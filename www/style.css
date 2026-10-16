@@ -1,0 +1,29 @@
+html,
+body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    color: #aaa;
+    font-family: ui-monospace, monospace;
+}
+
+body {
+    display: grid;
+    place-items: center;
+}
+
+/* The canvas is 320x200 internally; scale it to fit while keeping the 16:10
+   aspect and hard pixel edges. */
+#game {
+    width: min(100vw, 160vh);
+    aspect-ratio: 16 / 10;
+    image-rendering: pixelated;
+    outline: none;
+}
+
+#error {
+    position: fixed;
+    inset: auto 16px 16px;
+    color: #f55;
+    white-space: pre-wrap;
+}

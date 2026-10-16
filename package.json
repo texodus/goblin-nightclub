@@ -1,0 +1,22 @@
+{
+    "name": "goblin_nightclub",
+    "version": "0.1.0",
+    "description": "A 2D WebAssembly + WebGPU game",
+    "private": true,
+    "type": "module",
+    "license": "MIT",
+    "author": "Andrew Stein <steinlink@gmail.com>",
+    "engines": {
+        "node": ">=20"
+    },
+    "scripts": {
+        "build": "node scripts/build.mjs",
+        "build:dev": "node scripts/build.mjs --dev",
+        "dev": "node scripts/dev.mjs",
+        "serve": "node scripts/dev.mjs --release",
+        "test": "cargo test",
+        "check": "cargo clippy --target wasm32-unknown-unknown -- -D warnings",
+        "fmt": "cargo fmt",
+        "clean": "rm -rf dist target"
+    }
+}
