@@ -6,16 +6,17 @@
 
 #[cfg(target_arch = "wasm32")]
 mod app;
+pub mod draw;
 pub mod entity;
 pub mod frame;
 pub mod game;
+pub mod generate;
 pub mod level;
 pub mod memory;
 pub mod palette;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
 pub mod rng;
-pub mod sprite;
 pub mod vision;
 
 /// Logical (internal) resolution. The canvas is upscaled with CSS

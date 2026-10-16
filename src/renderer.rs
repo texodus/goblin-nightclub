@@ -1,5 +1,5 @@
 //! WebGPU renderer. Each frame it:
-//! 1. draws each visibility layer's sprites into its own offscreen texture;
+//! 1. draws each visibility layer's triangles into its own offscreen texture;
 //! 2. draws the visibility polygon into two masks: `now`, cleared every
 //!    frame, and `seen`, never cleared, so it accumulates everything seen;
 //! 3. composites the layers to the screen, styling each pixel by the masks.
@@ -7,8 +7,8 @@
 use wasm_bindgen::JsError;
 use web_sys::HtmlCanvasElement;
 
+use crate::draw::Vertex;
 use crate::frame::Frame;
-use crate::sprite::Sprite;
 
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
@@ -141,7 +141,7 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     globals: wgpu::BindGroup,
-    sprite_pipeline: wgpu::RenderPipeline,
+    shape_pipeline: wgpu::RenderPipeline,
     mask_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     composite_bind_group: wgpu::BindGroup,
@@ -150,7 +150,7 @@ pub struct Renderer {
     layers: [wgpu::TextureView; 3],
     mask_now: Mask,
     mask_seen: Mask,
-    instances: GrowBuffer,
+    vertices: GrowBuffer,
     fan: GrowBuffer,
 }
 
@@ -240,7 +240,7 @@ impl Renderer {
             depth_or_array_layers: 1,
         };
 
-        // Screen size, shared by the sprite and mask pipelines.
+        // Screen size, shared by the shape and mask pipelines.
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: size_of::<Globals>() as u64,
@@ -271,68 +271,51 @@ impl Renderer {
                 ..Default::default()
             });
 
-        let sprite_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/sprite.wgsl"));
-        let sprite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sprite"),
-            layout: Some(&globals_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &sprite_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<Sprite>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x2, 1 => Float32x2, 2 => Float32x4
-                    ],
-                })],
+        // Layers and masks both draw colored triangles from the same
+        // vertices; masks just ignore the color.
+        let shapes = device.create_shader_module(wgpu::include_wgsl!("shaders/shapes.wgsl"));
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4],
+        };
+        let triangles = |label, fs, target: wgpu::ColorTargetState, samples| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&globals_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shapes,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(vertex_layout.clone())],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shapes,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(target)],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: samples,
+                    ..Default::default()
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let shape_pipeline = triangles(
+            "shapes",
+            "fs_color",
+            wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &sprite_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let mask_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/mask.wgsl"));
-        let mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mask"),
-            layout: Some(&globals_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &mask_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<[f32; 2]>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2],
-                })],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &mask_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(MASK_FORMAT.into())],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: MASK_SAMPLES,
-                ..Default::default()
-            },
-            multiview_mask: None,
-            cache: None,
-        });
+            1,
+        );
+        let mask_pipeline = triangles("mask", "fs_mask", MASK_FORMAT.into(), MASK_SAMPLES);
 
         let layer_usage =
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
@@ -407,14 +390,14 @@ impl Renderer {
             cache: None,
         });
 
-        let instances = GrowBuffer::new(&device, "sprite instances", wgpu::BufferUsages::VERTEX);
+        let vertices = GrowBuffer::new(&device, "layer vertices", wgpu::BufferUsages::VERTEX);
         let fan = GrowBuffer::new(&device, "visibility fan", wgpu::BufferUsages::VERTEX);
         Ok(Self {
             surface,
             device,
             queue,
             globals,
-            sprite_pipeline,
+            shape_pipeline,
             mask_pipeline,
             composite_pipeline,
             composite_bind_group,
@@ -422,31 +405,41 @@ impl Renderer {
             layers,
             mask_now,
             mask_seen,
-            instances,
+            vertices,
             fan,
         })
     }
 
     pub fn draw(&mut self, frame: &Frame) {
-        // All layers' sprites share one buffer; each layer draws its range.
-        let mut sprites = Vec::new();
+        // All layers share one vertex buffer; each layer draws its range.
+        let mut vertices = Vec::new();
         let ranges = [&frame.visible, &frame.remembered, &frame.unknown].map(|layer| {
-            let start = sprites.len() as u32;
-            sprites.extend_from_slice(layer);
-            start..sprites.len() as u32
+            let start = vertices.len() as u32;
+            vertices.extend_from_slice(&layer.vertices);
+            start..vertices.len() as u32
         });
-        self.instances
-            .write(&self.device, &self.queue, bytemuck::cast_slice(&sprites));
+        self.vertices
+            .write(&self.device, &self.queue, bytemuck::cast_slice(&vertices));
 
         // Visible area as a triangle list: the polygon fanning out from the
-        // origin, plus two triangles per lit rect.
+        // origin, plus each (convex) lit shape fanned from its first point.
         let poly = &frame.polygon;
-        let mut fan: Vec<[f32; 2]> = (0..poly.len())
+        let mut fan: Vec<Vertex> = (0..poly.len())
             .flat_map(|i| [frame.origin, poly[i], poly[(i + 1) % poly.len()]])
+            .map(|pos| Vertex {
+                pos,
+                ..Default::default()
+            })
             .collect();
-        for &([x, y], [w, h]) in &frame.lit_rects {
-            let (x1, y1) = (x + w, y + h);
-            fan.extend([[x, y], [x1, y], [x, y1], [x, y1], [x1, y], [x1, y1]]);
+        for shape in &frame.lit_shapes {
+            fan.extend(
+                (1..shape.len().saturating_sub(1))
+                    .flat_map(|i| [shape[0], shape[i], shape[i + 1]])
+                    .map(|pos| Vertex {
+                        pos,
+                        ..Default::default()
+                    }),
+            );
         }
         self.fan
             .write(&self.device, &self.queue, bytemuck::cast_slice(&fan));
@@ -486,10 +479,10 @@ impl Renderer {
                 ..Default::default()
             });
             if !range.is_empty() {
-                pass.set_pipeline(&self.sprite_pipeline);
+                pass.set_pipeline(&self.shape_pipeline);
                 pass.set_bind_group(0, &self.globals, &[]);
-                pass.set_vertex_buffer(0, self.instances.buffer.slice(..));
-                pass.draw(0..6, range);
+                pass.set_vertex_buffer(0, self.vertices.buffer.slice(..));
+                pass.draw(range, 0..1);
             }
         }
 
