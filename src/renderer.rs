@@ -625,6 +625,18 @@ impl Renderer {
         })
     }
 
+    /// The canvas's size in pixels.
+    pub fn size(&self) -> [u32; 2] {
+        [self.config.width, self.config.height]
+    }
+
+    /// Forget what's been seen, for a new level (the next frame makes it
+    /// afresh).
+    pub fn reset(&mut self) {
+        self.world = None;
+        self.composite_bind_group = None;
+    }
+
     /// The canvas is now `width` x `height` pixels.
     pub fn resize(&mut self, width: u32, height: u32) {
         if [width, height] == [self.config.width, self.config.height] || width * height == 0 {

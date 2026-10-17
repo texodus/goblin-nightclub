@@ -6,13 +6,17 @@
 
 #[cfg(target_arch = "wasm32")]
 mod app;
+pub mod camera;
 pub mod draw;
+pub mod editor;
 pub mod entity;
 pub mod frame;
 pub mod game;
 pub mod generate;
+pub mod input;
 pub mod layer;
 pub mod level;
+pub mod level_file;
 pub mod memory;
 pub mod palette;
 pub mod path;

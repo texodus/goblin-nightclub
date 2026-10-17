@@ -36,6 +36,8 @@ export async function buildWasm({ dev = false } = {}) {
 export async function copyStatic() {
     await mkdir(DIST, { recursive: true });
     await cp(WWW, DIST, { recursive: true });
+    // The tile sheet, for the editor's palette.
+    await cp(path.join(ROOT, "assets"), path.join(DIST, "assets"), { recursive: true });
 }
 
 export async function build({ dev = false } = {}) {

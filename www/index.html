@@ -9,6 +9,68 @@
   </head>
   <body>
     <canvas id="game" tabindex="0"></canvas>
+
+    <div id="menu" class="panel" hidden>
+      <h1>Goblin Nightclub</h1>
+      <button data-action="new">New</button>
+      <button data-action="editor">Editor</button>
+      <button data-action="load">Load</button>
+      <p class="hint" id="menu-hint">Esc returns here</p>
+    </div>
+
+    <div id="editor" hidden>
+      <div id="topbar" class="bar">
+        <button data-action="menu" title="Back to the menu (Esc)">Menu</button>
+        <span class="sep"></span>
+        <button data-action="new-level" title="Start a blank level">New</button>
+        <button data-action="open" title="Open a level file">Open</button>
+        <button data-action="save" title="Save the level to a file">Save</button>
+        <span class="sep"></span>
+        <button data-action="undo" title="Undo (Ctrl+Z)">Undo</button>
+        <button data-action="redo" title="Redo (Ctrl+Shift+Z)">Redo</button>
+        <span class="sep"></span>
+        <span class="label">Layer</span>
+        <span id="layers"></span>
+        <span class="sep"></span>
+        <button data-action="play" title="Try the level out">Play</button>
+        <span id="status"></span>
+      </div>
+      <div id="toolbox" class="bar">
+        <button data-tool="pencil" title="Pencil: click or drag (B)">✎</button>
+        <button data-tool="rect" title="Rectangle: drag a region (R)">▭</button>
+        <button data-tool="fill" title="Fill: like tiles joined to the one clicked (F)">◍</button>
+        <button data-tool="pick" title="Picker: take the brushes from a tile (I)">⌖</button>
+        <button data-tool="spawn" title="Spawn: where the player starts">⚑</button>
+        <hr />
+        <button data-shape="whole" title="Whole tile">■</button>
+        <button data-shape="NW" title="Primary in the top-left half">◤</button>
+        <button data-shape="NE" title="Primary in the top-right half">◥</button>
+        <button data-shape="SW" title="Primary in the bottom-left half">◣</button>
+        <button data-shape="SE" title="Primary in the bottom-right half">◢</button>
+      </div>
+      <div id="palette" class="bar">
+        <div id="current" title="Primary (left button) over secondary (right button)">
+          <div id="secondary" class="swatch"></div>
+          <div id="primary" class="swatch"></div>
+        </div>
+        <div id="swatches"></div>
+      </div>
+    </div>
+
+    <dialog id="new-level" class="panel">
+      <form method="dialog">
+        <h2>New level</h2>
+        <label>Columns <input name="cols" type="number" min="4" max="128" value="64" /></label>
+        <label>Rows <input name="rows" type="number" min="4" max="128" value="40" /></label>
+        <label>Layers <input name="layers" type="number" min="1" max="8" value="3" /></label>
+        <div class="buttons">
+          <button value="cancel">Cancel</button>
+          <button value="ok">Create</button>
+        </div>
+      </form>
+    </dialog>
+
+    <input id="file" type="file" accept=".json,application/json" hidden />
     <p id="error" hidden></p>
     <script type="module" src="main.js"></script>
   </body>

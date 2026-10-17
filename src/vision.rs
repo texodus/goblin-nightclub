@@ -6,7 +6,7 @@
 use std::f32::consts::TAU;
 
 use crate::draw::inward_normal;
-use crate::layer::{Layer, Line, Shape, TILE};
+use crate::layer::{Layer, Line, Shape, Solid, TILE};
 
 /// Minimum angular offset of the extra rays cast to either side of each
 /// corner, sampling the boundary just before and just after it.
@@ -237,30 +237,40 @@ impl Vision {
     /// in range, and some point of it (center, or a corner pulled slightly
     /// in) not hidden by `above`. Its faces count as seen, and the tile as
     /// explored.
+    ///
+    /// A wall tile under a wall of a layer above (so not in the shaft)
+    /// lights up too if it borders void in view: a neighbor in the shaft
+    /// whose side next to it is in view. Exactly covered, it couldn't be
+    /// seen; but lower layers are drawn a little smaller (parallax), which
+    /// brings the edge of such a wall into view at the side of the hole.
     fn find_wall_tops(&mut self, own: &Layer, above: &Layer) {
         let mut lit = vec![false; own.cols * own.rows];
         self.wall_band.clear();
+        let (origin, radius) = (self.origin, self.radius);
+        let visible = |p: [f32; 2]| distance(p, origin) <= radius && above.los(origin, p);
         for y in 0..own.rows {
             for x in 0..own.cols {
-                if !self.in_shaft([x as i32, y as i32]) {
-                    continue;
-                }
                 let Some(shape) = own.solid(x as i32, y as i32).shape(x, y) else {
                     continue;
                 };
-                let n = shape.len() as f32;
-                let c = shape
-                    .iter()
-                    .fold([0.0; 2], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
-                let seen = std::iter::once(c)
-                    .chain(shape.iter().map(|p| {
-                        let d = distance(*p, c);
-                        [
-                            p[0] + (c[0] - p[0]) / d * 0.5,
-                            p[1] + (c[1] - p[1]) / d * 0.5,
-                        ]
-                    }))
-                    .any(|p| distance(p, self.origin) <= self.radius && above.los(self.origin, p));
+                let seen = if self.in_shaft([x as i32, y as i32]) {
+                    let n = shape.len() as f32;
+                    let c = shape
+                        .iter()
+                        .fold([0.0; 2], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
+                    std::iter::once(c)
+                        .chain(shape.iter().map(|p| {
+                            let d = distance(*p, c);
+                            [
+                                p[0] + (c[0] - p[0]) / d * 0.5,
+                                p[1] + (c[1] - p[1]) / d * 0.5,
+                            ]
+                        }))
+                        .any(visible)
+                } else {
+                    above.solid(x as i32, y as i32) != Solid::None
+                        && self.borders_void_in_view(x as i32, y as i32, &visible)
+                };
                 if seen {
                     lit[y * own.cols + x] = true;
                     self.explored[y * self.cols + x] = true;
@@ -274,6 +284,24 @@ impl Vision {
                 self.edge_seen[k] = true;
             }
         }
+    }
+
+    /// Does a neighbor of tile `(x, y)` (across a side or a corner) show
+    /// through to the viewer, with the point of it next to `(x, y)` (the
+    /// middle of the shared side, or the shared corner, pulled slightly in)
+    /// `visible`?
+    fn borders_void_in_view(&self, x: i32, y: i32, visible: &impl Fn([f32; 2]) -> bool) -> bool {
+        const INSET: f32 = 0.5;
+        (-1..=1).any(|dy: i32| {
+            (-1..=1).any(|dx: i32| {
+                if (dx, dy) == (0, 0) || !self.in_shaft([x + dx, y + dy]) {
+                    return false;
+                }
+                let at =
+                    |t: i32, d: i32| (t as f32 + 0.5 + d as f32 * 0.5) * TILE + d as f32 * INSET;
+                visible([at(x, dx), at(y, dy)])
+            })
+        })
     }
 
     /// Does tile `t` show through to the viewer?
@@ -1012,6 +1040,27 @@ mod tests {
         // hides its top.
         let walled = Layer::from_ascii(&["~~~~~~", "~~#~~~", "~~~~~~"]);
         assert!((look(&walled) - 100.0).abs() < 1e-2, "{}", look(&walled));
+    }
+
+    #[test]
+    fn walls_under_walls_light_beside_void_in_view() {
+        // Below, a wall at each end; above, walls over both, void beside
+        // the left one only, and floor where the viewer stands.
+        let below = Layer::from_ascii(&["#....#"]);
+        let deck = Layer::from_ascii(&["#~~~.#"]);
+        let mut v = Vision::new(&below, f32::INFINITY);
+        let sight = deck_sight(&below, &deck);
+        let shaft = [false, true, true, true, false, false];
+        v.update_through(&sight, &below, Some(&shaft), Some(&deck), [45.0, 5.0]);
+        // The left wall, next to the hole, lights up; the right one, next
+        // to floor, doesn't.
+        assert!((band_area(&v) - 100.0).abs() < 1e-2, "{}", band_area(&v));
+        assert!(v.is_explored(0, 0));
+        assert!(!v.is_explored(5, 0));
+        // Out of range of the hole's edge, it stays dark.
+        let mut near = Vision::new(&below, 20.0);
+        near.update_through(&sight, &below, Some(&shaft), Some(&deck), [45.0, 5.0]);
+        assert_eq!(band_area(&near), 0.0);
     }
 
     /// The walls of both layers together, as a level would combine them.

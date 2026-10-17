@@ -1,43 +1,20 @@
 //! Platform-independent game state. Nothing here touches the browser or GPU.
 
-use std::collections::HashSet;
-
+use crate::camera::Camera;
 use crate::draw::Canvas;
 use crate::entity::{Entity, EntityId, Kind};
 use crate::frame::{Frame, LayerFrame};
 use crate::generate::Style;
+pub use crate::input::Input;
 use crate::layer::{Dir, Shape, Solid, TILE, quarter_shapes};
 use crate::level::Level;
+use crate::level_file::LevelFile;
 use crate::memory::Memory;
 use crate::palette;
 use crate::path;
 use crate::rng::Rng;
 use crate::tileset::{self, Cell, ZOOM};
 use crate::vision::Vision;
-
-#[derive(Default)]
-pub struct Input {
-    held: HashSet<String>,
-}
-
-impl Input {
-    pub fn set(&mut self, code: &str, down: bool) {
-        if down {
-            self.held.insert(code.to_owned());
-        } else {
-            self.held.remove(code);
-        }
-    }
-
-    pub fn any(&self, codes: &[&str]) -> bool {
-        codes.iter().any(|c| self.held.contains(*c))
-    }
-
-    /// -1, 0 or 1 along an axis given negative and positive key sets.
-    fn axis(&self, neg: &[&str], pos: &[&str]) -> f32 {
-        self.any(pos) as i32 as f32 - self.any(neg) as i32 as f32
-    }
-}
 
 pub struct Game {
     pub input: Input,
@@ -56,12 +33,7 @@ pub struct Game {
     paused: bool,
     /// Where the player is walking, if anywhere.
     route: Option<Route>,
-    /// Top-left of the view, in world units.
-    camera: [f32; 2],
-    /// Size of the view, in screen pixels.
-    view: [f32; 2],
-    /// Zoom relative to the default (see [`Game::zoom`]).
-    zoom_factor: f32,
+    camera: Camera,
     /// Last pointer position, in view pixels.
     pointer: Option<[f32; 2]>,
 }
@@ -82,15 +54,6 @@ const PLAYER_SPEED: f32 = 90.0;
 
 /// Pause on reaching the destination.
 const AUTO_PAUSE: bool = true;
-
-/// Each wheel notch zooms by this factor.
-const ZOOM_STEP: f32 = 1.1;
-/// The most zoomed in, relative to the default. Zooming out stops where a
-/// pixel of the art is a pixel of the screen.
-const ZOOM_MAX: f32 = 3.0;
-
-/// Camera panning speed, in screen pixels a second.
-const CAMERA_SPEED: f32 = 600.0;
 
 /// Which kind of level to generate, and its size in tiles.
 const LEVEL_STYLE: Style = Style::Layered;
@@ -132,10 +95,32 @@ impl Game {
         Self::with_level(level, player, [width, height], seed)
     }
 
+    /// A game on a saved level, the player at its spawn.
+    pub fn from_file(file: &LevelFile, view: [f32; 2], seed: u32) -> Self {
+        let [x, y] = file.spawn.tile;
+        let player = [
+            x as f32 * TILE + (TILE - PLAYER_SIZE[0]) / 2.0,
+            y as f32 * TILE + (TILE - PLAYER_SIZE[1]) / 2.0,
+        ];
+        Self::with_level_at(file.level(), file.spawn.layer, player, view, seed)
+    }
+
     /// A game on `level`, the player at `player` (top-left, pixels) on the
     /// top layer, seen through a view of size `view`. It starts paused.
     pub fn with_level(level: Level, player: [f32; 2], view: [f32; 2], seed: u32) -> Self {
         let top = level.depth() - 1;
+        Self::with_level_at(level, top, player, view, seed)
+    }
+
+    /// A game on `level`, the player at `player` (top-left, pixels) on
+    /// layer `top`.
+    pub fn with_level_at(
+        level: Level,
+        top: usize,
+        player: [f32; 2],
+        view: [f32; 2],
+        seed: u32,
+    ) -> Self {
         let mut rng = Rng::new(seed ^ 0x9E37_79B9);
         let per_layer = (NPC_DENSITY * level.cols() * level.rows()).div_ceil(640);
         let mut npcs = Vec::new();
@@ -167,9 +152,7 @@ impl Game {
             time: 0.0,
             paused: true,
             route: None,
-            camera: [0.0; 2],
-            view,
-            zoom_factor: 1.0,
+            camera: Camera::new(view),
             pointer: None,
         };
         game.center_camera();
@@ -178,7 +161,8 @@ impl Game {
     }
 
     pub fn update(&mut self, dt: f32) {
-        self.pan_camera(dt);
+        // Arrow keys or WASD pan the view, paused or not.
+        self.camera.pan(&self.input, dt);
         if self.paused {
             return;
         }
@@ -201,11 +185,13 @@ impl Game {
         self.paused
     }
 
-    /// A key just went down (`KeyboardEvent.code`): Space toggles pause, C
-    /// centers the camera on the player. Held keys pan the camera.
+    /// A key just went down (`KeyboardEvent.code`): Space toggles pause,
+    /// Escape pauses, C centers the camera on the player. Held keys pan the
+    /// camera.
     pub fn key_pressed(&mut self, code: &str) {
         match code {
             "Space" => self.paused = !self.paused,
+            "Escape" => self.paused = true,
             "KeyC" => self.center_camera(),
             _ => {}
         }
@@ -226,45 +212,29 @@ impl Game {
         self.walk_to(tile_of(self.to_world(p)));
     }
 
-    /// Screen pixels per interface pixel: the interface is laid out for
-    /// a [`crate::WIDTH`] x [`crate::HEIGHT`] screen and scaled up by the
-    /// largest whole number that fits the view.
+    /// Screen pixels per interface pixel; see [`Camera::ui_scale`].
     pub fn ui_scale(&self) -> f32 {
-        let fit = (self.view[0] / crate::WIDTH as f32).min(self.view[1] / crate::HEIGHT as f32);
-        fit.floor().max(1.0)
+        self.camera.ui_scale()
     }
 
-    /// Screen pixels per world unit. By default the art is drawn at the
-    /// interface's scale (a pixel of the art an interface pixel), so the
-    /// view shows about as much of the level at any resolution.
+    /// Screen pixels per world unit.
     pub fn zoom(&self) -> f32 {
-        ZOOM * self.ui_scale() * self.zoom_factor
+        self.camera.zoom()
     }
 
-    /// Zoom in (`steps > 0`) or out by that many wheel notches, keeping the
-    /// world point under `p` (view pixels) where it is.
+    /// Zoom in (`steps > 0`) or out by that many wheel notches about `p`
+    /// (view pixels).
     pub fn zoom_by(&mut self, steps: i32, p: [f32; 2]) {
-        let anchor = self.to_world(p);
-        let min = 1.0 / self.ui_scale();
-        self.zoom_factor = (self.zoom_factor * ZOOM_STEP.powi(steps)).clamp(min, ZOOM_MAX);
-        let zoom = self.zoom();
-        self.camera = [anchor[0] - p[0] / zoom, anchor[1] - p[1] / zoom];
+        self.camera.zoom_by(steps, p);
     }
 
-    /// The view is now `view` screen pixels: keep what's at its center
-    /// there, and the zoom within bounds.
+    /// The view is now `view` screen pixels.
     pub fn resize(&mut self, view: [f32; 2]) {
-        let center = self.to_world([self.view[0] / 2.0, self.view[1] / 2.0]);
-        self.view = view;
-        self.zoom_factor = self.zoom_factor.clamp(1.0 / self.ui_scale(), ZOOM_MAX);
-        let world = self.view_world();
-        self.camera = [center[0] - world[0] / 2.0, center[1] - world[1] / 2.0];
+        self.camera.resize(view);
     }
 
-    /// The world point at view pixel `p`.
     fn to_world(&self, p: [f32; 2]) -> [f32; 2] {
-        let zoom = self.zoom();
-        [self.camera[0] + p[0] / zoom, self.camera[1] + p[1] / zoom]
+        self.camera.to_world(p)
     }
 
     /// Plan a walk to tile `goal` on the player's layer and set off. Plans
@@ -404,9 +374,9 @@ impl Game {
         }
     }
 
-    /// Size of the view, in world units.
+    #[cfg(test)]
     fn view_world(&self) -> [f32; 2] {
-        [self.view[0] / self.zoom(), self.view[1] / self.zoom()]
+        self.camera.view_world()
     }
 
     /// Size of the level, in world units.
@@ -418,29 +388,12 @@ impl Game {
     }
 
     fn center_camera(&mut self) {
-        let c = center(self.player, PLAYER_SIZE);
-        let view = self.view_world();
-        self.camera = [c[0] - view[0] / 2.0, c[1] - view[1] / 2.0];
-    }
-
-    /// Arrow keys or WASD pan the view, paused or not.
-    fn pan_camera(&mut self, dt: f32) {
-        let dx = self
-            .input
-            .axis(&["ArrowLeft", "KeyA"], &["ArrowRight", "KeyD"]);
-        let dy = self
-            .input
-            .axis(&["ArrowUp", "KeyW"], &["ArrowDown", "KeyS"]);
-        let speed = CAMERA_SPEED / self.zoom();
-        self.camera = [
-            self.camera[0] + dx * speed * dt,
-            self.camera[1] + dy * speed * dt,
-        ];
+        self.camera.center_on(center(self.player, PLAYER_SIZE));
     }
 
     /// The pause button's top-left, in interface pixels.
     fn button_pos(&self) -> [f32; 2] {
-        let width = self.view[0] / self.ui_scale();
+        let width = self.camera.view[0] / self.ui_scale();
         [width - BUTTON_SIZE[0] - BUTTON_MARGIN, BUTTON_MARGIN]
     }
 
@@ -626,8 +579,8 @@ impl Game {
             radius_step: VIEW_RADIUS_STEP,
             radius_min: VIEW_RADIUS_MIN,
             time: self.time,
-            camera: self.camera,
-            view: self.view,
+            camera: self.camera.pos,
+            view: self.camera.view,
             zoom: self.zoom(),
             ui_scale: self.ui_scale(),
             world: self.world(),
@@ -675,8 +628,8 @@ mod tests {
     /// Click world point `p`, through the camera.
     fn click_world(game: &mut Game, p: [f32; 2]) {
         game.click([
-            (p[0] - game.camera[0]) * game.zoom(),
-            (p[1] - game.camera[1]) * game.zoom(),
+            (p[0] - game.camera.pos[0]) * game.zoom(),
+            (p[1] - game.camera.pos[1]) * game.zoom(),
         ]);
     }
 
@@ -792,7 +745,7 @@ mod tests {
         let view = [VIEW[0] / ZOOM, VIEW[1] / ZOOM];
         assert_eq!(view, [200.0, 125.0]);
         assert_eq!(
-            game.camera,
+            game.camera.pos,
             [325.0 - view[0] / 2.0, 205.0 - view[1] / 2.0],
             "centered"
         );
@@ -801,10 +754,10 @@ mod tests {
             game.update(1.0 / 60.0);
         }
         // Ten seconds of panning: well past the level's edge.
-        let panned = game.camera[0] - (325.0 - view[0] / 2.0);
-        let expected = 10.0 * CAMERA_SPEED / ZOOM;
+        let panned = game.camera.pos[0] - (325.0 - view[0] / 2.0);
+        let expected = 10.0 * crate::camera::PAN_SPEED / ZOOM;
         assert!((panned - expected).abs() < 1.0, "{panned}");
-        assert!(game.camera[0] > 640.0, "no boundary");
+        assert!(game.camera.pos[0] > 640.0, "no boundary");
         assert_eq!(game.player, game.player, "player didn't move");
         // Clicking maps through the camera.
         game.input.set("ArrowRight", false);
@@ -824,7 +777,7 @@ mod tests {
         let pointer = [100.0, 60.0];
         let anchor = game.to_world(pointer);
         game.zoom_by(1, pointer);
-        assert_eq!(game.zoom(), ZOOM_STEP * ZOOM);
+        assert_eq!(game.zoom(), crate::camera::ZOOM_STEP * ZOOM);
         let after = game.to_world(pointer);
         assert!((after[0] - anchor[0]).abs() < 1e-3 && (after[1] - anchor[1]).abs() < 1e-3);
         // Clicks map through the zoom too.
@@ -836,7 +789,7 @@ mod tests {
         // Zoom stops at either end: at 320 x 200, the default already
         // shows a pixel of the art per pixel of the screen.
         game.zoom_by(100, pointer);
-        assert_eq!(game.zoom(), ZOOM_MAX * ZOOM);
+        assert_eq!(game.zoom(), crate::camera::ZOOM_MAX * ZOOM);
         game.zoom_by(-100, pointer);
         assert_eq!(game.zoom(), ZOOM);
         assert_eq!(game.frame().zoom, game.zoom());
