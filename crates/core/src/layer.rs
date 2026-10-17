@@ -131,6 +131,9 @@ pub enum Part {
     Floor(FloorId),
     /// No floor: the layer below shows through.
     Void,
+    /// Water: void to the game (impassable, open to sight, the layer below
+    /// showing through), drawn as a translucent tile over what's beneath.
+    Water,
 }
 
 /// The shape of some part of a tile: what rays, collision and outlines run
@@ -285,6 +288,7 @@ impl Tile {
     pub const FLOOR: Tile = Tile::Whole(Part::Floor(0));
     pub const WALL: Tile = Tile::Whole(Part::Wall(0));
     pub const VOID: Tile = Tile::Whole(Part::Void);
+    pub const WATER: Tile = Tile::Whole(Part::Water);
 
     /// Wall in `corner`'s half, floor in the rest.
     pub fn slope(corner: Corner) -> Tile {
@@ -349,14 +353,20 @@ impl Tile {
         Solid::from_quarters(self.quarters_where(|p| matches!(p, Part::Wall(_))), true)
     }
 
-    /// Where it's void, open to the layer below.
+    /// Where it's void (or water), open to the layer below.
     pub fn void(self) -> Solid {
-        Solid::from_quarters(self.quarters_where(|p| p == Part::Void), true)
+        Solid::from_quarters(self.void_quarters(), true)
     }
 
-    /// The quarters that are void, as bits.
+    /// The quarters that are void or water, as bits: open to the layer
+    /// below, impassable, and no block to sight.
     pub fn void_quarters(self) -> u8 {
-        self.quarters_where(|p| p == Part::Void)
+        self.quarters_where(|p| matches!(p, Part::Void | Part::Water))
+    }
+
+    /// The quarters that are water, as bits.
+    pub fn water_quarters(self) -> u8 {
+        self.quarters_where(|p| p == Part::Water)
     }
 
     /// Its wall type, if any of it is wall.
@@ -610,7 +620,8 @@ impl Layer {
     /// Build a layer from rows of `.` (floor), `#` (wall), `◸ ◹ ◺ ◿`
     /// (wall in that corner, floor in the rest), `◤ ◥ ◣ ◢` (wall in that
     /// corner over void), `▛ ▜ ▙ ▟` (floor in that corner, void in the
-    /// rest), `~` (void) and `<` `>` (stairs up and down), for tests.
+    /// rest), `~` (void), `≈` (water) and `<` `>` (stairs up and down), for
+    /// tests.
     #[cfg(any(test, feature = "test-util"))]
     pub fn from_ascii(rows: &[&str]) -> Self {
         use Corner::*;
@@ -622,6 +633,7 @@ impl Layer {
             .map(|c| match c {
                 '.' => Tile::FLOOR,
                 '~' => Tile::VOID,
+                '≈' => Tile::WATER,
                 '<' => Tile::Stairs(Dir::Up, 0),
                 '>' => Tile::Stairs(Dir::Down, 0),
                 '#' => Tile::WALL,
@@ -1324,13 +1336,24 @@ impl Layer {
             let (x, y) = (i % self.cols, i / self.cols);
             let origin = [x as f32 * TILE, y as f32 * TILE];
             let mut part = |shape: Option<Shape>, part: Part| {
-                let cell = match part {
-                    Part::Floor(f) => tileset::variant(tileset::FLOORS[f as usize].cells, x, y),
-                    Part::Wall(w) => tileset::variant(tileset::WALLS[w as usize].cells, x, y),
+                let (cell, color) = match part {
+                    Part::Floor(f) => (
+                        tileset::variant(tileset::FLOORS[f as usize].cells, x, y),
+                        palette::WHITE,
+                    ),
+                    Part::Wall(w) => (
+                        tileset::variant(tileset::WALLS[w as usize].cells, x, y),
+                        palette::WHITE,
+                    ),
+                    // Translucent, so what's beneath shows through.
+                    Part::Water => (
+                        tileset::variant(tileset::WATER, x, y),
+                        [1.0, 1.0, 1.0, tileset::WATER_ALPHA],
+                    ),
                     Part::Void => return,
                 };
                 if let Some(shape) = shape {
-                    canvas.textured(&shape, origin, cell, palette::WHITE);
+                    canvas.textured(&shape, origin, cell, color);
                 }
             };
             if let Some(dir) = tile.stairs() {
@@ -1957,6 +1980,19 @@ mod tests {
             Tile::VOID
         );
         assert_eq!(Tile::split(NE, dirt, dirt), Tile::Whole(dirt), "normalized");
+    }
+
+    #[test]
+    fn water_is_void_to_the_game() {
+        let t = Layer::from_ascii(&["≈"]).tile(0, 0);
+        assert_eq!(t, Tile::WATER);
+        assert_eq!(t.void(), Solid::Full);
+        assert_eq!(t.water_quarters(), 0b1111);
+        assert_eq!(Tile::VOID.water_quarters(), 0);
+        assert_eq!(t.wall(), Solid::None, "no block to sight");
+        let half = Tile::split(Corner::NW, Part::Floor(0), Part::Water);
+        assert_eq!(half.void(), Solid::Slope(Corner::SE));
+        assert_eq!(half.water_quarters(), half.void_quarters());
     }
 
     #[test]

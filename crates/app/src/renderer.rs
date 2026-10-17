@@ -341,6 +341,7 @@ pub struct Renderer {
     seen_pipeline: wgpu::RenderPipeline,
     seen_shaft_pipeline: wgpu::RenderPipeline,
     fill_pipeline: wgpu::RenderPipeline,
+    water_pipeline: wgpu::RenderPipeline,
     unmask_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     shaft_layout: wgpu::BindGroupLayout,
@@ -536,6 +537,7 @@ impl Renderer {
             1,
         );
         let fill_pipeline = triangles("fill", plain, "fs_mask", MASK_FORMAT.into(), 1);
+        let water_pipeline = triangles("water", plain, "fs_mask_half", MASK_FORMAT.into(), 1);
         let unmask_pipeline = triangles("unmask", plain, "fs_unmask", MASK_FORMAT.into(), 1);
 
         let composite_params = device.create_buffer(&wgpu::BufferDescriptor {
@@ -608,6 +610,7 @@ impl Renderer {
             seen_pipeline,
             seen_shaft_pipeline,
             fill_pipeline,
+            water_pipeline,
             unmask_pipeline,
             composite_pipeline,
             shaft_layout,
@@ -761,6 +764,7 @@ impl Renderer {
             canvases: [std::ops::Range<u32>; 3],
             visible: std::ops::Range<u32>,
             voids: std::ops::Range<u32>,
+            water: std::ops::Range<u32>,
             standing: std::ops::Range<u32>,
             shaft: Option<std::ops::Range<u32>>,
         }
@@ -786,6 +790,7 @@ impl Renderer {
                     });
                 let visible = push(&mut mask_vertices, &mut fan.into_iter());
                 let voids = push(&mut mask_vertices, &mut poly_triangles(&l.voids));
+                let water = push(&mut mask_vertices, &mut poly_triangles(&l.water));
                 let standing = push(&mut mask_vertices, &mut l.standing.vertices.iter().copied());
                 let shaft = l
                     .shaft
@@ -795,6 +800,7 @@ impl Renderer {
                     canvases,
                     visible,
                     voids,
+                    water,
                     standing,
                     shaft,
                 }
@@ -932,7 +938,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 };
@@ -955,6 +961,16 @@ impl Renderer {
                 None,
                 masks,
                 r.voids.clone(),
+            );
+            // Water is void that tints what shows through: mark it half.
+            pass(
+                &mut encoder,
+                keep(voids),
+                &self.water_pipeline,
+                transform,
+                None,
+                masks,
+                r.water.clone(),
             );
             // Then clear it again under whatever stands on the layer.
             pass(

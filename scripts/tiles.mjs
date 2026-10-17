@@ -2,10 +2,12 @@
 // palette.
 // Cells are CELL pixels square, laid out as src/tileset.rs expects:
 //
-//   row 0  white (for plain colored shapes), stairs up, stairs down
+//   row 0  white (for plain colored shapes), stairs up, stairs down,
+//          water (two variants)
 //   row 1  floors, two variants each: plain, planks, dirt, grate
 //   row 2  walls, two variants each: brick, rock, metal
 //   row 3  sprites: player, npc
+//   row 4  floors, two variants each: grass, sand, stone
 //
 //   node scripts/tiles.mjs
 
@@ -19,7 +21,7 @@ const OUT = path.join(ROOT, "crates", "core", "assets", "tiles.png");
 
 const CELL = 16;
 const COLS = 8;
-const ROWS = 4;
+const ROWS = 5;
 
 const EGA = {
     black: [0x00, 0x00, 0x00],
@@ -76,6 +78,39 @@ for (const [cx, tread, gap] of [
     cell(cx, 0, (x, y) => {
         if (x < 2 || x > 13) return EGA.black;
         return y % 4 === 1 || y % 4 === 2 ? tread : gap;
+    });
+}
+
+// Water: blue with light ripples, drawn translucent by the game.
+for (const v of [0, 1]) {
+    cell(3 + v, 0, (x, y) => {
+        const ripple = (y + v * 2) % 5 === 0 && (x + y * 3 + v * 4) % 7 < 3;
+        return ripple ? EGA.lightBlue : EGA.blue;
+    });
+}
+
+// Row 4: outdoor floors.
+for (const v of [0, 1]) {
+    // Grass: green with lighter blades.
+    cell(0 + v, 4, (x, y) => {
+        const n = noise(x, y, 20 + v);
+        if (n < 0.08) return EGA.lightGreen;
+        if (n < 0.12) return EGA.black;
+        return EGA.green;
+    });
+    // Sand: brown with pale grains.
+    cell(2 + v, 4, (x, y) => {
+        const n = noise(x, y, 22 + v);
+        if (n < 0.1) return EGA.yellow;
+        if (n < 0.14) return EGA.lightGray;
+        return EGA.brown;
+    });
+    // Stone: gray with cracks.
+    cell(4 + v, 4, (x, y) => {
+        const n = noise(x, y, 24 + v);
+        if (n < 0.06) return EGA.black;
+        if (n < 0.12) return EGA.lightGray;
+        return EGA.darkGray;
     });
 }
 

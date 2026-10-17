@@ -5,7 +5,7 @@ use crate::input::Input;
 use crate::tileset::ZOOM;
 
 /// Each wheel notch zooms by this factor.
-pub const ZOOM_STEP: f32 = 1.1;
+pub const ZOOM_STEP: f32 = 1.01;
 /// The most zoomed in, relative to the default. Zooming out stops where a
 /// pixel of the art is a pixel of the screen.
 pub const ZOOM_MAX: f32 = 3.0;

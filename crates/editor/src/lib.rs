@@ -87,7 +87,7 @@ pub struct State {
     pub can_remove_layer: bool,
 }
 
-/// Every brush, in palette order: floors, walls, void, stairs.
+/// Every brush, in palette order: floors, walls, void, water, stairs.
 pub fn palette() -> Vec<Brush> {
     let floors = (0..tileset::FLOORS.len()).map(|f| Brush::Part(Part::Floor(f as u8)));
     let walls = (0..tileset::WALLS.len()).map(|w| Brush::Part(Part::Wall(w as u8)));
@@ -95,6 +95,7 @@ pub fn palette() -> Vec<Brush> {
         .chain(walls)
         .chain([
             Brush::Part(Part::Void),
+            Brush::Part(Part::Water),
             Brush::Stairs(Dir::Up),
             Brush::Stairs(Dir::Down),
         ])
@@ -122,6 +123,10 @@ pub fn swatches() -> Vec<Swatch> {
             Brush::Part(Part::Void) => Swatch {
                 name: "void".into(),
                 cell: None,
+            },
+            Brush::Part(Part::Water) => Swatch {
+                name: "water".into(),
+                cell: Some(tileset::WATER[0]),
             },
             Brush::Stairs(Dir::Up) => Swatch {
                 name: "stairs up".into(),
@@ -680,6 +685,7 @@ impl Editor {
                         .collect()
                 };
                 let voids = parts(&|i| self.layers[k][i].void_quarters());
+                let water = parts(&|i| self.layers[k][i].water_quarters());
                 let shaft = (k < top).then(|| {
                     let shaft = self.level.shaft(top, k);
                     parts(&|i| if shaft[i] { 0b1111 } else { 0 })
@@ -692,6 +698,7 @@ impl Editor {
                     polygon: everywhere.clone(),
                     lit_shapes: Vec::new(),
                     voids,
+                    water,
                     standing: Canvas::default(),
                     shaft,
                 }

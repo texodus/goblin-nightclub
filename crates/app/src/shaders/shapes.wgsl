@@ -83,6 +83,12 @@ fn fs_mask() -> @location(0) vec4<f32> {
     return vec4(1.0);
 }
 
+// Marks water in the void mask: half, where void is 1.
+@fragment
+fn fs_mask_half() -> @location(0) vec4<f32> {
+    return vec4(0.5);
+}
+
 // Clears a mask where a sprite is opaque: where something stands on a
 // layer, it isn't void.
 @fragment

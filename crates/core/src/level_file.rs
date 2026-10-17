@@ -4,7 +4,7 @@
 //! Each tile is a short string, naming floor and wall types (so files
 //! survive reordering the tile sheet's tables):
 //!
-//! - `void`, `floor:<name>`, `wall:<name>`: wholly that part;
+//! - `void`, `water`, `floor:<name>`, `wall:<name>`: wholly that part;
 //! - `<corner>/<part>/<part>`, e.g. `NW/wall:brick/floor:plain`: split
 //!   along a diagonal, the first part in that corner's half;
 //! - `up/<floor>`, `down/<floor>`: stairs, over that floor type.
@@ -134,6 +134,7 @@ fn corner_name(c: Corner) -> &'static str {
 fn part_name(p: Part) -> String {
     match p {
         Part::Void => "void".into(),
+        Part::Water => "water".into(),
         Part::Floor(f) => format!("floor:{}", tileset::FLOORS[f as usize].name),
         Part::Wall(w) => format!("wall:{}", tileset::WALLS[w as usize].name),
     }
@@ -149,6 +150,7 @@ fn parse_part(s: &str) -> Result<Part, String> {
     };
     match s.split_once(':') {
         None if s == "void" => Ok(Part::Void),
+        None if s == "water" => Ok(Part::Water),
         Some(("floor", name)) => named(
             "floor",
             tileset::FLOORS.iter().map(|f| f.name).collect(),
@@ -240,6 +242,8 @@ mod tests {
             Tile::Whole(planks),
             Tile::split(Corner::NW, brick, planks),
             Tile::split(Corner::SE, planks, Part::Void),
+            Tile::WATER,
+            Tile::split(Corner::NE, planks, Part::Water),
             Tile::Stairs(Dir::Down, tileset::floor("grate")),
         ] {
             let text = tile.to_string();

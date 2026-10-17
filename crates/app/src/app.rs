@@ -11,6 +11,7 @@ use goblin_nightclub_core::level_file::LevelFile;
 use goblin_nightclub_core::{HEIGHT, WIDTH};
 use goblin_nightclub_editor::{self as editor, BrushShape, Editor, Tool};
 use goblin_nightclub_game::Game;
+use goblin_nightclub_generate::Params;
 
 #[wasm_bindgen(start)]
 fn init() {
@@ -77,10 +78,26 @@ impl App {
         self.mode = Mode::Menu;
     }
 
-    /// Start a game on a newly generated level, from `seed`.
+    /// Start a game on a newly generated level, from `seed`, with the
+    /// default generation parameters.
     pub fn new_game(&mut self, seed: u32) {
         let [w, h] = self.view();
-        self.switch(Mode::Game(Box::new(Game::new(w, h, seed))));
+        let params = Params::default();
+        web_sys::console::log_1(&serde_json::to_string(&params).unwrap().into());
+        let game = Game::new(w, h, seed, &params);
+        self.switch(Mode::Game(Box::new(game)));
+    }
+
+    /// Start a game on a newly generated level, from `seed`, with
+    /// generation parameters given as JSON (see [`Params`]; any left out
+    /// take their defaults).
+    pub fn new_game_with(&mut self, seed: u32, params: &str) -> Result<(), JsError> {
+        let params: Params = serde_json::from_str(params).map_err(js_err)?;
+        web_sys::console::log_1(&serde_json::to_string(&params).unwrap().into());
+        let [w, h] = self.view();
+        let game = Game::new(w, h, seed, &params);
+        self.switch(Mode::Game(Box::new(game)));
+        Ok(())
     }
 
     /// Start a game on a saved level (see [`LevelFile`]).

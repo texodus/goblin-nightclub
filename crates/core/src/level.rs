@@ -184,6 +184,19 @@ mod tests {
     }
 
     #[test]
+    fn water_blocks_movement_and_shows_the_layer_below() {
+        let l = level(&[&["..."], &["≈.~"]]);
+        assert_eq!(l.movement(1).solid(0, 0), Solid::Full, "a pit");
+        assert_eq!(l.movement(1).solid(1, 0), Solid::None);
+        assert_eq!(
+            l.shaft(1, 0),
+            &[true, false, true],
+            "shows through like void"
+        );
+        assert_eq!(l.visible_layers(1), vec![1, 0]);
+    }
+
+    #[test]
     fn half_void_tiles_block_their_void_half() {
         let l = level(&[
             &["#◤▛◺"], //

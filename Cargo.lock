@@ -211,6 +211,8 @@ name = "goblin-nightclub-generate"
 version = "0.1.0"
 dependencies = [
  "goblin-nightclub-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

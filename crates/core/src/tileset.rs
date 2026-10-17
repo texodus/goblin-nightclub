@@ -30,6 +30,9 @@ pub type Cell = [u16; 2];
 pub const WHITE: Cell = [0, 0];
 pub const STAIRS_UP: Cell = [1, 0];
 pub const STAIRS_DOWN: Cell = [2, 0];
+/// Water, in variants; drawn translucent, at `WATER_ALPHA`.
+pub const WATER: &[Cell] = &[[3, 0], [4, 0]];
+pub const WATER_ALPHA: f32 = 0.55;
 
 pub struct Floor {
     pub name: &'static str,
@@ -67,6 +70,18 @@ pub const FLOORS: &[Floor] = &[
     Floor {
         name: "grate",
         cells: &[[6, 1], [6, 1], [7, 1]],
+    },
+    Floor {
+        name: "grass",
+        cells: &[[0, 4], [1, 4]],
+    },
+    Floor {
+        name: "sand",
+        cells: &[[2, 4], [3, 4]],
+    },
+    Floor {
+        name: "stone",
+        cells: &[[4, 4], [5, 4]],
     },
 ];
 
@@ -164,6 +179,7 @@ mod tests {
             .flat_map(|f| f.cells)
             .chain(WALLS.iter().flat_map(|w| w.cells))
             .chain(SPRITES.iter().map(|s| &s.cell))
+            .chain(WATER)
             .chain([&WHITE, &STAIRS_UP, &STAIRS_DOWN]);
         for c in cells {
             assert!(c[0] < cols && c[1] < rows, "{c:?} outside the sheet");

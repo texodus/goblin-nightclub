@@ -128,6 +128,8 @@ fn seen_at(a: u32, world: vec2<f32>) -> f32 {
 // where it has been seen itself, or where the hole showing it has (the
 // hole's sides, which parallax brings into view beside it, are seen with
 // the hole, but lie under the layers above, so never in its own `seen`).
+// The canvases hold premultiplied color (drawn over transparent black), so
+// the result is too; water is the translucent case.
 fn shade(a: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec3<f32> {
     let dist = distance(world, params.origin);
     var now = textureLoad(mask_now, px, a, 0).r;
@@ -155,20 +157,34 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // How much the hole looked down has been seen: the least `seen` of the
     // void passed through, on the way down.
     var through = 1.0;
+    // Water passed through tints what's beneath: the color gathered so far,
+    // and how much of what's beneath still shows.
+    var color = vec3(0.0);
+    var remaining = 1.0;
     for (var d = 0u; d <= params.top; d++) {
         let a = params.top - d;
         if ((params.present >> a) & 1u) == 0u {
             break;
         }
         let world = params.camera + (center + (frag.xy - center) / scale) / params.zoom;
-        if textureLoad(voids, px, a, 0).r > 0.5 {
+        let mask = textureLoad(voids, px, a, 0).r;
+        if mask > 0.25 {
+            if mask < 0.75 {
+                // Water: its styled (premultiplied) color over what's below.
+                let dim = pow(LOWER_BRIGHTNESS, f32(d));
+                let below = select(0.0, through, d > 0u);
+                let alpha = textureLoad(canvases, px, 3u * a, 0).a;
+                color += shade(a, px, world, radius_at(d), below) * dim * remaining;
+                remaining *= 1.0 - alpha;
+            }
             through = min(through, seen_at(a, world));
             scale *= params.scale;
             continue;
         }
         let dim = pow(LOWER_BRIGHTNESS, f32(d));
         let below = select(0.0, through, d > 0u);
-        return vec4(shade(a, px, world, radius_at(d), below) * dim, 1.0);
+        color += shade(a, px, world, radius_at(d), below) * dim * remaining;
+        return vec4(color, 1.0);
     }
-    return vec4(0.0, 0.0, 0.0, 1.0);
+    return vec4(color, 1.0);
 }

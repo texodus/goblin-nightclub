@@ -1,382 +1,1138 @@
-//! Random level generators for the engine in `goblin_nightclub_core`, writing tiles:
+//! The world generator for the engine in `goblin_nightclub_core`: one kind of level,
+//! built in two groups of layers, bottom to top:
 //!
-//! - [`Style::World`]: open floor with solid pieces stamped onto it,
-//!   rectangular blocks (some with corners cut at 45 degrees) and diagonal
-//!   bars, which may merge into composite shapes.
-//! - [`Style::Cave`]: solid rock carved out by cellular automata, with
-//!   stair-steps smoothed into slopes.
-//! - [`Style::Layered`]: [`LAYERS`] layers, a cave below decks of floor
-//!   with void openings and stairs down.
+//! - **The underworld**, [`Params::underworld_layers`] layers of caves and
+//!   dungeon rooms carved out of solid rock, joined by stairs, with pools
+//!   of water in the caves. Enclosed on every side.
+//! - **The overworld**, [`Params::overworld_layers`] layers of terrain from
+//!   a heightmap: each column is rock up to its height, floor at it, and
+//!   void above, so from above you look down onto plains, hills and
+//!   mountains, and a step in height is a cliff. Cliffs are climbed by
+//!   ramps (a staircase in the cliff face), placed along them every so
+//!   often if [`Params::ramp_spacing`] allows. Lakes fill the lowest
+//!   ground and rivers run down to them, both water over a sandy bed, with
+//!   fords where a river would otherwise cut the land in two.
 //!
-//! Either way the area around the spawn is open, the level edge is solid
-//! or open floor, and any open space not connected to the spawn is filled
-//! in. Each style builds with its own materials, named in the tile sheet
-//! (see [`goblin_nightclub_core::tileset`]).
+//! The two meet at entrances: a cellar under the plains with a staircase
+//! down from the surface and another down into the top cave.
+//!
+//! Everything the player can walk to from the spawn is kept; floor in the
+//! underworld that can't be reached is filled with rock (ground in the
+//! overworld stays, reachable or not: whether every hilltop has a ramp is
+//! up to the parameters). Water never blocks the way between two pieces of
+//! land that nothing else joins.
+//!
+//! The materials are named in the tile sheet (see [`goblin_nightclub_core::tileset`]).
 
-use goblin_nightclub_core::layer::{Corner, Dir, Layer, Part, Side, Solid, TILE, Tile};
-use goblin_nightclub_core::layer::{FloorId, WallId};
-use goblin_nightclub_core::level::Level;
+use serde::{Deserialize, Serialize};
+use goblin_nightclub_core::layer::{Corner, Dir, FloorId, Layer, Part, Side, Solid, TILE, Tile, WallId};
+use goblin_nightclub_core::level::{Level, MAX_LAYERS};
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::tileset;
 
-/// A solid piece to stamp into a level: tiles that together form one
-/// convex shape.
-pub struct Piece {
-    pub tiles: Vec<([i32; 2], Tile)>,
+/// What to generate. Every field has a default; see [`Params::default`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Params {
+    /// Layers of terrain. Heights run from 1 (plains) to this minus 1, so
+    /// 2 gives flat plains only, 3 adds hills, 4 adds mountains, and more
+    /// stack higher peaks. The lowest layer holds the lake beds.
+    pub overworld_layers: usize,
+    /// Layers of caves and dungeons below the terrain.
+    pub underworld_layers: usize,
+    /// Size of terrain features, in tiles: the wavelength of the largest
+    /// hills.
+    pub terrain_scale: f32,
+    /// Share of the land that is hills or higher, and of that, the share
+    /// that is mountains (the highest heights), both 0 to 1.
+    pub hill_share: f32,
+    pub mountain_share: f32,
+    /// Share of the surface under lakes, 0 to 1.
+    pub water_share: f32,
+    /// Rivers to run from the hills to the lakes or the edge.
+    pub rivers: usize,
+    /// Tiles between ramps along a cliff. 0 for no ramps at all, so the
+    /// hills can't be climbed; otherwise every piece of high ground gets at
+    /// least one, spacing or not.
+    pub ramp_spacing: usize,
+    /// Tiles between fords along a river.
+    pub ford_spacing: usize,
+    /// Entrances from the surface to the underworld.
+    pub entrances: usize,
+    /// Dungeon rooms on each underworld layer, and staircases between each
+    /// pair of underworld layers.
+    pub rooms: usize,
+    pub stairs: usize,
+    /// Share of each cave's open floor under pools of water, 0 to 1.
+    pub pool_share: f32,
 }
 
-impl Piece {
-    /// The piece built of wall type `wall`.
-    pub fn of(mut self, wall: WallId) -> Self {
-        for (_, tile) in &mut self.tiles {
-            *tile = tile.with_wall(wall);
-        }
-        self
-    }
-
-    /// A `w` x `h` block of full tiles at `(x, y)`, with each corner (in
-    /// `Corner::CLOCKWISE` order) optionally cut off by a slope. Corners are
-    /// only cut on blocks at least 2x2.
-    pub fn block(x: i32, y: i32, w: i32, h: i32, cut: [bool; 4]) -> Self {
-        let mut tiles = Vec::new();
-        for ty in y..y + h {
-            for tx in x..x + w {
-                tiles.push(([tx, ty], Tile::WALL));
-            }
-        }
-        if w >= 2 && h >= 2 {
-            for (corner, cut) in Corner::CLOCKWISE.into_iter().zip(cut) {
-                if cut {
-                    let [dx, dy] = corner.offset();
-                    let at = [x + dx * (w - 1), y + dy * (h - 1)];
-                    // Keep the half facing into the block.
-                    let tile = Tile::slope(corner.opposite());
-                    tiles.iter_mut().find(|(t, _)| *t == at).unwrap().1 = tile;
-                }
-            }
-        }
-        Self { tiles }
-    }
-
-    /// A 45-degree bar of `len` full tiles starting at `(x, y)` and running
-    /// up-right (`rising`) or down-right, with slopes filling the stair steps
-    /// on both sides so its long faces are straight diagonals.
-    pub fn bar(x: i32, y: i32, len: i32, rising: bool) -> Self {
-        let dy = if rising { -1 } else { 1 };
-        // Slopes in the steps beside and above/below each diagonal neighbor.
-        let (beside, across) = if rising {
-            (Corner::NW, Corner::SE)
-        } else {
-            (Corner::SW, Corner::NE)
-        };
-        let mut tiles = Vec::new();
-        for i in 0..len {
-            tiles.push(([x + i, y + dy * i], Tile::WALL));
-            if i + 1 < len {
-                tiles.push(([x + i + 1, y + dy * i], Tile::slope(beside)));
-                tiles.push(([x + i, y + dy * (i + 1)], Tile::slope(across)));
-            }
-        }
-        Self { tiles }
-    }
-
-    /// Union this piece into `tiles` (a `cols`-wide grid).
-    fn stamp(&self, tiles: &mut [Tile], cols: usize) {
-        for ([x, y], tile) in &self.tiles {
-            let i = *y as usize * cols + *x as usize;
-            tiles[i] = tiles[i].stamp(*tile);
+impl Default for Params {
+    fn default() -> Self {
+        Self {
+            overworld_layers: 4,
+            underworld_layers: 3,
+            terrain_scale: 14.0,
+            hill_share: 0.4,
+            mountain_share: 0.25,
+            water_share: 0.1,
+            rivers: 2,
+            ramp_spacing: 7,
+            ford_spacing: 9,
+            entrances: 2,
+            rooms: 3,
+            stairs: 2,
+            pool_share: 0.06,
         }
     }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Style {
-    World,
-    Cave,
-    /// Only for whole levels; as a single layer, the same as `Cave`.
-    Layered,
-}
-
-/// Layers in a layered level: a cave, and decks above it.
-pub const LAYERS: usize = 5;
-const _: () = assert!(LAYERS <= goblin_nightclub_core::level::MAX_LAYERS);
-
-/// Void openings in the top deck of a layered level, and how many more
-/// (or, if negative, fewer) in each deck below it.
-const HOLE_COUNT: usize = 16;
-const HOLE_GROWTH: i32 = 10;
-const HOLE_MAX_W: usize = 8;
-const HOLE_MAX_H: usize = 6;
-/// Chance of cutting each corner of an opening at 45 degrees, and of the
-/// cut being a wall (rather than floor) over the void.
-const HOLE_CUT_CHANCE: f32 = 0.5;
-const HOLE_CUT_WALL_CHANCE: f32 = 0.5;
-/// Blocks on the top deck, and how many more (or fewer) on each deck below
-/// it.
-const DECK_BLOCKS: usize = 18;
-const BLOCK_GROWTH: i32 = 0;
-/// Staircases between each layer and the one below.
-const STAIRS: usize = 2;
-
-const BLOCK_COUNT: usize = 27;
-const BLOCK_MAX_W: usize = 5;
-const BLOCK_MAX_H: usize = 4;
-/// Chance of cutting each corner of a block at least 2x2.
-const CUT_CHANCE: f32 = 0.4;
-/// Chance of a 1x1 block being a single slope instead.
-const LONE_SLOPE_CHANCE: f32 = 0.5;
-
-const BAR_COUNT: usize = 2;
-const BAR_MIN_LEN: usize = 3;
-const BAR_MAX_LEN: usize = 6;
-
-/// Chance of letting a piece touch or overlap another, merging into a
-/// composite, rather than rejecting it.
-const MERGE_CHANCE: f32 = 0.5;
 
 /// Initial chance of each cave tile being rock.
 const CAVE_FILL: f32 = 0.45;
 /// Cellular automaton steps smoothing the cave.
 const CAVE_STEPS: usize = 4;
-/// Retry until at least this share of the level is reachable floor.
+/// Retry until at least this share of the layer is reachable floor.
 const CAVE_MIN_OPEN: f32 = 0.35;
 
-/// Materials, by name in the tile sheet: caves of dirt and rock; worlds of
-/// plain floor with brick blocks and metal bars; every deck of metal, with
-/// the same floor.
-const CAVE_FLOOR: &str = "planks";
-const CAVE_WALL: &str = "rock";
-const WORLD_FLOOR: &str = "plain";
-const WORLD_BLOCKS: &str = "brick";
-const WORLD_BARS: &str = "metal";
-const DECK_FLOOR: &str = "planks";
-const DECK_WALL: &str = "metal";
-
-/// Pieces may not come within this many tiles (Chebyshev) of the spawn.
+/// Tiles (Chebyshev) around the spawn kept flat, dry and open.
 const SPAWN_CLEARANCE: i32 = 2;
 
-pub fn generate(style: Style, seed: u32, cols: usize, rows: usize, spawn: [f32; 2]) -> Layer {
+/// Materials, by name in the tile sheet.
+const PLAINS: &str = "grass";
+const HILLS: &str = "dirt";
+const MOUNTAINS: &str = "stone";
+const BED: &str = "sand";
+const ROCK: &str = "rock";
+const CAVE_FLOOR: &str = "dirt";
+const ROOM_FLOOR: &str = "planks";
+const ROOM_WALL: &str = "brick";
+
+/// Generate a level from `seed`, `cols` x `rows` tiles a layer, the player
+/// starting on the plains at `spawn` (pixels).
+pub fn generate_level(
+    seed: u32,
+    cols: usize,
+    rows: usize,
+    spawn: [f32; 2],
+    params: &Params,
+) -> Level {
     let spawn = [(spawn[0] / TILE) as i32, (spawn[1] / TILE) as i32];
-    let tiles = match style {
-        Style::World => world(seed, cols, rows, spawn),
-        Style::Cave | Style::Layered => cave(seed, cols, rows, spawn),
-    };
-    Layer::from_tiles(cols, rows, tiles)
+    World::new(seed, cols, rows, spawn, params).build()
 }
 
-/// A whole level in `style`. World and Cave levels are a single layer.
-pub fn generate_level(style: Style, seed: u32, cols: usize, rows: usize, spawn: [f32; 2]) -> Level {
-    match style {
-        Style::Layered => {
-            let spawn = [(spawn[0] / TILE) as i32, (spawn[1] / TILE) as i32];
-            layered(seed, cols, rows, spawn)
+/// The spawn's layer: the plains, the second overworld layer up.
+pub fn spawn_layer(params: &Params) -> usize {
+    params.underworld_layers.max(1) + 1
+}
+
+struct World {
+    rng: Rng,
+    cols: usize,
+    rows: usize,
+    spawn: [i32; 2],
+    params: Params,
+    /// Underworld layers, then overworld, each row by row.
+    layers: Vec<Vec<Tile>>,
+    /// Terrain height per column, 1 and up (the overworld layer its floor
+    /// is on).
+    height: Vec<usize>,
+    /// Terrain noise per column, in [0, 1).
+    noise: Vec<f32>,
+    rock: Part,
+    floors: Floors,
+}
+
+struct Floors {
+    plains: FloorId,
+    hills: FloorId,
+    mountains: FloorId,
+    bed: FloorId,
+    cave: FloorId,
+    room: FloorId,
+}
+
+impl World {
+    fn new(seed: u32, cols: usize, rows: usize, spawn: [i32; 2], params: &Params) -> Self {
+        let mut params = params.clone();
+        params.underworld_layers = params.underworld_layers.clamp(1, MAX_LAYERS - 2);
+        params.overworld_layers = params
+            .overworld_layers
+            .clamp(2, MAX_LAYERS - params.underworld_layers);
+        let depth = params.underworld_layers + params.overworld_layers;
+        let rock = Part::Wall(tileset::wall(ROCK));
+        let spawn = [
+            spawn[0].clamp(SPAWN_CLEARANCE + 1, cols as i32 - SPAWN_CLEARANCE - 2),
+            spawn[1].clamp(SPAWN_CLEARANCE + 1, rows as i32 - SPAWN_CLEARANCE - 2),
+        ];
+        Self {
+            rng: Rng::new(seed),
+            cols,
+            rows,
+            spawn,
+            params,
+            layers: vec![vec![Tile::Whole(rock); cols * rows]; depth],
+            height: vec![1; cols * rows],
+            noise: vec![0.0; cols * rows],
+            rock,
+            floors: Floors {
+                plains: tileset::floor(PLAINS),
+                hills: tileset::floor(HILLS),
+                mountains: tileset::floor(MOUNTAINS),
+                bed: tileset::floor(BED),
+                cave: tileset::floor(CAVE_FLOOR),
+                room: tileset::floor(ROOM_FLOOR),
+            },
         }
-        _ => Level::new(vec![generate(style, seed, cols, rows, spawn)]),
     }
-}
 
-/// A cave at the bottom, and above it [`LAYERS`]` - 1` decks: floor with
-/// void openings (impassable, but you can see down through them), some
-/// blocks, and stairs down to the layer below.
-/// The player starts on the top deck.
-fn layered(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Level {
-    let mut rng = Rng::new(seed ^ 0x5EED_1A7E);
-    let index = |x: i32, y: i32| y as usize * cols + x as usize;
-    let near_spawn = |x: i32, y: i32, margin: i32| {
-        (x - spawn[0]).abs().max((y - spawn[1]).abs()) <= SPAWN_CLEARANCE + margin
-    };
+    fn build(mut self) -> Level {
+        self.terrain();
+        self.lakes();
+        self.rivers();
+        self.raise_terrain();
+        self.ramps();
+        self.underworld();
+        self.entrances();
+        self.connect();
+        for k in 0..self.layers.len() {
+            smooth(&mut self.layers[k], self.cols, self.rows);
+        }
+        self.level()
+    }
 
-    let mut layers = vec![cave(seed, cols, rows, spawn)];
-    // Each layer's floor and wall types.
-    let mut floors = vec![tileset::floor(CAVE_FLOOR)];
-    let mut walls = vec![tileset::wall(CAVE_WALL)];
-    for k in 1..LAYERS {
-        let floor = tileset::floor(DECK_FLOOR);
-        let wall = tileset::wall(DECK_WALL);
-        floors.push(floor);
-        walls.push(wall);
-        // Decks below the top have `GROWTH` more of each per deck down.
-        let depth = (LAYERS - 1 - k) as i32;
-        let grown = |base: usize, growth: i32| (base as i32 + growth * depth).max(0) as usize;
-        let mut deck = vec![Tile::Whole(Part::Floor(floor)); cols * rows];
-        for _ in 0..grown(HOLE_COUNT, HOLE_GROWTH) {
-            let (w, h) = (
-                rng.range(3, HOLE_MAX_W) as i32,
-                rng.range(2, HOLE_MAX_H) as i32,
-            );
-            let x0 = rng.range(1, cols - w as usize - 1) as i32;
-            let y0 = rng.range(1, rows - h as usize - 1) as i32;
-            for y in y0..y0 + h {
-                for x in x0..x0 + w {
-                    if !near_spawn(x, y, 1) {
-                        deck[index(x, y)] = Tile::VOID;
+    fn level(&self) -> Level {
+        Level::new(
+            self.layers
+                .iter()
+                .map(|t| Layer::from_tiles(self.cols, self.rows, t.clone()))
+                .collect(),
+        )
+    }
+
+    fn index(&self, [x, y]: [i32; 2]) -> usize {
+        y as usize * self.cols + x as usize
+    }
+
+    fn in_bounds(&self, [x, y]: [i32; 2]) -> bool {
+        x >= 0 && y >= 0 && (x as usize) < self.cols && (y as usize) < self.rows
+    }
+
+    /// Inside the one-tile border of rock.
+    fn interior(&self, [x, y]: [i32; 2]) -> bool {
+        x >= 1 && y >= 1 && (x as usize) + 1 < self.cols && (y as usize) + 1 < self.rows
+    }
+
+    fn near_spawn(&self, [x, y]: [i32; 2], margin: i32) -> bool {
+        (x - self.spawn[0]).abs().max((y - self.spawn[1]).abs()) <= SPAWN_CLEARANCE + margin
+    }
+
+    /// The overworld layer `h` above the lowest (height `h`'s floor).
+    fn over(&self, h: usize) -> usize {
+        self.params.underworld_layers + h
+    }
+
+    fn top_cave(&self) -> usize {
+        self.params.underworld_layers - 1
+    }
+
+    fn tiles(&self) -> impl Iterator<Item = [i32; 2]> + use<> {
+        let (cols, rows) = (self.cols as i32, self.rows as i32);
+        (0..rows).flat_map(move |y| (0..cols).map(move |x| [x, y]))
+    }
+
+    // --- The overworld ---------------------------------------------------
+
+    /// Heights from noise: the lowest `water_share` of the surface is left
+    /// at the plains' height for lakes; of the rest, `hill_share` is hills
+    /// and above, and of that `mountain_share` is the mountains, spread
+    /// over the heights above the hills. Steps between neighbors are
+    /// limited to one, so every cliff is one layer tall. The spawn and its
+    /// surroundings are plains.
+    fn terrain(&mut self) {
+        let p = &self.params;
+        let top = p.overworld_layers - 1;
+        let seed = self.rng.range(0, u16::MAX as usize) as u32;
+        let scale = p.terrain_scale.max(2.0);
+        let noise: Vec<f32> = self
+            .tiles()
+            .map(|[x, y]| fbm(seed, x as f32 / scale, y as f32 / scale))
+            .collect();
+        let mut sorted = noise.clone();
+        sorted.sort_by(f32::total_cmp);
+        let at = |share: f32| sorted[(share.clamp(0.0, 1.0) * (sorted.len() - 1) as f32) as usize];
+        let land_from = p.water_share.clamp(0.0, 0.9);
+        let hills_from = land_from + (1.0 - land_from) * (1.0 - p.hill_share.clamp(0.0, 1.0));
+        let mountains_from =
+            hills_from + (1.0 - hills_from) * (1.0 - p.mountain_share.clamp(0.0, 1.0));
+        let (hills, mountains) = (at(hills_from), at(mountains_from));
+        let peaks = top.saturating_sub(2).max(1) as f32;
+        for (i, &n) in noise.iter().enumerate() {
+            self.height[i] = if top < 2 || n < hills {
+                1
+            } else if top < 3 || n < mountains {
+                2
+            } else {
+                // The mountains' heights, 3 and up, by how far above the
+                // mountain line.
+                let t = (n - mountains) / (1.0 - mountains).max(1e-6);
+                3 + ((t * peaks) as usize).min(top - 3)
+            };
+        }
+        self.noise = noise;
+        // No step of more than one between neighbors: lower the high side.
+        loop {
+            let mut changed = false;
+            for t in self.tiles() {
+                let i = self.index(t);
+                for side in Side::ALL {
+                    let [dx, dy] = side.offset();
+                    let n = [t[0] + dx, t[1] + dy];
+                    if self.in_bounds(n) && self.height[i] > self.height[self.index(n)] + 1 {
+                        self.height[i] = self.height[self.index(n)] + 1;
+                        changed = true;
                     }
                 }
             }
-        }
-        cut_hole_corners(&mut deck, cols, rows, &mut rng, floor, wall);
-        for _ in 0..grown(DECK_BLOCKS, BLOCK_GROWTH) {
-            let piece = random_block(&mut rng, cols, rows).of(wall);
-            if piece.tiles.iter().all(|([x, y], _)| !near_spawn(*x, *y, 0)) {
-                piece.stamp(&mut deck, cols);
+            if !changed {
+                break;
             }
         }
-        layers.push(deck);
+        for t in self.tiles() {
+            if self.near_spawn(t, 2) {
+                let i = self.index(t);
+                self.height[i] = 1;
+            }
+        }
+        // Relax again around the flattened spawn.
+        loop {
+            let mut changed = false;
+            for t in self.tiles() {
+                let i = self.index(t);
+                for side in Side::ALL {
+                    let [dx, dy] = side.offset();
+                    let n = [t[0] + dx, t[1] + dy];
+                    if self.in_bounds(n) && self.height[i] > self.height[self.index(n)] + 1 {
+                        self.height[i] = self.height[self.index(n)] + 1;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 
-    // Stairs between each layer and the one below, where both have floor
-    // all around, so arriving at either end never lands the player in a
-    // wall, and where the player can get to them: placed from the top down,
-    // so each layer's reachable floor includes the stairs arriving from
-    // above. If there's no such spot, clear one around reachable floor:
-    // every layer needs a way down, or everything below it is cut off.
-    let clear = |tiles: &[Tile], x: i32, y: i32| {
-        (-1..=1).all(|dy| (-1..=1).all(|dx| tiles[index(x + dx, y + dy)].is_floor()))
-    };
-    let interior: Vec<[i32; 2]> = (2..rows as i32 - 2)
-        .flat_map(|y| (2..cols as i32 - 2).map(move |x| [x, y]))
-        .collect();
-    for upper in (1..LAYERS).rev() {
-        let level = Level::new(
-            layers
-                .iter()
-                .map(|t| Layer::from_tiles(cols, rows, t.clone()))
-                .collect(),
-        );
-        let reached = reachable_across(&level, LAYERS - 1, spawn);
-        let reachable = |[x, y]: [i32; 2]| reached[upper][index(x, y)];
-        let mut candidates: Vec<[i32; 2]> = interior
-            .iter()
-            .copied()
-            .filter(|&[x, y]| {
-                reachable([x, y])
-                    && !near_spawn(x, y, 1)
-                    && clear(&layers[upper], x, y)
-                    && clear(&layers[upper - 1], x, y)
-            })
-            .collect();
-        if candidates.is_empty() {
-            // Plain floor only: not the stairs arriving from above.
-            let floor = |t: [i32; 2]| {
-                reachable(t)
-                    && layers[upper][index(t[0], t[1])].is_floor()
-                    && layers[upper - 1][index(t[0], t[1])].stairs().is_none()
-            };
-            let away: Vec<[i32; 2]> = interior
-                .iter()
-                .copied()
-                .filter(|&t| floor(t) && !near_spawn(t[0], t[1], 1))
+    /// Lakes where the noise is lowest: water on the plains' layer over a
+    /// sandy bed on the layer below. Not at the spawn, and not where the
+    /// relaxed terrain is still high.
+    fn lakes(&mut self) {
+        let mut sorted = self.noise.clone();
+        sorted.sort_by(f32::total_cmp);
+        let share = self.params.water_share.clamp(0.0, 0.9);
+        let level = sorted[(share * (sorted.len() - 1) as f32) as usize];
+        let (bed, plains) = (self.over(0), self.over(1));
+        for t in self.tiles() {
+            let i = self.index(t);
+            let low = share > 0.0 && self.noise[i] <= level && self.height[i] == 1;
+            if low && self.interior(t) && !self.near_spawn(t, 2) {
+                self.layers[bed][i] = Tile::Whole(Part::Floor(self.floors.bed));
+                self.layers[plains][i] = Tile::WATER;
+            }
+        }
+    }
+
+    /// Rivers: from a high tile, downhill by the noise (with a little
+    /// wandering) to a lake, the edge, or exhaustion, carving the terrain
+    /// down to the plains along the way. Every `ford_spacing` tiles a ford
+    /// is left as land.
+    fn rivers(&mut self) {
+        let plains = self.over(1);
+        let bed = self.over(0);
+        let water = |w: &World, t: [i32; 2]| w.layers[plains][w.index(t)] == Tile::WATER;
+        for _ in 0..self.params.rivers {
+            let highs: Vec<[i32; 2]> = self
+                .tiles()
+                .filter(|&t| {
+                    self.interior(t) && self.height[self.index(t)] >= 2 && !self.near_spawn(t, 4)
+                })
                 .collect();
-            let near: Vec<[i32; 2]> = interior
-                .iter()
-                .copied()
-                .filter(|&t| floor(t) && t != spawn)
-                .collect();
-            let pool = if away.is_empty() { near } else { away };
-            let Some(&at) = pool.get(rng.range(0, pool.len().max(1) - 1)) else {
-                continue;
-            };
-            for k in [upper - 1, upper] {
+            if highs.is_empty() {
+                break;
+            }
+            let mut at = highs[self.rng.range(0, highs.len() - 1)];
+            let mut path = vec![at];
+            let mut visited = vec![false; self.cols * self.rows];
+            visited[self.index(at)] = true;
+            for _ in 0..(self.cols + self.rows) * 2 {
+                // Lowest neighbor by noise, jittered so rivers meander.
+                let mut best: Option<([i32; 2], f32)> = None;
                 for dy in -1..=1 {
                     for dx in -1..=1 {
-                        // Leave stairs placed already.
-                        let tile = &mut layers[k][index(at[0] + dx, at[1] + dy)];
-                        if tile.stairs().is_none() {
-                            *tile = Tile::Whole(Part::Floor(floors[k]));
+                        let n = [at[0] + dx, at[1] + dy];
+                        if (dx, dy) == (0, 0) || !self.in_bounds(n) || visited[self.index(n)] {
+                            continue;
+                        }
+                        let score = self.noise[self.index(n)] + self.rng.unit() * 0.08;
+                        if best.is_none_or(|(_, s)| score < s) {
+                            best = Some((n, score));
                         }
                     }
                 }
+                let Some((next, _)) = best else {
+                    break;
+                };
+                at = next;
+                visited[self.index(at)] = true;
+                if !self.interior(at) || water(self, at) {
+                    break;
+                }
+                path.push(at);
             }
-            candidates.push(at);
-        }
-        for _ in 0..STAIRS {
-            if candidates.is_empty() {
-                break;
+            // Carve: the river's columns become plains with water on them,
+            // and their neighbors are lowered to keep steps to one.
+            for (n, &t) in path.iter().enumerate() {
+                if self.near_spawn(t, 2) {
+                    continue;
+                }
+                let i = self.index(t);
+                self.height[i] = 1;
+                let ford = self.params.ford_spacing > 0
+                    && n % self.params.ford_spacing == self.params.ford_spacing / 2;
+                if !ford {
+                    self.layers[bed][i] = Tile::Whole(Part::Floor(self.floors.bed));
+                    self.layers[plains][i] = Tile::WATER;
+                }
             }
-            let [x, y] = candidates.swap_remove(rng.range(0, candidates.len() - 1));
-            layers[upper][index(x, y)] = Tile::Stairs(Dir::Down, floors[upper]);
-            layers[upper - 1][index(x, y)] = Tile::Stairs(Dir::Up, floors[upper - 1]);
-            // Keep staircases apart.
-            candidates.retain(|c| (c[0] - x).abs().max((c[1] - y).abs()) > 4);
-        }
-    }
-
-    // Fill in whatever floor the player can't reach.
-    let level = Level::new(
-        layers
-            .iter()
-            .map(|t| Layer::from_tiles(cols, rows, t.clone()))
-            .collect(),
-    );
-    let reached = reachable_across(&level, layers.len() - 1, spawn);
-    for (k, tiles) in layers.iter_mut().enumerate() {
-        let movement = level.movement(k);
-        for (i, tile) in tiles.iter_mut().enumerate() {
-            let open = movement.solid((i % cols) as i32, (i / cols) as i32) != Solid::Full;
-            if open && !reached[k][i] {
-                *tile = Tile::Whole(Part::Wall(walls[k]));
-            }
-        }
-    }
-    Level::new(
-        layers
-            .into_iter()
-            .map(|t| Layer::from_tiles(cols, rows, t))
-            .collect(),
-    )
-}
-
-/// Cut the corners of void openings at 45 degrees: a void tile with
-/// floor on two neighboring sides and void on the other two (and across
-/// from the corner between the floor sides) becomes, by chance, floor or
-/// wall in that corner's half and void in the rest.
-fn cut_hole_corners(
-    deck: &mut [Tile],
-    cols: usize,
-    rows: usize,
-    rng: &mut Rng,
-    floor_type: FloorId,
-    wall_type: WallId,
-) {
-    let snapshot = deck.to_vec();
-    let tile = |x: i32, y: i32| {
-        if x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 {
-            Tile::WALL
-        } else {
-            snapshot[y as usize * cols + x as usize]
-        }
-    };
-    let step = |[x, y]: [i32; 2], sides: &[Side]| {
-        sides
-            .iter()
-            .fold([x, y], |[x, y], s| [x + s.offset()[0], y + s.offset()[1]])
-    };
-    for y in 0..rows as i32 {
-        for x in 0..cols as i32 {
-            if tile(x, y) != Tile::VOID {
-                continue;
-            }
-            for corner in Corner::CLOCKWISE {
-                let floor = corner.sides().map(|s| step([x, y], &[s]));
-                let open = corner.opposite().sides().map(|s| step([x, y], &[s]));
-                let across = step([x, y], &corner.opposite().sides());
-                let is = |t: [i32; 2], want: Tile| tile(t[0], t[1]) == want;
-                if floor.iter().all(|t| tile(t[0], t[1]).is_floor())
-                    && open.iter().all(|t| is(*t, Tile::VOID))
-                    && is(across, Tile::VOID)
-                    && rng.unit() < HOLE_CUT_CHANCE
-                {
-                    let part = if rng.unit() < HOLE_CUT_WALL_CHANCE {
-                        Part::Wall(wall_type)
-                    } else {
-                        Part::Floor(floor_type)
-                    };
-                    deck[y as usize * cols + x as usize] = Tile::split(corner, part, Part::Void);
+            loop {
+                let mut changed = false;
+                for t in self.tiles() {
+                    let i = self.index(t);
+                    for side in Side::ALL {
+                        let [dx, dy] = side.offset();
+                        let n = [t[0] + dx, t[1] + dy];
+                        if self.in_bounds(n) && self.height[i] > self.height[self.index(n)] + 1 {
+                            self.height[i] = self.height[self.index(n)] + 1;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
                     break;
                 }
             }
         }
+        // A lone tile of land with water on every side becomes water too.
+        for t in self.tiles() {
+            let i = self.index(t);
+            if self.layers[plains][i] == Tile::WATER || !self.interior(t) || self.near_spawn(t, 2) {
+                continue;
+            }
+            let landlocked = Side::ALL.into_iter().all(|side| {
+                let [dx, dy] = side.offset();
+                water(self, [t[0] + dx, t[1] + dy])
+            });
+            if landlocked && self.height[i] == 1 {
+                self.layers[bed][i] = Tile::Whole(Part::Floor(self.floors.bed));
+                self.layers[plains][i] = Tile::WATER;
+            }
+        }
     }
+
+    /// Write the terrain into the overworld layers: for each column, rock
+    /// below its height, floor at it, void above. Water placed already is
+    /// kept. The lowest layer is the lake beds and rock.
+    fn raise_terrain(&mut self) {
+        let n = self.params.overworld_layers;
+        for t in self.tiles() {
+            let i = self.index(t);
+            let h = self.height[i];
+            let floor = match h {
+                1 => self.floors.plains,
+                2 => self.floors.hills,
+                _ => self.floors.mountains,
+            };
+            for k in 0..n {
+                let layer = self.over(k);
+                if self.layers[layer][i] == Tile::WATER
+                    || self.layers[layer][i].floor_id() == Some(self.floors.bed)
+                {
+                    continue;
+                }
+                self.layers[layer][i] = if k < h {
+                    Tile::Whole(self.rock)
+                } else if k == h {
+                    Tile::Whole(Part::Floor(floor))
+                } else {
+                    Tile::VOID
+                };
+            }
+            if !self.interior(t) {
+                // The border is rock all the way up.
+                for k in 0..n {
+                    let layer = self.over(k);
+                    self.layers[layer][i] = Tile::Whole(self.rock);
+                }
+            }
+        }
+    }
+
+    /// Can a ramp go at column `t`, down from its height `h` to a neighbor
+    /// at `h - 1`? Land on both ends.
+    fn ramp_fits(&self, t: [i32; 2]) -> bool {
+        let i = self.index(t);
+        let h = self.height[i];
+        if h < 2 || !self.interior(t) || self.near_spawn(t, 0) {
+            return false;
+        }
+        if !self.layers[self.over(h)][i].is_floor() {
+            return false;
+        }
+        Side::ALL.into_iter().any(|side| {
+            let [dx, dy] = side.offset();
+            let n = [t[0] + dx, t[1] + dy];
+            self.in_bounds(n)
+                && self.height[self.index(n)] == h - 1
+                && self.layers[self.over(h - 1)][self.index(n)].is_floor()
+        })
+    }
+
+    /// A ramp at column `t`: stairs down on its own layer, stairs up in the
+    /// cliff face below, where the lower ground reaches it.
+    fn place_ramp(&mut self, t: [i32; 2]) {
+        let i = self.index(t);
+        let h = self.height[i];
+        let floor = |w: &World, k: usize| match k {
+            1 => w.floors.plains,
+            2 => w.floors.hills,
+            _ => w.floors.mountains,
+        };
+        let (upper, lower) = (self.over(h), self.over(h - 1));
+        let (up_floor, down_floor) = (floor(self, h), floor(self, h - 1));
+        self.layers[upper][i] = Tile::Stairs(Dir::Down, up_floor);
+        self.layers[lower][i] = Tile::Stairs(Dir::Up, down_floor);
+    }
+
+    /// Ramps along every cliff, `ramp_spacing` apart (none if that's 0).
+    fn ramps(&mut self) {
+        let spacing = self.params.ramp_spacing as i32;
+        if spacing == 0 {
+            return;
+        }
+        let mut placed: Vec<[i32; 2]> = Vec::new();
+        for t in self.tiles() {
+            if !self.ramp_fits(t) {
+                continue;
+            }
+            let h = self.height[self.index(t)];
+            let crowded = placed.iter().any(|p| {
+                (p[0] - t[0]).abs().max((p[1] - t[1]).abs()) < spacing
+                    && self.height[self.index(*p)] == h
+            });
+            if !crowded {
+                self.place_ramp(t);
+                placed.push(t);
+            }
+        }
+    }
+
+    // --- The underworld --------------------------------------------------
+
+    /// Caves with dungeon rooms on every underworld layer, pools in the
+    /// caves, and stairs between the layers.
+    fn underworld(&mut self) {
+        let m = self.params.underworld_layers;
+        let seed = self.rng.range(0, u16::MAX as usize) as u32;
+        // Each cave is grown around a seed tile, so there's floor near
+        // where the stairs from above (or the entrances) will arrive.
+        for k in 0..m {
+            let around = [
+                self.rng.range(4, self.cols - 5) as i32,
+                self.rng.range(4, self.rows - 5) as i32,
+            ];
+            self.layers[k] = cave(
+                seed ^ (k as u32).wrapping_mul(0x9E37_79B9),
+                self.cols,
+                self.rows,
+                around,
+                self.rock,
+                Part::Floor(self.floors.cave),
+            );
+            self.rooms(k);
+            self.pools(k);
+        }
+        // Stairs between each underworld layer and the one below, where
+        // both have floor all around; cleared if there's no such spot.
+        let interior: Vec<[i32; 2]> = self
+            .tiles()
+            .filter(|&[x, y]| {
+                x >= 2 && y >= 2 && (x as usize) + 2 < self.cols && (y as usize) + 2 < self.rows
+            })
+            .collect();
+        for upper in (1..m).rev() {
+            let clear = |w: &World, k: usize, [x, y]: [i32; 2]| {
+                (-1..=1)
+                    .all(|dy| (-1..=1).all(|dx| w.layers[k][w.index([x + dx, y + dy])].is_floor()))
+            };
+            let mut candidates: Vec<[i32; 2]> = interior
+                .iter()
+                .copied()
+                .filter(|&t| clear(self, upper, t) && clear(self, upper - 1, t))
+                .collect();
+            if candidates.is_empty() {
+                let pool: Vec<[i32; 2]> = interior
+                    .iter()
+                    .copied()
+                    .filter(|&t| self.layers[upper][self.index(t)].is_floor())
+                    .collect();
+                if let Some(&at) = pool.get(self.rng.range(0, pool.len().max(1) - 1)) {
+                    for k in [upper - 1, upper] {
+                        self.clear_pocket(k, at);
+                    }
+                    candidates.push(at);
+                }
+            }
+            for _ in 0..self.params.stairs {
+                if candidates.is_empty() {
+                    break;
+                }
+                let at = candidates.swap_remove(self.rng.range(0, candidates.len() - 1));
+                let i = self.index(at);
+                self.layers[upper][i] = Tile::Stairs(Dir::Down, self.floors.cave);
+                self.layers[upper - 1][i] = Tile::Stairs(Dir::Up, self.floors.cave);
+                candidates.retain(|c| (c[0] - at[0]).abs().max((c[1] - at[1]).abs()) > 4);
+            }
+        }
+    }
+
+    /// A 3x3 of cave floor around `at` on layer `k`, leaving stairs.
+    fn clear_pocket(&mut self, k: usize, at: [i32; 2]) {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let t = [at[0] + dx, at[1] + dy];
+                if self.interior(t) {
+                    let i = self.index(t);
+                    if self.layers[k][i].stairs().is_none() {
+                        self.layers[k][i] = Tile::Whole(Part::Floor(self.floors.cave));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dungeon rooms on cave layer `k`: rectangles of plank floor walled
+    /// in brick, each with a door and a corridor dug toward the cave.
+    fn rooms(&mut self, k: usize) {
+        let (brick, planks) = (
+            Part::Wall(tileset::wall(ROOM_WALL)),
+            Part::Floor(self.floors.room),
+        );
+        let mut placed: Vec<[i32; 4]> = Vec::new();
+        for _ in 0..self.params.rooms * 10 {
+            if placed.len() >= self.params.rooms {
+                break;
+            }
+            let (w, h) = (self.rng.range(5, 9) as i32, self.rng.range(4, 7) as i32);
+            if w as usize + 4 >= self.cols || h as usize + 4 >= self.rows {
+                continue;
+            }
+            let x = self.rng.range(2, self.cols - w as usize - 2) as i32;
+            let y = self.rng.range(2, self.rows - h as usize - 2) as i32;
+            let overlaps = placed.iter().any(|r| {
+                x < r[0] + r[2] + 1 && x + w + 1 > r[0] && y < r[1] + r[3] + 1 && y + h + 1 > r[1]
+            });
+            if overlaps {
+                continue;
+            }
+            placed.push([x, y, w, h]);
+            for ty in y..y + h {
+                for tx in x..x + w {
+                    let edge = tx == x || tx == x + w - 1 || ty == y || ty == y + h - 1;
+                    let i = self.index([tx, ty]);
+                    self.layers[k][i] = Tile::Whole(if edge { brick } else { planks });
+                }
+            }
+            // A door on a random side, and a corridor out from it until it
+            // meets cave floor.
+            let side = Side::ALL[self.rng.range(0, 3)];
+            let door = match side {
+                Side::N => [x + 1 + self.rng.range(0, (w - 3) as usize) as i32, y],
+                Side::S => [
+                    x + 1 + self.rng.range(0, (w - 3) as usize) as i32,
+                    y + h - 1,
+                ],
+                Side::W => [x, y + 1 + self.rng.range(0, (h - 3) as usize) as i32],
+                Side::E => [
+                    x + w - 1,
+                    y + 1 + self.rng.range(0, (h - 3) as usize) as i32,
+                ],
+            };
+            let door_index = self.index(door);
+            self.layers[k][door_index] = Tile::Whole(planks);
+            let [dx, dy] = side.offset();
+            let mut at = door;
+            for _ in 0..(self.cols + self.rows) {
+                at = [at[0] + dx, at[1] + dy];
+                if !self.interior(at) {
+                    break;
+                }
+                let i = self.index(at);
+                if self.layers[k][i].is_floor() || self.layers[k][i] == Tile::WATER {
+                    break;
+                }
+                self.layers[k][i] = Tile::Whole(Part::Floor(self.floors.cave));
+            }
+        }
+    }
+
+    /// Pools: the lowest-noise cave floor, where all its neighbors are
+    /// floor too (so nothing narrow is blocked), up to `pool_share` of the
+    /// floor.
+    fn pools(&mut self, k: usize) {
+        let share = self.params.pool_share.clamp(0.0, 0.5);
+        if share <= 0.0 {
+            return;
+        }
+        let seed = self.rng.range(0, u16::MAX as usize) as u32;
+        let mut open: Vec<([i32; 2], f32)> = self
+            .tiles()
+            .filter(|&t| {
+                let cave = self.floors.cave;
+                self.layers[k][self.index(t)].floor_id() == Some(cave)
+                    && (-1..=1).all(|dy| {
+                        (-1..=1).all(|dx| {
+                            let n = [t[0] + dx, t[1] + dy];
+                            self.in_bounds(n) && self.layers[k][self.index(n)].is_floor()
+                        })
+                    })
+            })
+            .map(|t| (t, fbm(seed, t[0] as f32 / 6.0, t[1] as f32 / 6.0)))
+            .collect();
+        open.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let count = (open.len() as f32 * share) as usize;
+        for (t, _) in open.into_iter().take(count) {
+            let i = self.index(t);
+            self.layers[k][i] = Tile::WATER;
+        }
+    }
+
+    /// Entrances: a cellar in the lowest overworld layer under a plains
+    /// tile, with stairs down from the surface and, beside them, stairs on
+    /// down into the top cave (cleared around where they arrive).
+    fn entrances(&mut self) {
+        let (plains, cellar, cave) = (self.over(1), self.over(0), self.top_cave());
+        let plains_floor = self.floors.plains;
+        for _ in 0..self.params.entrances {
+            let spots: Vec<[i32; 2]> = self
+                .tiles()
+                .filter(|&t| {
+                    // The cellar's footprint: plains all over it, rock
+                    // under all of it.
+                    t[0] >= 3
+                        && t[1] >= 3
+                        && (t[0] as usize) + 4 < self.cols
+                        && (t[1] as usize) + 3 < self.rows
+                        && !self.near_spawn(t, 3)
+                        && (-1..=1).all(|dy| {
+                            (-1..=2).all(|dx| {
+                                let i = self.index([t[0] + dx, t[1] + dy]);
+                                self.layers[plains][i].floor_id() == Some(plains_floor)
+                                    && self.layers[cellar][i] == Tile::Whole(self.rock)
+                            })
+                        })
+                })
+                .collect();
+            if spots.is_empty() {
+                break;
+            }
+            let at = spots[self.rng.range(0, spots.len() - 1)];
+            let beside = [at[0] + 1, at[1]];
+            let (ia, ib) = (self.index(at), self.index(beside));
+            let cave_floor = self.floors.cave;
+            self.clear_pocket(cellar, at);
+            self.clear_pocket(cellar, beside);
+            self.clear_pocket(cave, beside);
+            self.layers[plains][ia] = Tile::Stairs(Dir::Down, plains_floor);
+            self.layers[cellar][ia] = Tile::Stairs(Dir::Up, cave_floor);
+            self.layers[cellar][ib] = Tile::Stairs(Dir::Down, cave_floor);
+            self.layers[cave][ib] = Tile::Stairs(Dir::Up, cave_floor);
+        }
+    }
+
+    // --- Connectivity ----------------------------------------------------
+
+    /// Which tiles of each layer the player can walk to from the spawn,
+    /// straight from the tiles (no [`Level`] needed): walls and void
+    /// block, stairs join layers. Also each layer's movement grid.
+    fn reachable(&self) -> (Vec<Vec<bool>>, Vec<Vec<Solid>>) {
+        let (cols, rows) = (self.cols, self.rows);
+        let grids: Vec<Vec<Solid>> = self
+            .layers
+            .iter()
+            .map(|tiles| {
+                tiles
+                    .iter()
+                    .map(|t| Solid::from_quarters(t.wall().quarters() | t.void_quarters(), true))
+                    .collect()
+            })
+            .collect();
+        let depth = self.layers.len();
+        let mut seeds: Vec<Vec<[i32; 2]>> = vec![Vec::new(); depth];
+        seeds[self.over(1)].push(self.spawn);
+        let mut reached = vec![vec![false; cols * rows]; depth];
+        loop {
+            let mut grew = false;
+            for k in 0..depth {
+                if seeds[k].is_empty() {
+                    continue;
+                }
+                let more = reachable_from(&grids[k], cols, rows, &std::mem::take(&mut seeds[k]));
+                for i in 0..cols * rows {
+                    if more[i] && !reached[k][i] {
+                        reached[k][i] = true;
+                        grew = true;
+                        let at = [(i % cols) as i32, (i / cols) as i32];
+                        match self.layers[k][i].stairs() {
+                            Some(Dir::Down) if k > 0 => seeds[k - 1].push(at),
+                            Some(Dir::Up) if k + 1 < depth => seeds[k + 1].push(at),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if !grew {
+                return (reached, grids);
+            }
+        }
+    }
+
+    /// The connected piece of plains floor `start` is on (across sides).
+    fn plains_region(&self, start: [i32; 2]) -> Vec<[i32; 2]> {
+        let plains = self.over(1);
+        let mut seen = vec![false; self.cols * self.rows];
+        let mut stack = vec![start];
+        let mut out = Vec::new();
+        seen[self.index(start)] = true;
+        while let Some(t) = stack.pop() {
+            out.push(t);
+            for side in Side::ALL {
+                let [dx, dy] = side.offset();
+                let n = [t[0] + dx, t[1] + dy];
+                if self.in_bounds(n)
+                    && !seen[self.index(n)]
+                    && self.layers[plains][self.index(n)].is_floor()
+                {
+                    seen[self.index(n)] = true;
+                    stack.push(n);
+                }
+            }
+        }
+        out
+    }
+
+    /// The water tiles of the shortest way from `start` (cut-off land)
+    /// across water to land that's `reached`, within `reach` tiles.
+    fn ford_path(&self, start: [i32; 2], reached: &[bool], reach: usize) -> Option<Vec<[i32; 2]>> {
+        let plains = self.over(1);
+        let mut from: Vec<Option<[i32; 2]>> = vec![None; self.cols * self.rows];
+        let mut seen = vec![false; self.cols * self.rows];
+        let mut frontier = vec![start];
+        seen[self.index(start)] = true;
+        for _ in 0..reach {
+            let mut next = Vec::new();
+            for t in frontier {
+                for side in Side::ALL {
+                    let [dx, dy] = side.offset();
+                    let n = [t[0] + dx, t[1] + dy];
+                    if !self.in_bounds(n) || seen[self.index(n)] {
+                        continue;
+                    }
+                    let tile = self.layers[plains][self.index(n)];
+                    seen[self.index(n)] = true;
+                    from[self.index(n)] = Some(t);
+                    if tile.is_floor() && reached[self.index(n)] {
+                        // Walk back, collecting the water crossed.
+                        let mut path = Vec::new();
+                        let mut at = t;
+                        while at != start {
+                            path.push(at);
+                            at = from[self.index(at)].unwrap();
+                        }
+                        return Some(path);
+                    }
+                    if tile == Tile::WATER {
+                        next.push(n);
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Join what the player can't reach from the spawn: fords across water
+    /// between separated land, ramps up to unreached ground (if ramps are
+    /// allowed), and rock filling unreached underworld floor.
+    fn connect(&mut self) {
+        /// A cut-off piece of plains this small sinks into the lake around
+        /// it rather than getting a causeway.
+        const ISLET: usize = 16;
+        let m = self.params.underworld_layers;
+        let plains = self.over(1);
+        let bed = self.over(0);
+        // Tiles given up on, per layer: nothing could join them.
+        let mut skipped = vec![vec![false; self.cols * self.rows]; self.layers.len()];
+        for _ in 0..256 {
+            let (reached, _) = self.reachable();
+            let mut changed = false;
+
+            // A ford: from a piece of cut-off plains, the shortest way
+            // through water to plains that are reached. A short one if
+            // there is one; else a small piece becomes lake, a large one
+            // gets a causeway however long.
+            let cut_off = self.tiles().find(|&t| {
+                let i = self.index(t);
+                self.layers[plains][i].is_floor()
+                    && !reached[plains][i]
+                    && self.height[i] == 1
+                    && !skipped[plains][i]
+            });
+            if let Some(start) = cut_off {
+                let far = self.cols + self.rows;
+                let region = self.plains_region(start);
+                let path = self.ford_path(start, &reached[plains], 8).or_else(|| {
+                    (region.len() > ISLET)
+                        .then(|| self.ford_path(start, &reached[plains], far))
+                        .flatten()
+                });
+                if let Some(path) = path {
+                    for t in path {
+                        let i = self.index(t);
+                        self.layers[plains][i] = Tile::Whole(Part::Floor(self.floors.bed));
+                        self.layers[bed][i] = Tile::Whole(self.rock);
+                    }
+                    changed = true;
+                } else if region.len() <= ISLET
+                    && region
+                        .iter()
+                        .all(|t| self.interior(*t) && !self.near_spawn(*t, 2))
+                {
+                    for t in region {
+                        let i = self.index(t);
+                        self.layers[plains][i] = Tile::WATER;
+                        self.layers[bed][i] = Tile::Whole(Part::Floor(self.floors.bed));
+                    }
+                    changed = true;
+                } else {
+                    for t in region {
+                        skipped[plains][self.index(t)] = true;
+                    }
+                    changed = true;
+                }
+            }
+
+            // Ramps: an unreached column that could ramp down to reached
+            // ground, or reached ground above unreached ground.
+            if self.params.ramp_spacing > 0 && !changed {
+                let candidate = self.tiles().find(|&t| {
+                    if !self.ramp_fits(t) {
+                        return false;
+                    }
+                    let i = self.index(t);
+                    let h = self.height[i];
+                    let here = reached[self.over(h)][i];
+                    Side::ALL.into_iter().any(|side| {
+                        let [dx, dy] = side.offset();
+                        let n = [t[0] + dx, t[1] + dy];
+                        self.in_bounds(n)
+                            && self.height[self.index(n)] == h - 1
+                            && self.layers[self.over(h - 1)][self.index(n)].is_floor()
+                            && reached[self.over(h - 1)][self.index(n)] != here
+                    })
+                });
+                if let Some(t) = candidate {
+                    self.place_ramp(t);
+                    changed = true;
+                }
+            }
+            // High ground rising straight out of water, with no land below
+            // to ramp down onto: give it a shore, one tile of water made
+            // bed, and a causeway from there to land that's reached; or
+            // give that hill up.
+            if self.params.ramp_spacing > 0 && !changed {
+                let hills = self.over(2);
+                let shore = self.tiles().find_map(|t| {
+                    let i = self.index(t);
+                    let h = self.height[i];
+                    if h != 2
+                        || !self.interior(t)
+                        || reached[hills][i]
+                        || skipped[hills][i]
+                        || !self.layers[hills][i].is_floor()
+                    {
+                        return None;
+                    }
+                    let lower = |w: &World, side: Side| {
+                        let [dx, dy] = side.offset();
+                        let n = [t[0] + dx, t[1] + dy];
+                        (w.in_bounds(n) && w.height[w.index(n)] == 1).then_some(n)
+                    };
+                    let has_land = Side::ALL.into_iter().any(|side| {
+                        lower(self, side)
+                            .is_some_and(|n| self.layers[plains][self.index(n)].is_floor())
+                    });
+                    if has_land {
+                        return None;
+                    }
+                    Side::ALL
+                        .into_iter()
+                        .find_map(|side| {
+                            lower(self, side)
+                                .filter(|n| self.layers[plains][self.index(*n)] == Tile::WATER)
+                        })
+                        .map(|n| (t, n))
+                });
+                if let Some((t, n)) = shore {
+                    let far = self.cols + self.rows;
+                    match self.ford_path(n, &reached[plains], far) {
+                        Some(path) => {
+                            for t in path.into_iter().chain([n]) {
+                                let i = self.index(t);
+                                self.layers[plains][i] = Tile::Whole(Part::Floor(self.floors.bed));
+                                self.layers[bed][i] = Tile::Whole(self.rock);
+                            }
+                        }
+                        None => {
+                            skipped[hills][self.index(t)] = true;
+                        }
+                    }
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Underworld floor nobody can reach becomes rock.
+        let (reached, grids) = self.reachable();
+        let rock = self.rock;
+        for (k, reached) in reached.iter().enumerate().take(m) {
+            for (i, tile) in self.layers[k].iter_mut().enumerate() {
+                let open = grids[k][i] != Solid::Full;
+                if open && !reached[i] && *tile != Tile::WATER {
+                    *tile = Tile::Whole(rock);
+                }
+            }
+        }
+    }
+}
+
+/// Value noise with three octaves, in [0, 1): smooth hills of wavelength
+/// about one unit of `(x, y)`.
+fn fbm(seed: u32, x: f32, y: f32) -> f32 {
+    let mut sum = 0.0;
+    let mut amp = 1.0;
+    let mut norm = 0.0;
+    let (mut fx, mut fy) = (x, y);
+    for octave in 0..3u32 {
+        sum += value_noise(seed.wrapping_add(octave.wrapping_mul(0x51ED_270B)), fx, fy) * amp;
+        norm += amp;
+        amp *= 0.5;
+        fx *= 2.0;
+        fy *= 2.0;
+    }
+    (sum / norm).clamp(0.0, 0.999_99)
+}
+
+/// Bilinear value noise: a hashed value at each lattice point, smoothly
+/// interpolated between.
+fn value_noise(seed: u32, x: f32, y: f32) -> f32 {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (tx, ty) = (x - x0, y - y0);
+    let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
+    let (sx, sy) = (smooth(tx), smooth(ty));
+    let at = |dx: f32, dy: f32| lattice(seed, (x0 + dx) as i32, (y0 + dy) as i32);
+    let top = at(0.0, 0.0) + (at(1.0, 0.0) - at(0.0, 0.0)) * sx;
+    let bottom = at(0.0, 1.0) + (at(1.0, 1.0) - at(0.0, 1.0)) * sx;
+    top + (bottom - top) * sy
+}
+
+fn lattice(seed: u32, x: i32, y: i32) -> f32 {
+    let mut h = seed ^ (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297A_2D39);
+    h ^= h >> 15;
+    (h >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// A cave of `floor` carved out of `wall` by cellular automata, grown
+/// until at least [`CAVE_MIN_OPEN`] of the layer is floor connected to
+/// `around` (which is cleared), the border left solid.
+fn cave(
+    seed: u32,
+    cols: usize,
+    rows: usize,
+    around: [i32; 2],
+    wall: Part,
+    floor: Part,
+) -> Vec<Tile> {
+    let index = |x: i32, y: i32| y as usize * cols + x as usize;
+    let edge = |x: i32, y: i32| x == 0 || y == 0 || x == cols as i32 - 1 || y == rows as i32 - 1;
+    let mut best: (Vec<Tile>, usize) = (Vec::new(), 0);
+    for attempt in 0..20u32 {
+        let mut rng = Rng::new(seed ^ attempt.wrapping_mul(0x9E37_79B9));
+        let mut rock: Vec<bool> = (0..cols * rows)
+            .map(|i| edge((i % cols) as i32, (i / cols) as i32) || rng.unit() < CAVE_FILL)
+            .collect();
+        // Rock where most of the 3x3 neighborhood is rock (outside counts
+        // as rock); the edge stays rock.
+        for _ in 0..CAVE_STEPS {
+            let solid = |x: i32, y: i32| {
+                x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 || rock[index(x, y)]
+            };
+            rock = (0..cols * rows)
+                .map(|i| {
+                    let (x, y) = ((i % cols) as i32, (i / cols) as i32);
+                    let count = (-1..=1)
+                        .flat_map(|dy| (-1..=1).map(move |dx| (dx, dy)))
+                        .filter(|&(dx, dy)| solid(x + dx, y + dy))
+                        .count();
+                    edge(x, y) || count >= 5
+                })
+                .collect();
+        }
+        for y in around[1] - SPAWN_CLEARANCE..=around[1] + SPAWN_CLEARANCE {
+            for x in around[0] - SPAWN_CLEARANCE..=around[0] + SPAWN_CLEARANCE {
+                if !edge(x, y) {
+                    rock[index(x, y)] = false;
+                }
+            }
+        }
+        let mut tiles: Vec<Tile> = rock
+            .iter()
+            .map(|r| Tile::Whole(if *r { wall } else { floor }))
+            .collect();
+        let solids: Vec<Solid> = tiles.iter().map(|t| t.wall()).collect();
+        let reached = reachable_from(&solids, cols, rows, &[around]);
+        for (tile, reached) in tiles.iter_mut().zip(reached) {
+            if !reached {
+                *tile = Tile::Whole(wall);
+            }
+        }
+        let open = tiles.iter().filter(|t| t.is_floor()).count();
+        if open > best.1 {
+            best = (tiles, open);
+        }
+        if best.1 as f32 >= CAVE_MIN_OPEN * (cols * rows) as f32 {
+            break;
+        }
+    }
+    best.0
 }
 
 /// Which tiles of each layer the player can walk to from `start` on layer
@@ -420,120 +1176,9 @@ pub fn reachable_across(level: &Level, top: usize, start: [i32; 2]) -> Vec<Vec<b
     }
 }
 
-fn world(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Vec<Tile> {
-    let mut rng = Rng::new(seed);
-    let mut occupied = vec![false; cols * rows];
-    let mut tiles = vec![Tile::Whole(Part::Floor(tileset::floor(WORLD_FLOOR))); cols * rows];
-
-    // Bars first, since they're the hardest to fit.
-    for (count, make, wall) in [
-        (
-            BAR_COUNT,
-            random_bar as fn(&mut Rng, usize, usize) -> Piece,
-            WORLD_BARS,
-        ),
-        (BLOCK_COUNT, random_block, WORLD_BLOCKS),
-    ] {
-        let mut placed = 0;
-        for _ in 0..count * 50 {
-            if placed == count {
-                break;
-            }
-            let piece = make(&mut rng, cols, rows).of(tileset::wall(wall));
-            let merge = rng.unit() < MERGE_CHANCE;
-            if fits(&piece, &occupied, cols, rows, spawn, merge) {
-                for ([x, y], _) in &piece.tiles {
-                    occupied[*y as usize * cols + *x as usize] = true;
-                }
-                piece.stamp(&mut tiles, cols);
-                placed += 1;
-            }
-        }
-    }
-    // Merged pieces can enclose pockets.
-    fill_unreachable(&mut tiles, cols, rows, spawn, tileset::wall(WORLD_BLOCKS));
-    tiles
-}
-
-fn cave(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Vec<Tile> {
-    let (wall, floor) = (
-        Part::Wall(tileset::wall(CAVE_WALL)),
-        Part::Floor(tileset::floor(CAVE_FLOOR)),
-    );
-    let index = |x: i32, y: i32| y as usize * cols + x as usize;
-    let edge = |x: i32, y: i32| x == 0 || y == 0 || x == cols as i32 - 1 || y == rows as i32 - 1;
-    // The most open attempt so far, and how many open tiles it has.
-    let mut best: (Vec<Tile>, usize) = (Vec::new(), 0);
-    for attempt in 0..20u32 {
-        let mut rng = Rng::new(seed ^ attempt.wrapping_mul(0x9E37_79B9));
-        let mut rock: Vec<bool> = (0..cols * rows)
-            .map(|i| edge((i % cols) as i32, (i / cols) as i32) || rng.unit() < CAVE_FILL)
-            .collect();
-
-        // Rock where most of the 3x3 neighborhood is rock (outside counts
-        // as rock); the edge stays rock.
-        for _ in 0..CAVE_STEPS {
-            let solid = |x: i32, y: i32| {
-                x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 || rock[index(x, y)]
-            };
-            rock = (0..cols * rows)
-                .map(|i| {
-                    let (x, y) = ((i % cols) as i32, (i / cols) as i32);
-                    let around = (-1..=1)
-                        .flat_map(|dy| (-1..=1).map(move |dx| (dx, dy)))
-                        .filter(|&(dx, dy)| solid(x + dx, y + dy))
-                        .count();
-                    edge(x, y) || around >= 5
-                })
-                .collect();
-        }
-
-        for y in spawn[1] - SPAWN_CLEARANCE..=spawn[1] + SPAWN_CLEARANCE {
-            for x in spawn[0] - SPAWN_CLEARANCE..=spawn[0] + SPAWN_CLEARANCE {
-                if !edge(x, y) {
-                    rock[index(x, y)] = false;
-                }
-            }
-        }
-        let mut tiles: Vec<Tile> = rock
-            .iter()
-            .map(|r| Tile::Whole(if *r { wall } else { floor }))
-            .collect();
-        fill_unreachable(&mut tiles, cols, rows, spawn, tileset::wall(CAVE_WALL));
-        let open = tiles.iter().filter(|t| t.is_floor()).count();
-        if open > best.1 {
-            best = (tiles, open);
-        }
-        if best.1 as f32 >= CAVE_MIN_OPEN * (cols * rows) as f32 {
-            break;
-        }
-    }
-    let mut tiles = best.0;
-    smooth(&mut tiles, cols, rows);
-    tiles
-}
-
-/// Fill in (make full) every tile with open space that can't be reached
-/// from `start`, moving between tiles across sides neither one covers:
-/// with its own wall type, if it has one, else `wall`.
-fn fill_unreachable(tiles: &mut [Tile], cols: usize, rows: usize, start: [i32; 2], wall: WallId) {
-    let solids: Vec<Solid> = tiles.iter().map(|t| t.wall()).collect();
-    let reached = reachable(&solids, cols, rows, start);
-    for (tile, reached) in tiles.iter_mut().zip(reached) {
-        if !reached && tile.wall() != Solid::Full {
-            *tile = Tile::Whole(Part::Wall(tile.wall_id().unwrap_or(wall)));
-        }
-    }
-}
-
-/// Which tiles can be reached from `start` across open sides, given where
-/// each tile is solid.
-pub fn reachable(solids: &[Solid], cols: usize, rows: usize, start: [i32; 2]) -> Vec<bool> {
-    reachable_from(solids, cols, rows, &[start])
-}
-
-/// Which tiles can be reached from any of `starts` across open sides.
-fn reachable_from(tiles: &[Solid], cols: usize, rows: usize, starts: &[[i32; 2]]) -> Vec<bool> {
+/// Which tiles can be reached from any of `starts` across open sides,
+/// given where each tile is solid.
+pub fn reachable_from(tiles: &[Solid], cols: usize, rows: usize, starts: &[[i32; 2]]) -> Vec<bool> {
     let tile = |x: i32, y: i32| {
         if x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 {
             Solid::Full
@@ -564,7 +1209,7 @@ fn reachable_from(tiles: &[Solid], cols: usize, rows: usize, starts: &[[i32; 2]]
 /// and the diagonal between them gets a slope in that corner. Only ever
 /// adds solid, and leaves a way around, so it never thins a wall or cuts
 /// a passage.
-fn smooth(tiles: &mut [Tile], cols: usize, rows: usize) {
+pub fn smooth(tiles: &mut [Tile], cols: usize, rows: usize) {
     let snapshot = tiles.to_vec();
     let tile = |x: i32, y: i32| {
         if x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 {
@@ -594,7 +1239,7 @@ fn smooth(tiles: &mut [Tile], cols: usize, rows: usize) {
                 {
                     // The wall of the neighbor it continues, over this floor.
                     let [ax, ay] = a.offset();
-                    let wall = tile(x + ax, y + ay).wall_id().unwrap_or(0);
+                    let wall: WallId = tile(x + ax, y + ay).wall_id().unwrap_or(0);
                     let floor = here.floor_id().unwrap_or(0);
                     tiles[y as usize * cols + x as usize] =
                         Tile::split(corner, Part::Wall(wall), Part::Floor(floor));
@@ -605,342 +1250,226 @@ fn smooth(tiles: &mut [Tile], cols: usize, rows: usize) {
     }
 }
 
-fn random_block(rng: &mut Rng, cols: usize, rows: usize) -> Piece {
-    let w = rng.range(1, BLOCK_MAX_W);
-    let h = rng.range(1, BLOCK_MAX_H);
-    let x = rng.range(1, cols - w - 1) as i32;
-    let y = rng.range(1, rows - h - 1) as i32;
-    if w == 1 && h == 1 && rng.unit() < LONE_SLOPE_CHANCE {
-        let corner = Corner::CLOCKWISE[rng.range(0, 3)];
-        return Piece {
-            tiles: vec![([x, y], Tile::slope(corner))],
-        };
-    }
-    let cut = [(); 4].map(|_| rng.unit() < CUT_CHANCE);
-    Piece::block(x, y, w as i32, h as i32, cut)
-}
-
-fn random_bar(rng: &mut Rng, cols: usize, rows: usize) -> Piece {
-    let len = rng.range(BAR_MIN_LEN, BAR_MAX_LEN);
-    let rising = rng.unit() < 0.5;
-    // The bar spans `len` tiles each way; place that square inside the
-    // one-tile margin.
-    let x = rng.range(1, cols - len - 1) as i32;
-    let top = rng.range(1, rows - len - 1) as i32;
-    let y = if rising { top + len as i32 - 1 } else { top };
-    Piece::bar(x, y, len as i32, rising)
-}
-
-/// Inside the margin, clear of the spawn, and (unless `merge`) not
-/// touching, even diagonally, any occupied tile.
-fn fits(
-    piece: &Piece,
-    occupied: &[bool],
-    cols: usize,
-    rows: usize,
-    spawn: [i32; 2],
-    merge: bool,
-) -> bool {
-    let (cols, rows) = (cols as i32, rows as i32);
-    piece.tiles.iter().all(|([x, y], _)| {
-        let in_margin = *x >= 1 && *y >= 1 && *x < cols - 1 && *y < rows - 1;
-        let near_spawn = (x - spawn[0]).abs().max((y - spawn[1]).abs()) <= SPAWN_CLEARANCE;
-        let crowded = (-1..=1).any(|dy| {
-            (-1..=1).any(|dx| {
-                let (nx, ny) = (x + dx, y + dy);
-                nx >= 0 && ny >= 0 && nx < cols && ny < rows && occupied[(ny * cols + nx) as usize]
-            })
-        });
-        in_margin && !near_spawn && (merge || !crowded)
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::needless_range_loop)]
+
     use super::*;
 
-    const SPAWN: [f32; 2] = [165.0, 105.0];
-    const STYLES: [Style; 2] = [Style::World, Style::Cave];
+    const SPAWN: [f32; 2] = [325.0, 205.0];
+    const COLS: usize = 64;
+    const ROWS: usize = 40;
+
+    fn world(seed: u32) -> Level {
+        generate_level(seed, COLS, ROWS, SPAWN, &Params::default())
+    }
 
     fn spawn_tile() -> [i32; 2] {
         [(SPAWN[0] / TILE) as i32, (SPAWN[1] / TILE) as i32]
     }
 
-    fn tiles_of(level: &Layer) -> Vec<Tile> {
-        (0..20)
-            .flat_map(|y| (0..32).map(move |x| (x, y)))
-            .map(|(x, y)| level.tile(x, y))
-            .collect()
-    }
-
-    fn solids_of(tiles: &[Tile]) -> Vec<Solid> {
-        tiles.iter().map(|t| t.wall()).collect()
-    }
-
+    /// Each overworld column is rock, then one floor (or water on the
+    /// plains, with a bed beneath), then void; and the underworld is
+    /// enclosed.
     #[test]
-    fn open_space_is_connected() {
-        for style in STYLES {
-            for seed in 0..100 {
-                let level = generate(style, seed, 32, 20, SPAWN);
-                let tiles = tiles_of(&level);
-                let reached = reachable(&solids_of(&tiles), 32, 20, spawn_tile());
-                for (i, t) in tiles.iter().enumerate() {
-                    assert!(
-                        t.wall() == Solid::Full || reached[i],
-                        "{style:?} seed {seed}: tile {i} cut off"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn spawn_is_clear() {
-        for style in STYLES {
-            for seed in 0..100 {
-                let level = generate(style, seed, 32, 20, SPAWN);
-                assert!(
-                    !level.collides([SPAWN[0] - 4.0, SPAWN[1] - 4.0], [8.0, 8.0]),
-                    "{style:?} {seed}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn worlds_have_variety_and_composites() {
-        let (mut slopes, mut bars, mut merged) = (0, 0, 0);
-        for seed in 0..100 {
-            let level = generate(Style::World, seed, 32, 20, SPAWN);
-            for y in 0..20 {
-                for x in 0..32 {
-                    let tile = level.solid(x, y);
-                    slopes += matches!(tile, Solid::Slope(_)) as usize;
-                    // A bar's signature: full tiles diagonally adjacent with
-                    // a slope filling the step between them.
-                    let full = |dx, dy| level.solid(x + dx, y + dy) == Solid::Full;
-                    let step = level.solid(x + 1, y);
-                    let rising = full(0, 0) && full(1, -1) && step == Solid::Slope(Corner::NW);
-                    let falling = full(0, 0) && full(1, 1) && step == Solid::Slope(Corner::SW);
-                    bars += (rising || falling) as usize;
-                }
-            }
-            // An outline loop with a concave corner is a composite (pieces
-            // are convex on their own), or a filled-in pocket.
-            merged += level
-                .concave_corners()
-                .iter()
-                .any(|c| level.in_bounds([(c.at[0] / TILE) as i32, (c.at[1] / TILE) as i32]))
-                as usize;
-        }
-        assert!(slopes > 500, "{slopes} slope tiles in 100 levels");
-        assert!(bars > 100, "{bars} bar steps in 100 levels");
-        assert!(merged > 50, "{merged} of 100 levels with composites");
-    }
-
-    #[test]
-    fn caves_are_mostly_rock_with_open_halls() {
-        for seed in 0..100 {
-            let level = generate(Style::Cave, seed, 32, 20, SPAWN);
-            let tiles = tiles_of(&level);
-            // Slopes (from smoothing) are half open.
-            let open = tiles
-                .iter()
-                .map(|t| match t.wall() {
-                    Solid::None => 1.0,
-                    Solid::Slope(_) => 0.5,
-                    Solid::Full => 0.0,
-                })
-                .sum::<f32>()
-                / tiles.len() as f32;
-            assert!(
-                (CAVE_MIN_OPEN - 0.05..0.8).contains(&open),
-                "seed {seed}: {open} open"
-            );
-            for x in 0..32 {
-                assert_eq!(level.solid(x, 0), Solid::Full);
-                assert_eq!(level.solid(x, 19), Solid::Full);
-            }
-            assert!(
-                tiles.iter().any(|t| matches!(t.wall(), Solid::Slope(_))),
-                "seed {seed}: no slopes"
-            );
-        }
-    }
-
-    #[test]
-    fn layered_levels_connect_through_stairs() {
-        let mut sees_below = 0;
-        for seed in 0..50 {
-            let level = generate_level(Style::Layered, seed, 32, 20, SPAWN);
-            assert_eq!(level.depth(), LAYERS);
-            let top = level.depth() - 1;
-            assert!(
-                !level
-                    .movement(top)
-                    .collides([SPAWN[0] - 4.0, SPAWN[1] - 4.0], [8.0, 8.0]),
-                "seed {seed}: spawn blocked"
-            );
-
-            // Every walkable tile on every layer is reachable.
-            let reached = reachable_across(&level, top, spawn_tile());
-            for (k, reached) in reached.iter().enumerate() {
-                let m = level.movement(k);
-                for i in 0..32 * 20 {
-                    let open = m.solid(i % 32, i / 32) != Solid::Full;
-                    assert!(
-                        !open || reached[i as usize],
-                        "seed {seed}: layer {k} tile {i} cut off"
-                    );
-                }
-            }
-
-            // Each layer has stairs down to the one below, paired with
-            // stairs up, with floor all around on both.
-            for upper in 1..level.depth() {
-                let mut pairs = 0;
-                for y in 0..20 {
-                    for x in 0..32 {
-                        if level.layer(upper).tile(x, y).stairs() == Some(Dir::Down) {
-                            pairs += 1;
-                            assert_eq!(
-                                level.layer(upper - 1).tile(x, y).stairs(),
-                                Some(Dir::Up),
-                                "seed {seed}"
-                            );
-                            for k in [upper - 1, upper] {
-                                let around = [(x - 1) as f32 * TILE, (y - 1) as f32 * TILE];
+    fn columns_follow_the_heightmap() {
+        let p = Params::default();
+        for seed in 0..20 {
+            let level = world(seed);
+            assert_eq!(level.depth(), p.underworld_layers + p.overworld_layers);
+            let under = p.underworld_layers;
+            for y in 1..ROWS as i32 - 1 {
+                for x in 1..COLS as i32 - 1 {
+                    let column: Vec<Tile> = (under..level.depth())
+                        .map(|k| level.layer(k).tile(x, y))
+                        .collect();
+                    // Ramps (stairs in a cliff) and entrance cellars (floor
+                    // under the plains) are the exceptions to the rule.
+                    let cellar = column[0]
+                        .floor_id()
+                        .is_some_and(|f| f != tileset::floor(BED));
+                    if column.iter().any(|t| t.stairs().is_some()) || cellar {
+                        continue;
+                    }
+                    let surface = column
+                        .iter()
+                        .position(|t| t.wall() != Solid::Full)
+                        .unwrap_or_else(|| panic!("seed {seed}: ({x}, {y}) is rock to the top"));
+                    for (k, t) in column.iter().enumerate() {
+                        match k.cmp(&surface) {
+                            std::cmp::Ordering::Less => assert_eq!(
+                                t.wall(),
+                                Solid::Full,
+                                "seed {seed} ({x}, {y}) layer {k}"
+                            ),
+                            std::cmp::Ordering::Equal => {
+                                let ok = t.floor_id().is_some()
+                                    || *t == Tile::WATER
+                                    || t.stairs().is_some();
+                                assert!(ok, "seed {seed} ({x}, {y}): {t:?} at the surface");
+                            }
+                            std::cmp::Ordering::Greater => {
+                                // Above the surface: void, or the bed's water.
+                                let ok = *t == Tile::VOID
+                                    || *t == Tile::WATER
+                                    || (t.void_quarters() != 0);
                                 assert!(
-                                    !level.movement(k).collides(around, [3.0 * TILE, 3.0 * TILE]),
-                                    "seed {seed}"
+                                    ok,
+                                    "seed {seed} ({x}, {y}) layer {k}: {t:?} above the surface"
                                 );
                             }
                         }
                     }
                 }
-                assert!(pairs > 0, "seed {seed}: no stairs from layer {upper}");
             }
-            sees_below += level.visible_layers(top).contains(&(top - 1)) as usize;
+            // The underworld's border is rock, as is the overworld's.
+            for k in 0..level.depth() {
+                for x in 0..COLS as i32 {
+                    assert_eq!(level.layer(k).solid(x, 0), Solid::Full, "seed {seed}");
+                    assert_eq!(level.layer(k).solid(x, ROWS as i32 - 1), Solid::Full);
+                }
+            }
         }
-        assert!(
-            sees_below > 40,
-            "{sees_below} of 50 levels show the layer below"
-        );
     }
 
+    /// Every cave and dungeon floor is reachable (the rest is filled in),
+    /// and so is nearly all the ground above: a hill ringed by rivers
+    /// with no way onto it is left as scenery.
     #[test]
-    fn decks_cut_opening_corners_with_walls_and_floor() {
-        let (mut walls, mut floors) = (0, 0);
-        for seed in 0..10 {
-            let level = generate_level(Style::Layered, seed, 32, 20, SPAWN);
-            for k in 1..level.depth() {
-                for y in 0..20 {
-                    for x in 0..32 {
-                        if let Tile::Split {
-                            at,
-                            rest: Part::Void,
-                            ..
-                        } = level.layer(k).tile(x, y)
-                        {
-                            walls += matches!(at, Part::Wall(_)) as usize;
-                            floors += matches!(at, Part::Floor(_)) as usize;
-                        }
+    fn everything_walkable_is_reachable_with_ramps() {
+        let p = Params::default();
+        let (mut ground, mut cut_off) = (0, 0);
+        for seed in 0..20 {
+            let level = world(seed);
+            let top = spawn_layer(&p);
+            assert!(
+                !level
+                    .movement(top)
+                    .collides([SPAWN[0] - 4.0, SPAWN[1] - 4.0], [8.0, 8.0]),
+                "seed {seed}"
+            );
+            let reached = reachable_across(&level, top, spawn_tile());
+            for k in 0..level.depth() {
+                let m = level.movement(k);
+                for i in 0..COLS * ROWS {
+                    let (x, y) = ((i % COLS) as i32, (i / COLS) as i32);
+                    let open = m.solid(x, y) != Solid::Full;
+                    // A lake bed is floor, but under water: nobody walks there.
+                    let bed = k + 1 < level.depth() && level.layer(k + 1).tile(x, y) == Tile::WATER;
+                    if !open || bed {
+                        continue;
+                    }
+                    if k < p.underworld_layers {
+                        assert!(
+                            reached[k][i],
+                            "seed {seed}: layer {k} tile {i} cut off underground"
+                        );
+                    } else {
+                        ground += 1;
+                        cut_off += !reached[k][i] as usize;
                     }
                 }
             }
         }
         assert!(
-            walls > 20 && floors > 20,
-            "{walls} wall and {floors} floor cuts"
+            cut_off * 100 < ground,
+            "{cut_off} of {ground} ground tiles cut off"
         );
     }
 
     #[test]
-    fn styles_build_with_their_materials() {
-        let types = |layer: &Layer| {
-            let mut walls = std::collections::BTreeSet::new();
-            let mut floors = std::collections::BTreeSet::new();
-            for y in 0..layer.rows as i32 {
-                for x in 0..layer.cols as i32 {
-                    let t = layer.tile(x, y);
-                    walls.extend(t.wall_id());
-                    floors.extend(t.floor_id());
-                }
-            }
-            (walls, floors)
+    fn without_ramps_the_hills_are_out_of_reach() {
+        let params = Params {
+            ramp_spacing: 0,
+            ..Params::default()
         };
-        let set = |names: &[u8]| {
-            names
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<u8>>()
-        };
-        let (wall, floor) = (tileset::wall, tileset::floor);
-
-        let cave = generate(Style::Cave, 3, 32, 20, SPAWN);
-        assert_eq!(
-            types(&cave),
-            (set(&[wall(CAVE_WALL)]), set(&[floor(CAVE_FLOOR)]))
-        );
-        let world = generate(Style::World, 3, 32, 20, SPAWN);
-        let (walls, floors) = types(&world);
-        assert_eq!(walls, set(&[wall(WORLD_BLOCKS), wall(WORLD_BARS)]));
-        assert_eq!(floors, set(&[floor(WORLD_FLOOR)]));
-
-        // Every deck alike.
-        let level = generate_level(Style::Layered, 3, 32, 20, SPAWN);
-        for k in 1..level.depth() {
-            let (walls, floors) = types(level.layer(k));
-            assert_eq!(floors, set(&[floor(DECK_FLOOR)]), "deck {k}");
-            assert_eq!(walls, set(&[wall(DECK_WALL)]), "deck {k}");
-        }
-    }
-
-    #[test]
-    fn bigger_levels_stay_connected() {
-        let spawn = [325.0, 205.0];
-        let start = [32, 20];
+        let mut cut_off = 0;
         for seed in 0..10 {
-            let level = generate_level(Style::Layered, seed, 64, 40, spawn);
-            let top = level.depth() - 1;
-            assert!(
-                !level
-                    .movement(top)
-                    .collides([spawn[0] - 4.0, spawn[1] - 4.0], [8.0, 8.0])
-            );
-            let reached = reachable_across(&level, top, start);
-            for (k, reached) in reached.iter().enumerate() {
-                let m = level.movement(k);
-                for i in 0..64 * 40 {
-                    let open = m.solid(i % 64, i / 64) != Solid::Full;
-                    assert!(
-                        !open || reached[i as usize],
-                        "seed {seed}: layer {k} tile {i} cut off"
-                    );
+            let level = generate_level(seed, COLS, ROWS, SPAWN, &params);
+            let top = spawn_layer(&params);
+            let reached = reachable_across(&level, top, spawn_tile());
+            // No ramps anywhere: no stairs on the overworld but the entrances.
+            let hills = top + 1;
+            for i in 0..COLS * ROWS {
+                let t = level
+                    .layer(hills)
+                    .tile((i % COLS) as i32, (i / COLS) as i32);
+                assert!(t.stairs().is_none(), "seed {seed}: a ramp");
+                if t.is_floor() && !reached[hills][i] {
+                    cut_off += 1;
                 }
             }
-            for style in [Style::World, Style::Cave] {
-                let layer = generate(style, seed, 64, 40, spawn);
-                let tiles: Vec<Tile> = (0..40)
-                    .flat_map(|y| (0..64).map(move |x| (x, y)))
-                    .map(|(x, y)| layer.tile(x, y))
-                    .collect();
-                let reached = reachable(&solids_of(&tiles), 64, 40, start);
-                assert!(
-                    tiles
-                        .iter()
-                        .zip(&reached)
-                        .all(|(t, r)| t.wall() == Solid::Full || *r),
-                    "{style:?} {seed}"
-                );
+        }
+        assert!(cut_off > 0, "some hilltop should be unreachable");
+    }
+
+    #[test]
+    fn water_lies_on_the_plains_over_sand_and_never_at_the_spawn() {
+        let p = Params::default();
+        let (bed, plains) = (p.underworld_layers, p.underworld_layers + 1);
+        let mut water = 0;
+        for seed in 0..20 {
+            let level = world(seed);
+            for y in 0..ROWS as i32 {
+                for x in 0..COLS as i32 {
+                    if level.layer(plains).tile(x, y) == Tile::WATER {
+                        water += 1;
+                        assert_eq!(
+                            level.layer(bed).tile(x, y).floor_id(),
+                            Some(tileset::floor(BED)),
+                            "seed {seed}"
+                        );
+                        let s = spawn_tile();
+                        assert!((x - s[0]).abs().max((y - s[1]).abs()) > SPAWN_CLEARANCE);
+                    }
+                }
             }
         }
+        assert!(water > 20 * 100, "{water} water tiles in 20 levels");
+    }
+
+    #[test]
+    fn stairs_come_in_pairs() {
+        for seed in 0..20 {
+            let level = world(seed);
+            let mut pairs = 0;
+            for k in 1..level.depth() {
+                for y in 0..ROWS as i32 {
+                    for x in 0..COLS as i32 {
+                        if level.layer(k).tile(x, y).stairs() == Some(Dir::Down) {
+                            pairs += 1;
+                            assert_eq!(
+                                level.layer(k - 1).tile(x, y).stairs(),
+                                Some(Dir::Up),
+                                "seed {seed} ({x}, {y}) layer {k}"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(pairs >= 2, "seed {seed}: {pairs} staircases");
+        }
+    }
+
+    #[test]
+    fn parameters_round_trip_and_default_when_missing() {
+        let p: Params = serde_json::from_str(r#"{"rivers": 5, "water_share": 0.3}"#).unwrap();
+        assert_eq!(p.rivers, 5);
+        assert_eq!(p.overworld_layers, Params::default().overworld_layers);
+        let back: Params = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+        // Out-of-range layer counts are clamped, not fatal.
+        let many = Params {
+            overworld_layers: 20,
+            underworld_layers: 20,
+            ..Params::default()
+        };
+        let level = generate_level(1, 32, 20, [165.0, 105.0], &many);
+        assert!(level.depth() <= MAX_LAYERS);
     }
 
     #[test]
     fn smoothing_fills_stair_steps_only() {
-        // An inside corner with room around it gets a slope; a one-tile
-        // corridor bend doesn't, since that would pinch it shut.
         let rows = ["#####", "#....", "#....", "#...."];
         let mut tiles: Vec<Tile> = rows
             .iter()

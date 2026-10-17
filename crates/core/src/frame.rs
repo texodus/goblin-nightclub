@@ -22,6 +22,9 @@ pub struct LayerFrame {
     /// Where this layer is void, as convex polygons: where the layer below
     /// shows through.
     pub voids: Vec<Vec<[f32; 2]>>,
+    /// The part of `voids` that is water: drawn as a translucent tint over
+    /// the layer below instead of simply showing it.
+    pub water: Vec<Vec<[f32; 2]>>,
     /// Sprites of things standing on this layer: wherever they're opaque,
     /// the layer is drawn over any void beneath them rather than letting
     /// the layer below show through.

@@ -20,7 +20,12 @@ function warn(message) {
     errorTimer = setTimeout(() => (errorEl.hidden = true), 5000);
 }
 
-const seed = () => (Math.random() * 2 ** 32) >>> 0;
+// A random seed, or the one given in the URL as ?seed=<number>, for a
+// level that comes out the same every time.
+const seed = () => {
+    const given = Number(new URLSearchParams(location.search).get("seed"));
+    return Number.isInteger(given) && given >= 0 ? given >>> 0 : (Math.random() * 2 ** 32) >>> 0;
+};
 
 // Let the player pick a file; resolves to its text, or null if cancelled.
 function pickFile() {
@@ -91,10 +96,20 @@ async function main() {
     // The start menu.
     menuEl.addEventListener("click", async (e) => {
         switch (e.target.dataset.action) {
-            case "new":
-                app.new_game(seed());
+            case "new": {
+                // Generation parameters may be given in the URL as JSON,
+                // e.g. ?params={"water_share":0.2,"ramp_spacing":0}.
+                const params = new URLSearchParams(location.search).get("params");
+                try {
+                    if (params) app.new_game_with(seed(), params);
+                    else app.new_game(seed());
+                } catch (err) {
+                    warn(`Bad generation parameters: ${err.message ?? err}`);
+                    return;
+                }
                 show("game");
                 break;
+            }
             case "editor":
                 app.editor();
                 show("editor");
@@ -317,7 +332,7 @@ async function main() {
 
     // The wheel zooms about the pointer, a level per notch. Trackpads send
     // many small deltas, so they're added up into notches.
-    const NOTCH = 100;
+    const NOTCH = 1;
     let wheel = 0;
     canvas.addEventListener(
         "wheel",

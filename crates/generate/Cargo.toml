@@ -1,6 +1,6 @@
 [package]
 name = "goblin-nightclub-generate"
-description = "Random level generators"
+description = "The world generator: terrain, caves and dungeons, water"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 goblin-nightclub-core.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 goblin-nightclub-core = { workspace = true, features = ["test-util"] }
+serde_json.workspace = true

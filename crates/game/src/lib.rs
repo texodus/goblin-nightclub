@@ -14,7 +14,7 @@ use goblin_nightclub_core::path;
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::tileset::{self, Cell, ZOOM};
 use goblin_nightclub_core::vision::Vision;
-use goblin_nightclub_generate::Style;
+use goblin_nightclub_generate::Params;
 
 pub struct Game {
     pub input: Input,
@@ -55,13 +55,12 @@ const PLAYER_SPEED: f32 = 90.0;
 /// Pause on reaching the destination.
 const AUTO_PAUSE: bool = true;
 
-/// Which kind of level to generate, and its size in tiles.
-const LEVEL_STYLE: Style = Style::Layered;
-const LEVEL_COLS: usize = 64;
-const LEVEL_ROWS: usize = 40;
+/// Size of a generated level, in tiles.
+const LEVEL_COLS: usize = 96;
+const LEVEL_ROWS: usize = 60;
 
 /// How far the player can see, in pixels. `f32::INFINITY` is unlimited.
-const VIEW_RADIUS: f32 = 96.0;
+const VIEW_RADIUS: f32 = 296.0;
 /// Looking down, each layer below the player's is seen this much less far,
 /// down to `VIEW_RADIUS_MIN`.
 const VIEW_RADIUS_STEP: f32 = 16.0;
@@ -84,15 +83,16 @@ const BUTTON_MARGIN: f32 = 3.0;
 impl Game {
     /// A new game on a generated level, seen through a view `width` x
     /// `height` pixels.
-    pub fn new(width: f32, height: f32, seed: u32) -> Self {
+    pub fn new(width: f32, height: f32, seed: u32, params: &Params) -> Self {
         let (cols, rows) = (LEVEL_COLS, LEVEL_ROWS);
-        // Spawn centered in the middle tile, on the top layer.
+        // Spawn centered in the middle tile, on the plains.
         let player = [
             (cols / 2) as f32 * TILE + (TILE - PLAYER_SIZE[0]) / 2.0,
             (rows / 2) as f32 * TILE + (TILE - PLAYER_SIZE[1]) / 2.0,
         ];
-        let level = goblin_nightclub_generate::generate_level(LEVEL_STYLE, seed, cols, rows, player);
-        Self::with_level(level, player, [width, height], seed)
+        let level = goblin_nightclub_generate::generate_level(seed, cols, rows, player, params);
+        let top = goblin_nightclub_generate::spawn_layer(params).min(level.depth() - 1);
+        Self::with_level_at(level, top, player, [width, height], seed)
     }
 
     /// A game on a saved level, the player at its spawn.
@@ -528,10 +528,9 @@ impl Game {
                         .flat_map(|i| quarter_shapes(i % layer.cols, i / layer.cols, quarters(i)))
                         .collect()
                 };
-                let voids = parts(&|i| {
-                    let (x, y) = ((i % layer.cols) as i32, (i / layer.cols) as i32);
-                    layer.tile(x, y).void_quarters()
-                });
+                let at = |i: usize| layer.tile((i % layer.cols) as i32, (i / layer.cols) as i32);
+                let voids = parts(&|i| at(i).void_quarters());
+                let water = parts(&|i| at(i).water_quarters());
                 let shaft = (k < self.top).then(|| {
                     let shaft = self.level.shaft(self.top, k);
                     parts(&|i| if shaft[i] { 0b1111 } else { 0 })
@@ -563,6 +562,7 @@ impl Game {
                     polygon: vision.polygon().to_vec(),
                     lit_shapes: vision.wall_band().to_vec(),
                     voids,
+                    water,
                     standing,
                     shaft,
                 }
@@ -786,11 +786,12 @@ mod tests {
             *game.route.as_ref().unwrap().tiles.last().unwrap(),
             [33, 21]
         );
-        // Zoom stops at either end: at 320 x 200, the default already
+        // Zoom stops at either end (enough notches for any step size): at
+        // 320 x 200, the default already
         // shows a pixel of the art per pixel of the screen.
-        game.zoom_by(100, pointer);
+        game.zoom_by(10_000, pointer);
         assert_eq!(game.zoom(), goblin_nightclub_core::camera::ZOOM_MAX * ZOOM);
-        game.zoom_by(-100, pointer);
+        game.zoom_by(-10_000, pointer);
         assert_eq!(game.zoom(), ZOOM);
         assert_eq!(game.frame().zoom, game.zoom());
     }
@@ -816,7 +817,7 @@ mod tests {
         // Zoomed all the way out, a pixel of the art is a screen pixel, and
         // the whole level fits, with room around it.
         let corner = game.to_world([0.0, 0.0]);
-        game.zoom_by(-100, [0.0, 0.0]);
+        game.zoom_by(-10_000, [0.0, 0.0]);
         assert_eq!(game.zoom(), ZOOM);
         let view = game.view_world();
         assert!(view[0] > 640.0 && view[1] > 400.0);
