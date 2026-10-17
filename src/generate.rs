@@ -91,7 +91,7 @@ pub const LAYERS: usize = 5;
 const _: () = assert!(LAYERS <= crate::level::MAX_LAYERS);
 
 /// Void openings in each deck of a layered level.
-const HOLE_COUNT: usize = 6;
+const HOLE_COUNT: usize = 16;
 const HOLE_MAX_W: usize = 8;
 const HOLE_MAX_H: usize = 6;
 /// Blocks on each deck.
@@ -185,31 +185,64 @@ fn layered(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Level {
 
     // Stairs between each layer and the one below, where both have floor
     // all around, so arriving at either end never lands the player in a
-    // wall. If there's no such spot, clear one: every layer needs a way
-    // down, or everything below it is cut off.
+    // wall, and where the player can get to them: placed from the top down,
+    // so each layer's reachable floor includes the stairs arriving from
+    // above. If there's no such spot, clear one around reachable floor:
+    // every layer needs a way down, or everything below it is cut off.
     let clear = |tiles: &[Tile], x: i32, y: i32| {
         (-1..=1).all(|dy| (-1..=1).all(|dx| tiles[index(x + dx, y + dy)] == Tile::Empty))
     };
-    for upper in 1..LAYERS {
-        let mut candidates: Vec<[i32; 2]> = (2..rows as i32 - 2)
-            .flat_map(|y| (2..cols as i32 - 2).map(move |x| [x, y]))
+    let interior: Vec<[i32; 2]> = (2..rows as i32 - 2)
+        .flat_map(|y| (2..cols as i32 - 2).map(move |x| [x, y]))
+        .collect();
+    for upper in (1..LAYERS).rev() {
+        let level = Level::new(
+            layers
+                .iter()
+                .map(|t| Layer::from_tiles(cols, rows, t.clone()))
+                .collect(),
+        );
+        let reached = reachable_across(&level, LAYERS - 1, spawn);
+        let reachable = |[x, y]: [i32; 2]| reached[upper][index(x, y)];
+        let mut candidates: Vec<[i32; 2]> = interior
+            .iter()
+            .copied()
             .filter(|&[x, y]| {
-                !near_spawn(x, y, 1)
+                reachable([x, y])
+                    && !near_spawn(x, y, 1)
                     && clear(&layers[upper], x, y)
                     && clear(&layers[upper - 1], x, y)
             })
             .collect();
         if candidates.is_empty() {
-            let at = loop {
-                let at = [rng.range(2, cols - 3) as i32, rng.range(2, rows - 3) as i32];
-                if !near_spawn(at[0], at[1], 1) {
-                    break at;
-                }
+            // Plain floor only: not the stairs arriving from above.
+            let floor = |t: [i32; 2]| {
+                reachable(t)
+                    && layers[upper][index(t[0], t[1])] == Tile::Empty
+                    && !matches!(layers[upper - 1][index(t[0], t[1])], Tile::Stairs(_))
+            };
+            let away: Vec<[i32; 2]> = interior
+                .iter()
+                .copied()
+                .filter(|&t| floor(t) && !near_spawn(t[0], t[1], 1))
+                .collect();
+            let near: Vec<[i32; 2]> = interior
+                .iter()
+                .copied()
+                .filter(|&t| floor(t) && t != spawn)
+                .collect();
+            let pool = if away.is_empty() { near } else { away };
+            let Some(&at) = pool.get(rng.range(0, pool.len().max(1) - 1)) else {
+                continue;
             };
             for k in [upper - 1, upper] {
                 for dy in -1..=1 {
                     for dx in -1..=1 {
-                        layers[k][index(at[0] + dx, at[1] + dy)] = Tile::Empty;
+                        // Leave stairs placed already.
+                        let tile = &mut layers[k][index(at[0] + dx, at[1] + dy)];
+                        if !matches!(tile, Tile::Stairs(_)) {
+                            *tile = Tile::Empty;
+                        }
                     }
                 }
             }
@@ -690,6 +723,47 @@ mod tests {
             sees_below > 40,
             "{sees_below} of 50 levels show the layer below"
         );
+    }
+
+    #[test]
+    fn bigger_levels_stay_connected() {
+        let spawn = [325.0, 205.0];
+        let start = [32, 20];
+        for seed in 0..10 {
+            let level = generate_level(Style::Layered, seed, 64, 40, spawn);
+            let top = level.depth() - 1;
+            assert!(
+                !level
+                    .movement(top)
+                    .collides([spawn[0] - 4.0, spawn[1] - 4.0], [8.0, 8.0])
+            );
+            let reached = reachable_across(&level, top, start);
+            for (k, reached) in reached.iter().enumerate() {
+                let m = level.movement(k);
+                for i in 0..64 * 40 {
+                    let open = m.tile(i % 64, i / 64) != Tile::Full;
+                    assert!(
+                        !open || reached[i as usize],
+                        "seed {seed}: layer {k} tile {i} cut off"
+                    );
+                }
+            }
+            for style in [Style::World, Style::Cave] {
+                let layer = generate(style, seed, 64, 40, spawn);
+                let tiles: Vec<Tile> = (0..40)
+                    .flat_map(|y| (0..64).map(move |x| (x, y)))
+                    .map(|(x, y)| layer.tile(x, y))
+                    .collect();
+                let reached = reachable(&tiles, 64, 40, start);
+                assert!(
+                    tiles
+                        .iter()
+                        .zip(&reached)
+                        .all(|(t, r)| *t == Tile::Full || *r),
+                    "{style:?} {seed}"
+                );
+            }
+        }
     }
 
     #[test]

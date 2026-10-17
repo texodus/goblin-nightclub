@@ -38,8 +38,23 @@ pub struct Frame {
     /// first.
     pub layers: Vec<LayerFrame>,
     pub origin: [f32; 2],
-    /// View radius in pixels; `f32::INFINITY` for unlimited.
+    /// View radius on the viewer's layer, in pixels; `f32::INFINITY` for
+    /// unlimited.
     pub radius: f32,
+    /// How much less far each layer below the viewer's is seen, and the
+    /// least any is.
+    pub radius_step: f32,
+    pub radius_min: f32,
     /// Game time in seconds, for animated styles.
     pub time: f32,
+    /// Top-left of the view, in world pixels.
+    pub camera: [f32; 2],
+    /// Size of the view, in pixels.
+    pub view: [f32; 2],
+    /// Size of the level, in pixels.
+    pub world: [f32; 2],
+    /// Drawn in world space over everything, on the viewer's layer.
+    pub overlay: Canvas,
+    /// Drawn in view space over everything: the interface.
+    pub ui: Canvas,
 }

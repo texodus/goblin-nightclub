@@ -174,6 +174,11 @@ impl Vision {
         self.radius
     }
 
+    /// Change the view distance, from the next update on.
+    pub fn set_radius(&mut self, radius: f32) {
+        self.radius = radius;
+    }
+
     pub fn polygon(&self) -> &[[f32; 2]] {
         &self.polygon
     }

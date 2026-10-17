@@ -48,8 +48,22 @@ impl App {
     }
 
     /// `code` is a `KeyboardEvent.code`, e.g. `"ArrowLeft"` or `"KeyW"`.
-    pub fn key_down(&mut self, code: &str) {
+    /// `repeat` is set for auto-repeats of a held key.
+    pub fn key_down(&mut self, code: &str, repeat: bool) {
         self.game.input.set(code, true);
+        if !repeat {
+            self.game.key_pressed(code);
+        }
+    }
+
+    /// A click at `(x, y)` in canvas pixels (the logical resolution).
+    pub fn click(&mut self, x: f32, y: f32) {
+        self.game.click([x, y]);
+    }
+
+    /// The pointer moved to `(x, y)` in canvas pixels.
+    pub fn pointer(&mut self, x: f32, y: f32) {
+        self.game.pointer([x, y]);
     }
 
     pub fn key_up(&mut self, code: &str) {

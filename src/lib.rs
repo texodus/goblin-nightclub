@@ -15,6 +15,7 @@ pub mod layer;
 pub mod level;
 pub mod memory;
 pub mod palette;
+pub mod path;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
 pub mod rng;

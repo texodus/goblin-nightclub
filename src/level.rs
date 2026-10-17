@@ -18,6 +18,10 @@ use crate::layer::{Layer, TILE, Tile};
 /// Layers a level may have (the renderer keeps textures for each).
 pub const MAX_LAYERS: usize = 8;
 
+/// Tiles a level may have per layer: the renderer keeps a level-sized mask
+/// of what's been seen on each layer, a byte per pixel.
+pub const MAX_TILES: usize = 128 * 128;
+
 pub struct Level {
     layers: Vec<Layer>,
     movement: Vec<Layer>,
@@ -34,6 +38,10 @@ impl Level {
         let (cols, rows) = (layers[0].cols, layers[0].rows);
         assert!(layers.iter().all(|l| l.cols == cols && l.rows == rows));
         assert!(layers.len() <= MAX_LAYERS, "at most {MAX_LAYERS} layers");
+        assert!(
+            cols * rows <= MAX_TILES,
+            "at most {MAX_TILES} tiles a layer"
+        );
         let n = cols * rows;
         let at = |l: &Layer, i: usize| l.tile((i % cols) as i32, (i / cols) as i32);
 

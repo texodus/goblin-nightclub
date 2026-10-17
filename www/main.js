@@ -25,11 +25,29 @@ async function main() {
         "Space",
     ]);
 
+    // Keys pan the camera (arrows / WASD), toggle pause (Space) and center
+    // the camera on the player (C).
     window.addEventListener("keydown", (e) => {
         if (GAME_KEYS.has(e.code)) e.preventDefault();
-        if (!e.repeat) app.key_down(e.code);
+        app.key_down(e.code, e.repeat);
     });
     window.addEventListener("keyup", (e) => app.key_up(e.code));
+
+    // Mouse positions in canvas pixels: the canvas is drawn at its logical
+    // resolution and scaled up by CSS.
+    const logical = (e) => {
+        const r = canvas.getBoundingClientRect();
+        return [
+            ((e.clientX - r.left) * canvas.width) / r.width,
+            ((e.clientY - r.top) * canvas.height) / r.height,
+        ];
+    };
+    canvas.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        canvas.focus();
+        app.click(...logical(e));
+    });
+    canvas.addEventListener("mousemove", (e) => app.pointer(...logical(e)));
 
     const loop = (t) => {
         app.frame(t);
