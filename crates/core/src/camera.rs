@@ -2,7 +2,6 @@
 //! Shared by the game and the editor.
 
 use crate::input::Input;
-use crate::tileset::ZOOM;
 
 /// Each wheel notch zooms by this factor.
 pub const ZOOM_STEP: f32 = 1.01;
@@ -18,16 +17,21 @@ pub struct Camera {
     pub pos: [f32; 2],
     /// Size of the view, in screen pixels.
     pub view: [f32; 2],
+    /// Screen pixels per world unit at which the art is at its own size
+    /// (the tileset's [`crate::tileset::Tileset::zoom`]).
+    base: f32,
     /// Zoom relative to the default (see [`Camera::zoom`]).
     zoom_factor: f32,
 }
 
 impl Camera {
-    /// A view `view` screen pixels in size, at the default zoom.
-    pub fn new(view: [f32; 2]) -> Self {
+    /// A view `view` screen pixels in size, at the default zoom, for art at
+    /// its own size at `base` screen pixels a world unit.
+    pub fn new(view: [f32; 2], base: f32) -> Self {
         Self {
             pos: [0.0; 2],
             view,
+            base,
             zoom_factor: 1.0,
         }
     }
@@ -44,7 +48,7 @@ impl Camera {
     /// interface's scale (a pixel of the art an interface pixel), so the
     /// view shows about as much of the level at any resolution.
     pub fn zoom(&self) -> f32 {
-        ZOOM * self.ui_scale() * self.zoom_factor
+        self.base * self.ui_scale() * self.zoom_factor
     }
 
     /// Zoom in (`steps > 0`) or out by that many wheel notches, keeping the

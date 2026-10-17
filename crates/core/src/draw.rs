@@ -3,8 +3,9 @@
 //! (see [`crate::tileset`]) times its color; plain colored shapes show the
 //! sheet's white cell.
 
+use crate::layer::TILE;
 use crate::palette::Color;
-use crate::tileset::{CELL, Cell, ZOOM};
+use crate::tileset::{Cell, Tileset};
 
 /// Mirrors the vertex input of shapes.wgsl.
 #[repr(C)]
@@ -21,12 +22,30 @@ pub struct Vertex {
 }
 
 /// Triangles drawn in order, later ones on top.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Canvas {
     pub vertices: Vec<Vertex>,
+    /// Edge of a cell of the sheet, in pixels.
+    cell: u32,
+    /// The sheet's white cell, for plain shapes.
+    white: Cell,
 }
 
 impl Canvas {
+    /// An empty canvas drawing from `tileset`'s sheet.
+    pub fn new(tileset: &Tileset) -> Self {
+        Self {
+            vertices: Vec::new(),
+            cell: tileset.cell,
+            white: tileset.white,
+        }
+    }
+
+    /// Sheet pixels per world unit.
+    fn zoom(&self) -> f32 {
+        self.cell as f32 / TILE
+    }
+
     pub fn rect(&mut self, pos: [f32; 2], size: [f32; 2], color: Color) {
         let [x0, y0] = pos;
         let [x1, y1] = [x0 + size[0], y0 + size[1]];
@@ -43,34 +62,44 @@ impl Canvas {
         self.rect([x + w - width, y], [width, h], color);
     }
 
-    /// A convex polygon, as a triangle fan.
+    /// A convex polygon, as a triangle fan, in a plain color: it samples
+    /// the middle of the sheet's white cell.
     pub fn poly(&mut self, points: &[[f32; 2]], color: Color) {
-        self.fan(points, |_| [0.5, 0.5], [0.0, 0.0], color);
+        let white = self.cell_origin(self.white);
+        let mid = [white[0] + 0.5, white[1] + 0.5];
+        self.fan(points, |_| mid, white, color);
+    }
+
+    /// Top-left pixel of sheet cell `cell`.
+    fn cell_origin(&self, cell: Cell) -> [f32; 2] {
+        [
+            (cell[0] as u32 * self.cell) as f32,
+            (cell[1] as u32 * self.cell) as f32,
+        ]
     }
 
     /// A convex polygon showing sheet cell `cell` (tinted by `color`), the
-    /// cell's top-left corner at world point `origin`, at [`ZOOM`]: so a
-    /// tile-sized square at a tile's corner shows the whole cell.
+    /// cell's top-left corner at world point `origin`, at the sheet's zoom:
+    /// so a tile-sized square at a tile's corner shows the whole cell.
     pub fn textured(&mut self, points: &[[f32; 2]], origin: [f32; 2], cell: Cell, color: Color) {
-        let base = [
-            (cell[0] as u32 * CELL) as f32,
-            (cell[1] as u32 * CELL) as f32,
-        ];
+        let base = self.cell_origin(cell);
+        let zoom = self.zoom();
         let uv = |p: [f32; 2]| {
             [
-                base[0] + (p[0] - origin[0]) * ZOOM,
-                base[1] + (p[1] - origin[1]) * ZOOM,
+                base[0] + (p[0] - origin[0]) * zoom,
+                base[1] + (p[1] - origin[1]) * zoom,
             ]
         };
         self.fan(points, uv, base, color);
     }
 
-    /// Sheet cell `cell` as a square of [`crate::tileset::SPRITE_SIZE`]
-    /// centered on `center`, snapped to whole sheet pixels so it lines up
-    /// with the tiles' pixels.
+    /// Sheet cell `cell` as a tile-sized square (see
+    /// [`Tileset::sprite_size`]) centered on `center`, snapped to whole
+    /// sheet pixels so it lines up with the tiles' pixels.
     pub fn sprite(&mut self, center: [f32; 2], cell: Cell, color: Color) {
-        let size = crate::tileset::SPRITE_SIZE;
-        let snap = |v: f32| (v * ZOOM).round() / ZOOM;
+        let size = [TILE, TILE];
+        let zoom = self.zoom();
+        let snap = |v: f32| (v * zoom).round() / zoom;
         let [x0, y0] = [
             snap(center[0] - size[0] / 2.0),
             snap(center[1] - size[1] / 2.0),
@@ -161,6 +190,13 @@ mod tests {
     const GREEN: Color = [0.0, 1.0, 0.0, 1.0];
     const BLUE: Color = [0.0, 0.0, 1.0, 1.0];
 
+    const ZOOM: f32 = 1.6;
+    const CELL: u32 = 16;
+
+    fn canvas() -> Canvas {
+        Canvas::new(&crate::tileset::testing::tileset())
+    }
+
     /// Color of the last triangle covering `p`, like the GPU would draw it.
     fn color_at(layer: &Canvas, p: [f32; 2]) -> Option<Color> {
         layer.vertices.chunks(3).rev().find_map(|t| {
@@ -179,7 +215,7 @@ mod tests {
 
     #[test]
     fn bevels_light_top_left_and_shade_bottom_right() {
-        let mut layer = Canvas::default();
+        let mut layer = canvas();
         // A 10x10 square with its bottom-right corner cut at 45 degrees.
         let shape = [
             [0.0, 0.0],
@@ -204,9 +240,9 @@ mod tests {
 
     #[test]
     fn sprites_center_on_whole_pixels_and_show_their_cell() {
-        let mut canvas = Canvas::default();
+        let mut canvas = canvas();
         canvas.sprite([20.0, 30.0], [1, 3], RED);
-        let size = crate::tileset::SPRITE_SIZE;
+        let size = [TILE, TILE];
         let xs: Vec<f32> = canvas.vertices.iter().map(|v| v.pos[0]).collect();
         let ys: Vec<f32> = canvas.vertices.iter().map(|v| v.pos[1]).collect();
         let (x0, x1) = (
@@ -240,7 +276,7 @@ mod tests {
             assert_eq!(v.color, RED);
         }
         // Plain shapes show the white cell.
-        let mut plain = Canvas::default();
+        let mut plain = Canvas::new(&crate::tileset::testing::tileset());
         plain.rect([0.0, 0.0], [5.0, 5.0], RED);
         assert!(
             plain
@@ -252,7 +288,7 @@ mod tests {
 
     #[test]
     fn bevel_strip_is_one_pixel_wide_on_diagonals() {
-        let mut layer = Canvas::default();
+        let mut layer = canvas();
         // A "/" face facing up-left: lit.
         let shape = [[10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
         layer.beveled(&shape, RED, GREEN, BLUE);

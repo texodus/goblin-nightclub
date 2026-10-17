@@ -12,13 +12,37 @@ use goblin_nightclub_core::memory::Memory;
 use goblin_nightclub_core::palette;
 use goblin_nightclub_core::path;
 use goblin_nightclub_core::rng::Rng;
-use goblin_nightclub_core::tileset::{self, Cell, ZOOM};
+use goblin_nightclub_core::tileset::{Cell, Tileset};
 use goblin_nightclub_core::vision::Vision;
 use goblin_nightclub_generate::Params;
+
+/// The sheet cells the characters are drawn with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sprites {
+    pub player: Cell,
+    pub npc: Cell,
+}
+
+impl Sprites {
+    /// The sprites `file` names, from its tileset.
+    pub fn from_file(file: &LevelFile) -> Self {
+        let cell = |name: &str| {
+            file.tileset
+                .sprite(name)
+                .unwrap_or_else(|| panic!("no sprite {name:?} in the tileset"))
+                .cell
+        };
+        Self {
+            player: cell(&file.player.sprite),
+            npc: cell(&file.npc.sprite),
+        }
+    }
+}
 
 pub struct Game {
     pub input: Input,
     level: Level,
+    sprites: Sprites,
     /// The player's layer.
     top: usize,
     /// The ground level: the lowest layer under the open sky (see
@@ -52,7 +76,6 @@ struct Route {
 }
 
 const PLAYER_SIZE: [f32; 2] = [8.0, 8.0];
-const PLAYER_SPRITE: &tileset::Sprite = &tileset::SPRITES[0];
 const PLAYER_SPEED: f32 = 90.0;
 
 /// Pause on reaching the destination.
@@ -103,43 +126,34 @@ impl Game {
     /// `height` pixels.
     pub fn new(width: f32, height: f32, seed: u32, params: &Params) -> Self {
         let (cols, rows) = (LEVEL_COLS, LEVEL_ROWS);
-        // Spawn centered in the middle tile, on the plains.
-        let player = [
-            (cols / 2) as f32 * TILE + (TILE - PLAYER_SIZE[0]) / 2.0,
-            (rows / 2) as f32 * TILE + (TILE - PLAYER_SIZE[1]) / 2.0,
-        ];
-        let level = goblin_nightclub_generate::generate_level(seed, cols, rows, player, params);
-        let top = goblin_nightclub_generate::spawn_layer(params).min(level.depth() - 1);
-        let mut game = Self::with_level_at(level, top, player, [width, height], seed);
-        game.ground = goblin_nightclub_generate::ground_layer(params).min(game.level.depth() - 1);
-        game
+        // Spawn in the middle tile, on the plains.
+        let spawn = [(cols / 2) as f32 * TILE, (rows / 2) as f32 * TILE];
+        let file = goblin_nightclub_generate::world(seed, cols, rows, spawn, params);
+        Self::from_file(&file, [width, height], seed)
     }
 
-    /// A game on a saved level, the player at its spawn.
+    /// A game on a level file (generated or saved), the player at its
+    /// spawn, drawn with the sprites it names. It starts paused.
     pub fn from_file(file: &LevelFile, view: [f32; 2], seed: u32) -> Self {
         let [x, y] = file.spawn.tile;
         let player = [
             x as f32 * TILE + (TILE - PLAYER_SIZE[0]) / 2.0,
             y as f32 * TILE + (TILE - PLAYER_SIZE[1]) / 2.0,
         ];
-        let mut game = Self::with_level_at(file.level(), file.spawn.layer, player, view, seed);
+        let sprites = Sprites::from_file(file);
+        let mut game =
+            Self::with_level_at(file.level(), file.spawn.layer, player, sprites, view, seed);
         game.ground = file.ground.min(game.level.depth() - 1);
         game
     }
 
-    /// A game on `level`, the player at `player` (top-left, pixels) on the
-    /// top layer, seen through a view of size `view`. It starts paused.
-    pub fn with_level(level: Level, player: [f32; 2], view: [f32; 2], seed: u32) -> Self {
-        let top = level.depth() - 1;
-        Self::with_level_at(level, top, player, view, seed)
-    }
-
     /// A game on `level`, the player at `player` (top-left, pixels) on
-    /// layer `top`.
+    /// layer `top`, seen through a view of size `view`.
     pub fn with_level_at(
         level: Level,
         top: usize,
         player: [f32; 2],
+        sprites: Sprites,
         view: [f32; 2],
         seed: u32,
     ) -> Self {
@@ -160,6 +174,7 @@ impl Game {
                 npcs.push(npc);
             }
         }
+        let camera = Camera::new(view, level.tileset().zoom());
         let mut game = Self {
             input: Input::default(),
             visions: (0..level.depth())
@@ -167,6 +182,7 @@ impl Game {
                 .collect(),
             memories: (0..level.depth()).map(|_| Memory::default()).collect(),
             level,
+            sprites,
             top,
             ground: 0,
             player,
@@ -175,7 +191,7 @@ impl Game {
             time: 0.0,
             paused: true,
             route: None,
-            camera: Camera::new(view),
+            camera,
             pointer: None,
         };
         game.center_camera();
@@ -202,6 +218,11 @@ impl Game {
 
     pub fn layer(&self) -> usize {
         self.top
+    }
+
+    /// The art the level is drawn with.
+    pub fn tileset(&self) -> &Tileset {
+        self.level.tileset()
     }
 
     pub fn is_paused(&self) -> bool {
@@ -430,12 +451,13 @@ impl Game {
     /// World-space marks over everything: the route being walked, dotted,
     /// and its destination, in lines a pixel of the art wide.
     fn overlay(&self) -> Canvas {
-        let mut canvas = Canvas::default();
+        let mut canvas = Canvas::new(self.tileset());
         let Some(route) = &self.route else {
             return canvas;
         };
-        let px = 1.0 / ZOOM;
-        let snap = |v: f32| (v * ZOOM).floor() / ZOOM;
+        let zoom = self.tileset().zoom();
+        let px = 1.0 / zoom;
+        let snap = |v: f32| (v * zoom).floor() / zoom;
         let mut at = center(self.player, PLAYER_SIZE);
         for &w in &route.waypoints[route.next..] {
             let len = (w[0] - at[0]).hypot(w[1] - at[1]);
@@ -456,7 +478,7 @@ impl Game {
     /// The interface, in interface pixels: the pause button, showing what a
     /// click does (pause while running, play while paused).
     fn ui(&self) -> Canvas {
-        let mut canvas = Canvas::default();
+        let mut canvas = Canvas::new(self.tileset());
         let [x, y] = self.button_pos();
         let hover = self.pointer.is_some_and(|p| self.on_button(p));
         let fill = if hover {
@@ -522,7 +544,8 @@ impl Game {
     /// renderer shows it only where the matching visibility applies, so live
     /// NPCs go in `visible` and last-seen markers in `remembered`.
     pub fn frame(&self) -> Frame {
-        let bevel = 1.0 / ZOOM;
+        let tileset = self.tileset();
+        let bevel = 1.0 / tileset.zoom();
         let layers = self
             .level
             .visible_layers(self.top)
@@ -541,23 +564,23 @@ impl Game {
                     .npcs
                     .iter()
                     .filter(|n| n.layer == k)
-                    .map(|n| (n.center(), sprite(n.kind)))
+                    .map(|n| (n.center(), self.sprite(n.kind)))
                     .collect();
                 if k == self.top {
-                    live.push((center(self.player, PLAYER_SIZE), PLAYER_SPRITE.cell));
+                    live.push((center(self.player, PLAYER_SIZE), self.sprites.player));
                 }
                 let stale: Vec<([f32; 2], Cell)> = memory
                     .stale()
-                    .map(|(_, m)| (center(m.pos, m.size), sprite(m.kind)))
+                    .map(|(_, m)| (center(m.pos, m.size), self.sprite(m.kind)))
                     .collect();
 
-                let mut visible = Canvas::default();
-                layer.draw(&mut visible, |i| vision.edge_visible()[i], bevel);
+                let mut visible = Canvas::new(tileset);
+                layer.draw(tileset, &mut visible, |i| vision.edge_visible()[i], bevel);
                 for &(at, cell) in &live {
                     visible.sprite(at, cell, palette::WHITE);
                 }
-                let mut remembered = Canvas::default();
-                layer.draw(&mut remembered, |i| vision.edge_seen()[i], bevel);
+                let mut remembered = Canvas::new(tileset);
+                layer.draw(tileset, &mut remembered, |i| vision.edge_seen()[i], bevel);
                 for &(at, cell) in &stale {
                     remembered.sprite(at, cell, palette::WHITE);
                 }
@@ -570,7 +593,7 @@ impl Game {
                 };
                 let at = |i: usize| layer.tile((i % layer.cols) as i32, (i / layer.cols) as i32);
                 let voids = parts(&|i| at(i).void_quarters());
-                let water = parts(&|i| at(i).water_quarters());
+                let liquid = parts(&|i| at(i).liquid_quarters());
                 let shaft = (k < self.top).then(|| {
                     let shaft = self.level.shaft(self.top, k);
                     parts(&|i| if shaft[i] { 0b1111 } else { 0 })
@@ -578,17 +601,17 @@ impl Game {
                 // Characters drawn on this layer cover any void their
                 // sprites overhang: the player, NPCs in view and last
                 // sightings.
-                let mut standing = Canvas::default();
+                let mut standing = Canvas::new(tileset);
                 let in_view = self
                     .npcs
                     .iter()
                     .filter(|n| n.layer == k && memory.is_visible(n.id));
                 for n in in_view {
-                    standing.sprite(n.center(), sprite(n.kind), palette::WHITE);
+                    standing.sprite(n.center(), self.sprite(n.kind), palette::WHITE);
                 }
                 if k == self.top {
                     let at = center(self.player, PLAYER_SIZE);
-                    standing.sprite(at, PLAYER_SPRITE.cell, palette::WHITE);
+                    standing.sprite(at, self.sprites.player, palette::WHITE);
                 }
                 for &(at, cell) in &stale {
                     standing.sprite(at, cell, palette::WHITE);
@@ -598,11 +621,11 @@ impl Game {
                     index: k,
                     visible,
                     remembered,
-                    unknown: Canvas::default(),
+                    unknown: Canvas::new(tileset),
                     polygon: vision.polygon().to_vec(),
                     lit_shapes: vision.wall_band().to_vec(),
                     voids,
-                    water,
+                    liquid,
                     standing,
                     shaft,
                 }
@@ -627,6 +650,7 @@ impl Game {
             camera: self.camera.pos,
             view: self.camera.view,
             zoom: self.zoom(),
+            cell: tileset.cell,
             ui_scale: self.ui_scale(),
             outdoors: self.outdoors(),
             ground: self.ground,
@@ -637,10 +661,12 @@ impl Game {
     }
 }
 
-/// The sheet cell drawn for an entity of `kind`.
-fn sprite(kind: Kind) -> Cell {
-    match kind {
-        Kind::Npc => tileset::sprite("npc").cell,
+impl Game {
+    /// The sheet cell drawn for an entity of `kind`.
+    fn sprite(&self, kind: Kind) -> Cell {
+        match kind {
+            Kind::Npc => self.sprites.npc,
+        }
     }
 }
 
@@ -660,9 +686,26 @@ mod tests {
     use goblin_nightclub_core::level_file::Spawn;
 
     const VIEW: [f32; 2] = [320.0, 200.0];
+    /// The test tileset's default zoom: 16-pixel cells over 10-unit tiles.
+    const ZOOM: f32 = 1.6;
+
+    fn tileset() -> Tileset {
+        goblin_nightclub_core::tileset::testing::tileset()
+    }
+
+    fn sprites() -> Sprites {
+        let t = tileset();
+        Sprites {
+            player: t.sprite("player").unwrap().cell,
+            npc: t.sprite("npc").unwrap().cell,
+        }
+    }
 
     fn level(layers: &[&[&str]]) -> Level {
-        Level::new(layers.iter().map(|rows| Layer::from_ascii(rows)).collect())
+        Level::new(
+            layers.iter().map(|rows| Layer::from_ascii(rows)).collect(),
+            tileset(),
+        )
     }
 
     /// A game on `level` with no NPCs, the player's box centered in tile
@@ -675,7 +718,7 @@ mod tests {
     /// The same, on layer `k`.
     fn game_on(level: Level, k: usize, at: [i32; 2]) -> Game {
         let c = path::center(at);
-        let mut game = Game::with_level_at(level, k, [c[0] - 4.0, c[1] - 4.0], VIEW, 1);
+        let mut game = Game::with_level_at(level, k, [c[0] - 4.0, c[1] - 4.0], sprites(), VIEW, 1);
         game.npcs.clear();
         game
     }
@@ -790,7 +833,7 @@ mod tests {
     fn camera_pans_independently_and_freely() {
         let rows: Vec<String> = (0..40).map(|_| ".".repeat(64)).collect();
         let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
-        let l = Level::new(vec![Layer::from_ascii(&rows)]);
+        let l = Level::new(vec![Layer::from_ascii(&rows)], tileset());
         let mut game = game(l, [32, 20]);
         // The view is 320 x 200 screen pixels, so 200 x 125 world units.
         let view = [VIEW[0] / ZOOM, VIEW[1] / ZOOM];
@@ -823,7 +866,7 @@ mod tests {
     fn zooming_keeps_the_point_under_the_pointer() {
         let rows: Vec<String> = (0..40).map(|_| ".".repeat(64)).collect();
         let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
-        let l = Level::new(vec![Layer::from_ascii(&rows)]);
+        let l = Level::new(vec![Layer::from_ascii(&rows)], tileset());
         let mut game = game(l, [32, 20]);
         let pointer = [100.0, 60.0];
         let anchor = game.to_world(pointer);
@@ -851,7 +894,7 @@ mod tests {
     fn bigger_views_scale_up_and_zoom_out_further() {
         let rows: Vec<String> = (0..40).map(|_| ".".repeat(64)).collect();
         let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
-        let l = Level::new(vec![Layer::from_ascii(&rows)]);
+        let l = Level::new(vec![Layer::from_ascii(&rows)], tileset());
         let mut game = game(l, [32, 20]);
         let center = game.to_world([160.0, 100.0]);
         // Four times the pixels each way (and a bit): the same view of the
@@ -982,9 +1025,15 @@ mod tests {
                 layer: 2,
                 tile: [1, 0],
             },
+            tileset(),
+            "player",
+            "npc",
         )
         .with_ground(1);
-        assert_eq!(Game::from_file(&file, VIEW, 1).frame().ground, 1);
+        let from_file = Game::from_file(&file, VIEW, 1);
+        assert_eq!(from_file.frame().ground, 1);
+        assert_eq!(from_file.sprites, sprites(), "sprites by name");
+        assert_eq!(from_file.frame().cell, 16);
         assert!(
             !game_on(level(&[&["..."], &["..."]]), 0, [1, 0])
                 .frame()

@@ -11,7 +11,8 @@ publish.workspace = true
 [dependencies]
 goblin-nightclub-core.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 goblin-nightclub-core = { workspace = true, features = ["test-util"] }
-serde_json.workspace = true
+png.workspace = true

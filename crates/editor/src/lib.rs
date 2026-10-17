@@ -12,7 +12,8 @@
 //!
 //! One layer is edited at a time, seen over the layers below it as in the
 //! game but with everything in view. Levels save to and load from
-//! [`LevelFile`]s. Nothing here touches the browser or GPU.
+//! [`LevelFile`]s, and the palette is whatever the level's tileset has.
+//! Nothing here touches the browser or GPU.
 
 use serde::Serialize;
 
@@ -21,10 +22,10 @@ use goblin_nightclub_core::draw::Canvas;
 use goblin_nightclub_core::frame::{Frame, LayerFrame};
 use goblin_nightclub_core::input::Input;
 use goblin_nightclub_core::layer::{Corner, Dir, Layer, Part, Shape, TILE, Tile, quarter_shapes};
-use goblin_nightclub_core::level::{Level, MAX_LAYERS, MAX_TILES};
-use goblin_nightclub_core::level_file::{LevelFile, Spawn};
+use goblin_nightclub_core::level::{Level, MAX_LAYERS};
+use goblin_nightclub_core::level_file::{Character, LevelFile, Spawn};
 use goblin_nightclub_core::palette::{self, Color};
-use goblin_nightclub_core::tileset::{self, ZOOM};
+use goblin_nightclub_core::tileset::Tileset;
 
 /// A size for new levels.
 pub const NEW_COLS: usize = 64;
@@ -87,34 +88,33 @@ pub struct State {
     pub can_remove_layer: bool,
 }
 
-/// Every brush, in palette order: floors, walls, void, water, stairs.
-pub fn palette() -> Vec<Brush> {
-    let floors = (0..tileset::FLOORS.len()).map(|f| Brush::Part(Part::Floor(f as u8)));
-    let walls = (0..tileset::WALLS.len()).map(|w| Brush::Part(Part::Wall(w as u8)));
+/// Every brush `tileset` offers, in palette order: floors, walls, void,
+/// liquids, stairs.
+pub fn palette(tileset: &Tileset) -> Vec<Brush> {
+    let floors = (0..tileset.floors.len()).map(|f| Brush::Part(Part::Floor(f as u8)));
+    let walls = (0..tileset.walls.len()).map(|w| Brush::Part(Part::Wall(w as u8)));
+    let liquids = (0..tileset.liquids.len()).map(|l| Brush::Part(Part::Liquid(l as u8)));
     floors
         .chain(walls)
-        .chain([
-            Brush::Part(Part::Void),
-            Brush::Part(Part::Water),
-            Brush::Stairs(Dir::Up),
-            Brush::Stairs(Dir::Down),
-        ])
+        .chain([Brush::Part(Part::Void)])
+        .chain(liquids)
+        .chain([Brush::Stairs(Dir::Up), Brush::Stairs(Dir::Down)])
         .collect()
 }
 
-pub fn swatches() -> Vec<Swatch> {
-    palette()
+pub fn swatches(tileset: &Tileset) -> Vec<Swatch> {
+    palette(tileset)
         .into_iter()
         .map(|b| match b {
             Brush::Part(Part::Floor(f)) => {
-                let floor = &tileset::FLOORS[f as usize];
+                let floor = &tileset.floors[f as usize];
                 Swatch {
                     name: format!("{} floor", floor.name),
                     cell: Some(floor.cells[0]),
                 }
             }
             Brush::Part(Part::Wall(w)) => {
-                let wall = &tileset::WALLS[w as usize];
+                let wall = &tileset.walls[w as usize];
                 Swatch {
                     name: format!("{} wall", wall.name),
                     cell: Some(wall.cells[0]),
@@ -124,17 +124,20 @@ pub fn swatches() -> Vec<Swatch> {
                 name: "void".into(),
                 cell: None,
             },
-            Brush::Part(Part::Water) => Swatch {
-                name: "water".into(),
-                cell: Some(tileset::WATER[0]),
-            },
+            Brush::Part(Part::Liquid(l)) => {
+                let liquid = &tileset.liquids[l as usize];
+                Swatch {
+                    name: liquid.name.clone(),
+                    cell: Some(liquid.cells[0]),
+                }
+            }
             Brush::Stairs(Dir::Up) => Swatch {
                 name: "stairs up".into(),
-                cell: Some(tileset::STAIRS_UP),
+                cell: Some(tileset.stairs[0]),
             },
             Brush::Stairs(Dir::Down) => Swatch {
                 name: "stairs down".into(),
-                cell: Some(tileset::STAIRS_DOWN),
+                cell: Some(tileset.stairs[1]),
             },
         })
         .collect()
@@ -164,6 +167,12 @@ pub struct Editor {
     /// The ground level (kept from the file; see
     /// [`LevelFile::ground`]).
     ground: usize,
+    /// The art, and the characters' sprites, kept for the file.
+    tileset: Tileset,
+    player: Character,
+    npc: Character,
+    /// The brushes `tileset` offers (see [`palette`]).
+    palette: Vec<Brush>,
     /// The layer being edited.
     layer: usize,
     /// Built from `layers` (when `dirty` is clear), for drawing.
@@ -184,69 +193,45 @@ pub struct Editor {
     redo: Vec<Snapshot>,
 }
 
-fn build(cols: usize, rows: usize, layers: &[Vec<Tile>]) -> Level {
+fn build(cols: usize, rows: usize, layers: &[Vec<Tile>], tileset: &Tileset) -> Level {
     Level::new(
         layers
             .iter()
             .map(|tiles| Layer::from_tiles(cols, rows, tiles.clone()))
             .collect(),
+        tileset.clone(),
     )
 }
 
 impl Editor {
-    /// A blank level: `depth` layers of `cols` x `rows` plain floor, the
-    /// spawn in the middle of the top one. Sizes are clamped to what a
-    /// level may have.
-    pub fn new(cols: usize, rows: usize, depth: usize, view: [f32; 2]) -> Self {
-        let depth = depth.clamp(1, MAX_LAYERS);
-        let cols = cols.clamp(1, MAX_TILES);
-        let rows = rows.clamp(1, MAX_TILES / cols);
-        let layers = vec![vec![Tile::FLOOR; cols * rows]; depth];
-        let spawn = Spawn {
-            layer: depth - 1,
-            tile: [(cols / 2) as i32, (rows / 2) as i32],
-        };
-        Self::with_layers(cols, rows, layers, spawn, 0, view)
-    }
-
-    /// Edit a saved level.
+    /// Edit a level file (a saved one, or a blank one to start from; see
+    /// [`LevelFile::blank`]). The brushes are the first wall and the first
+    /// floor of its tileset.
     pub fn from_file(file: &LevelFile, view: [f32; 2]) -> Self {
-        Self::with_layers(
-            file.cols,
-            file.rows,
-            file.tiles(),
-            file.spawn,
-            file.ground,
-            view,
-        )
-    }
-
-    fn with_layers(
-        cols: usize,
-        rows: usize,
-        layers: Vec<Vec<Tile>>,
-        spawn: Spawn,
-        ground: usize,
-        view: [f32; 2],
-    ) -> Self {
-        let level = build(cols, rows, &layers);
-        let palette = palette();
+        let (cols, rows) = (file.cols, file.rows);
+        let layers = file.tiles();
+        let level = build(cols, rows, &layers, &file.tileset);
+        let palette = palette(&file.tileset);
         let index = |b: Brush| palette.iter().position(|p| *p == b).unwrap();
         let mut editor = Self {
             input: Input::default(),
             cols,
             rows,
-            layer: spawn.layer,
+            layer: file.spawn.layer,
             layers,
-            spawn,
-            ground,
+            spawn: file.spawn,
+            ground: file.ground,
+            tileset: file.tileset.clone(),
+            player: file.player.clone(),
+            npc: file.npc.clone(),
+            primary: index(Brush::Part(Part::Wall(0))),
+            secondary: index(Brush::Part(Part::Floor(0))),
+            palette,
             level,
             dirty: false,
             tool: Tool::Pencil,
             shape: BrushShape::Whole,
-            primary: index(Brush::Part(Part::Wall(0))),
-            secondary: index(Brush::Part(Part::Floor(0))),
-            camera: Camera::new(view),
+            camera: Camera::new(view, file.tileset.zoom()),
             stroke: None,
             panning: None,
             hover: None,
@@ -260,8 +245,26 @@ impl Editor {
     }
 
     pub fn to_file(&self) -> LevelFile {
-        LevelFile::new(self.cols, self.rows, &self.layers, self.spawn)
-            .with_ground(self.ground.min(self.layers.len() - 1))
+        LevelFile::new(
+            self.cols,
+            self.rows,
+            &self.layers,
+            self.spawn,
+            self.tileset.clone(),
+            &self.player.sprite,
+            &self.npc.sprite,
+        )
+        .with_ground(self.ground.min(self.layers.len() - 1))
+    }
+
+    /// The art the level is drawn with.
+    pub fn tileset(&self) -> &Tileset {
+        &self.tileset
+    }
+
+    /// The palette as the interface shows it.
+    pub fn swatches(&self) -> Vec<Swatch> {
+        swatches(&self.tileset)
     }
 
     pub fn state(&self) -> State {
@@ -297,7 +300,7 @@ impl Editor {
 
     /// Choose palette entry `index` as the primary or the secondary brush.
     pub fn set_brush(&mut self, index: usize, secondary: bool) {
-        if index < palette().len() {
+        if index < self.palette.len() {
             if secondary {
                 self.secondary = index;
             } else {
@@ -358,7 +361,7 @@ impl Editor {
     pub fn update(&mut self, dt: f32) {
         self.camera.pan(&self.input, dt);
         if self.dirty {
-            self.level = build(self.cols, self.rows, &self.layers);
+            self.level = build(self.cols, self.rows, &self.layers, &self.tileset);
             self.dirty = false;
         }
     }
@@ -418,7 +421,7 @@ impl Editor {
     /// What the brushes paint: with `swap` (the right button), the
     /// secondary takes the primary's place.
     fn brush_tile(&self, swap: bool) -> Tile {
-        let palette = palette();
+        let palette = &self.palette;
         let (a, b) = if swap {
             (palette[self.secondary], palette[self.primary])
         } else {
@@ -512,21 +515,26 @@ impl Editor {
     /// Take the brushes and shape from tile `t`: with `swap`, a whole
     /// tile's part goes to the secondary brush.
     fn pick(&mut self, t: [i32; 2], swap: bool) {
-        let palette = palette();
-        let index = |b: Brush| palette.iter().position(|p| *p == b).unwrap();
+        let index = |b: Brush| self.palette.iter().position(|p| *p == b).unwrap();
         match self.layers[self.layer][self.index(t)] {
             Tile::Whole(p) => {
-                self.set_brush(index(Brush::Part(p)), swap);
+                let i = index(Brush::Part(p));
+                self.set_brush(i, swap);
                 self.shape = BrushShape::Whole;
             }
             Tile::Split { corner, at, rest } => {
-                self.primary = index(Brush::Part(at));
-                self.secondary = index(Brush::Part(rest));
+                let (a, b) = (index(Brush::Part(at)), index(Brush::Part(rest)));
+                self.primary = a;
+                self.secondary = b;
                 self.shape = BrushShape::Split(corner);
             }
             Tile::Stairs(dir, floor) => {
-                self.primary = index(Brush::Stairs(dir));
-                self.secondary = index(Brush::Part(Part::Floor(floor)));
+                let (a, b) = (
+                    index(Brush::Stairs(dir)),
+                    index(Brush::Part(Part::Floor(floor))),
+                );
+                self.primary = a;
+                self.secondary = b;
             }
         }
     }
@@ -643,8 +651,8 @@ impl Editor {
     /// the pointer, and the region a rectangle drag covers.
     fn overlay(&self) -> Canvas {
         const GRID: Color = [0.33, 0.33, 0.33, 0.6];
-        let mut canvas = Canvas::default();
-        let px = 1.0 / ZOOM;
+        let mut canvas = Canvas::new(&self.tileset);
+        let px = 1.0 / self.tileset.zoom();
         let [w, h] = self.world();
         let lo = self.camera.pos;
         let size = self.camera.view_world();
@@ -684,12 +692,20 @@ impl Editor {
             .into_iter()
             .map(|k| {
                 let layer = self.level.layer(k);
-                let mut visible = Canvas::default();
-                layer.draw(&mut visible, |_| true, 1.0 / ZOOM);
+                let mut visible = Canvas::new(&self.tileset);
+                layer.draw(
+                    &self.tileset,
+                    &mut visible,
+                    |_| true,
+                    1.0 / self.tileset.zoom(),
+                );
                 if self.spawn.layer == k {
                     let [x, y] = self.spawn.tile;
                     let at = [(x as f32 + 0.5) * TILE, (y as f32 + 0.5) * TILE];
-                    let player = tileset::sprite("player").cell;
+                    let player = self
+                        .tileset
+                        .sprite(&self.player.sprite)
+                        .map_or(self.tileset.white, |s| s.cell);
                     visible.sprite(at, player, palette::WHITE);
                 }
                 let parts = |quarters: &dyn Fn(usize) -> u8| -> Vec<Shape> {
@@ -698,7 +714,7 @@ impl Editor {
                         .collect()
                 };
                 let voids = parts(&|i| self.layers[k][i].void_quarters());
-                let water = parts(&|i| self.layers[k][i].water_quarters());
+                let liquid = parts(&|i| self.layers[k][i].liquid_quarters());
                 let shaft = (k < top).then(|| {
                     let shaft = self.level.shaft(top, k);
                     parts(&|i| if shaft[i] { 0b1111 } else { 0 })
@@ -707,12 +723,12 @@ impl Editor {
                     index: k,
                     remembered: visible.clone(),
                     visible,
-                    unknown: Canvas::default(),
+                    unknown: Canvas::new(&self.tileset),
                     polygon: everywhere.clone(),
                     lit_shapes: Vec::new(),
                     voids,
-                    water,
-                    standing: Canvas::default(),
+                    liquid,
+                    standing: Canvas::new(&self.tileset),
                     shaft,
                 }
             })
@@ -730,12 +746,13 @@ impl Editor {
             camera: self.camera.pos,
             view: self.camera.view,
             zoom: self.camera.zoom(),
+            cell: self.tileset.cell,
             ui_scale: self.camera.ui_scale(),
             outdoors: false,
             ground: 0,
             world: self.world(),
             overlay: self.overlay(),
-            ui: Canvas::default(),
+            ui: Canvas::new(&self.tileset),
         }
     }
 }
@@ -746,8 +763,13 @@ mod tests {
 
     const VIEW: [f32; 2] = [320.0, 200.0];
 
+    fn tileset() -> Tileset {
+        goblin_nightclub_core::tileset::testing::tileset()
+    }
+
     fn editor() -> Editor {
-        let mut e = Editor::new(8, 6, 2, VIEW);
+        let blank = LevelFile::blank(8, 6, 2, tileset(), "player", "npc");
+        let mut e = Editor::from_file(&blank, VIEW);
         // The whole level in view, a tile 16 pixels across at the origin.
         e.camera.pos = [0.0, 0.0];
         e
@@ -767,7 +789,7 @@ mod tests {
     }
 
     fn brush(b: Brush) -> usize {
-        palette().iter().position(|p| *p == b).unwrap()
+        palette(&tileset()).iter().position(|p| *p == b).unwrap()
     }
 
     fn click(e: &mut Editor, t: [i32; 2], button: u32) {
@@ -841,7 +863,7 @@ mod tests {
             tile(&e, [3, 2]),
             Tile::split(Corner::NW, Part::Void, Part::Wall(0))
         );
-        let grate = tileset::floor("grate");
+        let grate = tileset().floor("grate").unwrap();
         e.set_brush(brush(Brush::Stairs(Dir::Down)), false);
         e.set_brush(brush(Brush::Part(Part::Floor(grate))), true);
         click(&mut e, [4, 2], 0);
@@ -902,6 +924,13 @@ mod tests {
         let loaded = Editor::from_file(&file, VIEW);
         assert_eq!(loaded.layers, e.layers);
         assert_eq!(loaded.state().layer, 0, "opens on the spawn's layer");
+        assert_eq!(file.tileset, tileset(), "the tileset travels with it");
+        assert_eq!(file.player.sprite, "player");
+        // The palette offers everything in the tileset.
+        let names: Vec<String> = e.swatches().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"grate floor".to_string()));
+        assert!(names.contains(&"water".to_string()));
+        assert_eq!(e.swatches().len(), 4 + 3 + 1 + 1 + 2);
     }
 
     #[test]

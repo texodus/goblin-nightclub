@@ -77,13 +77,50 @@ async function main() {
         if (fit()) app.resize(canvas.width, canvas.height);
     }).observe(canvas);
 
+    // The tile sheet: the level says which image it draws with (a URL or a
+    // data: URL) and how big its cells are. The browser decodes it; the
+    // pixels go to the renderer, and the image itself paints the editor's
+    // swatches. Loaded again only when a level names a different image.
+    const sheet = { image: null, cell: 16, img: null };
+    async function syncSheet() {
+        const info = JSON.parse(app.level_info() ?? "null");
+        if (!info) return;
+        sheet.cell = info.cell;
+        if (info.image === sheet.image) return;
+        sheet.image = info.image;
+        const img = new Image();
+        img.src = info.image;
+        try {
+            await img.decode();
+        } catch {
+            warn(`Couldn't load the tile sheet ${info.image}`);
+            return;
+        }
+        if (sheet.image !== info.image) return; // superseded meanwhile
+        const scratch = new OffscreenCanvas(img.width, img.height);
+        const ctx = scratch.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0);
+        const { data } = ctx.getImageData(0, 0, img.width, img.height);
+        try {
+            app.set_sheet(img.width, img.height, new Uint8Array(data.buffer));
+        } catch (err) {
+            warn(`Tile sheet: ${err.message ?? err}`);
+        }
+        sheet.img = img;
+        if (mode === "editor") buildPalette();
+    }
+
     // What's running: null (just the menu), "game" or "editor".
     let mode = null;
     const show = (next) => {
         mode = next;
         menuEl.hidden = true;
         editorEl.hidden = mode !== "editor";
-        if (mode === "editor") refreshEditor();
+        syncSheet();
+        if (mode === "editor") {
+            buildPalette();
+            refreshEditor();
+        }
         canvas.focus();
     };
     const showMenu = () => {
@@ -129,39 +166,50 @@ async function main() {
     });
     showMenu();
 
-    // The editor's interface: the palette from the tile sheet, tools,
-    // shapes, layers. `refreshEditor` makes it show the editor's state.
-    const sheet = new Image();
-    sheet.src = "assets/tiles.png";
-    await sheet.decode().catch(() => {});
+    // The editor's interface: the palette from the level's tileset, tools,
+    // shapes, layers. `buildPalette` makes the swatches for the tileset
+    // being edited (again whenever it changes); `refreshEditor` makes the
+    // interface show the editor's state.
     const SWATCH = 32;
-    const CELL = 16;
-    const palette = JSON.parse(app.editor_palette());
+    let palette = [];
+    let paletteJson = null;
+    let swatches = [];
     const paint = (el, entry) => {
-        el.classList.toggle("void", !entry.cell);
-        el.title = entry.name;
-        if (!entry.cell) {
+        el.classList.toggle("void", !entry?.cell);
+        el.title = entry?.name ?? "";
+        if (!entry?.cell || !sheet.img) {
             el.style.backgroundImage = "";
             return;
         }
-        const k = SWATCH / CELL;
-        el.style.backgroundImage = `url(${sheet.src})`;
-        el.style.backgroundSize = `${sheet.width * k}px ${sheet.height * k}px`;
+        const k = SWATCH / sheet.cell;
+        el.style.backgroundImage = `url(${sheet.img.src})`;
+        el.style.backgroundSize = `${sheet.img.width * k}px ${sheet.img.height * k}px`;
         el.style.backgroundPosition = `${-entry.cell[0] * SWATCH}px ${-entry.cell[1] * SWATCH}px`;
     };
-    const swatches = palette.map((entry, i) => {
-        const el = document.createElement("div");
-        el.className = "swatch";
-        paint(el, entry);
-        el.title += " (left: primary, right: secondary)";
-        el.addEventListener("mousedown", (e) => {
-            app.editor_brush(i, e.button === 2);
-            refreshEditor();
+    function buildPalette() {
+        const json = app.editor_palette() ?? "[]";
+        if (json === paletteJson) {
+            swatches.forEach((el, i) => paint(el, palette[i]));
+            return;
+        }
+        paletteJson = json;
+        palette = JSON.parse(json);
+        $("#swatches").replaceChildren();
+        swatches = palette.map((entry, i) => {
+            const el = document.createElement("div");
+            el.className = "swatch";
+            paint(el, entry);
+            el.title += " (left: primary, right: secondary)";
+            el.addEventListener("mousedown", (e) => {
+                app.editor_brush(i, e.button === 2);
+                refreshEditor();
+            });
+            el.addEventListener("contextmenu", (e) => e.preventDefault());
+            $("#swatches").append(el);
+            return el;
         });
-        el.addEventListener("contextmenu", (e) => e.preventDefault());
-        $("#swatches").append(el);
-        return el;
-    });
+        refreshEditor();
+    }
 
     let shownDepth = 0;
     function refreshEditor() {
@@ -218,6 +266,8 @@ async function main() {
         const num = (name) => Number(form.elements[name].value);
         app.editor_new(num("cols"), num("rows"), num("layers"));
         shownDepth = 0;
+        syncSheet();
+        buildPalette();
         refreshEditor();
     });
 
@@ -237,6 +287,8 @@ async function main() {
                 try {
                     app.editor_load(text);
                     shownDepth = 0;
+                    syncSheet();
+                    buildPalette();
                 } catch (err) {
                     warn(`Couldn't open that level: ${err.message ?? err}`);
                 }

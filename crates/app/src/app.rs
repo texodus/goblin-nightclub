@@ -8,6 +8,7 @@ use web_sys::HtmlCanvasElement;
 use crate::renderer::Renderer;
 use goblin_nightclub_core::layer::Corner;
 use goblin_nightclub_core::level_file::LevelFile;
+use goblin_nightclub_core::tileset::{Sheet, Tileset};
 use goblin_nightclub_core::{HEIGHT, WIDTH};
 use goblin_nightclub_editor::{self as editor, BrushShape, Editor, Tool};
 use goblin_nightclub_game::Game;
@@ -70,6 +71,35 @@ impl App {
         self.renderer.reset();
     }
 
+    /// The tileset of the level on screen, if any.
+    fn tileset(&self) -> Option<&Tileset> {
+        match &self.mode {
+            Mode::Menu => None,
+            Mode::Game(game) => Some(game.tileset()),
+            Mode::Editor => self.editor.as_ref().map(|e| e.tileset()),
+        }
+    }
+
+    /// What the current level draws with, as JSON `{image, cell}`: the
+    /// sheet image's URL (or `data:` URL) and its cell size in pixels. JS
+    /// loads the image and hands its pixels to `set_sheet`. Null in the
+    /// menu.
+    pub fn level_info(&self) -> Option<String> {
+        self.tileset()
+            .map(|t| serde_json::json!({ "image": t.image, "cell": t.cell }).to_string())
+    }
+
+    /// The tile sheet's pixels: `width` x `height`, RGBA row by row.
+    /// Fails if the current level's tileset names cells outside it.
+    pub fn set_sheet(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<(), JsError> {
+        let sheet = Sheet::new([width, height], rgba.to_vec()).map_err(js_err)?;
+        self.renderer.set_sheet(&sheet);
+        if let Some(t) = self.tileset() {
+            t.check_sheet(sheet.size).map_err(js_err)?;
+        }
+        Ok(())
+    }
+
     /// Back to the start menu.
     pub fn menu(&mut self) {
         if let Mode::Game(game) = &mut self.mode {
@@ -112,7 +142,7 @@ impl App {
     pub fn editor(&mut self) {
         if self.editor.is_none() {
             let (cols, rows, depth) = (editor::NEW_COLS, editor::NEW_ROWS, editor::NEW_LAYERS);
-            self.editor = Some(Editor::new(cols, rows, depth, self.view()));
+            self.editor_new(cols, rows, depth);
         }
         self.switch(Mode::Editor);
     }
@@ -132,9 +162,11 @@ impl App {
         }
     }
 
-    /// Start editing a blank level of this size.
+    /// Start editing a blank level of this size, with the generator's
+    /// tileset.
     pub fn editor_new(&mut self, cols: usize, rows: usize, layers: usize) {
-        self.editor = Some(Editor::new(cols, rows, layers, self.view()));
+        let blank = goblin_nightclub_generate::template(cols, rows, layers);
+        self.editor = Some(Editor::from_file(&blank, self.view()));
         self.switch(Mode::Editor);
     }
 
@@ -151,10 +183,13 @@ impl App {
         self.editor.as_ref().map(|e| e.to_file().to_json())
     }
 
-    /// The palette, as JSON: a list of `{name, cell}`, `cell` the swatch's
-    /// `[column, row]` in the tile sheet (or null).
-    pub fn editor_palette(&self) -> String {
-        serde_json::to_string(&editor::swatches()).unwrap()
+    /// The palette of the level being edited, as JSON: a list of
+    /// `{name, cell}`, `cell` the swatch's `[column, row]` in the tile
+    /// sheet (or null). None without an editor.
+    pub fn editor_palette(&self) -> Option<String> {
+        self.editor
+            .as_ref()
+            .map(|e| serde_json::to_string(&e.swatches()).unwrap())
     }
 
     /// The editor's settings, as JSON (see [`editor::State`]).

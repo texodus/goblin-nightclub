@@ -20,8 +20,9 @@ use web_sys::HtmlCanvasElement;
 
 use goblin_nightclub_core::draw::Vertex;
 use goblin_nightclub_core::frame::Frame;
+use goblin_nightclub_core::layer::TILE;
 use goblin_nightclub_core::level::MAX_LAYERS;
-use goblin_nightclub_core::tileset::{CELL, ZOOM};
+use goblin_nightclub_core::tileset::Sheet;
 
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
@@ -43,8 +44,8 @@ const PARALLAX_NORMALIZATION: f32 = 0.5;
 
 /// The scale of each layer relative to the one above it at `zoom` screen
 /// pixels a world unit, where `default_zoom` is the zoom the art is drawn
-/// at its own size (see [`goblin_nightclub_core::tileset::ZOOM`] and the interface
-/// scale).
+/// at its own size (see [`goblin_nightclub_core::tileset::Tileset::zoom`] and the
+/// interface scale).
 fn parallax(zoom: f32, default_zoom: f32) -> f32 {
     let normalized = (zoom / default_zoom).min(1.0);
     let strength = 1.0 - PARALLAX_NORMALIZATION.clamp(0.0, 1.0) * (1.0 - normalized);
@@ -242,10 +243,9 @@ impl Msaa {
     }
 }
 
-/// The tile sheet as a texture, for `textureLoad` in shapes.wgsl. Not
-/// sRGB, so its colors reach the screen as is, like vertex colors.
-fn upload_sheet(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
-    let sheet = goblin_nightclub_core::tileset::sheet();
+/// A tile sheet as a texture, for `textureLoad` in shapes.wgsl. Not sRGB,
+/// so its colors reach the screen as is, like vertex colors.
+fn upload_sheet(device: &wgpu::Device, queue: &wgpu::Queue, sheet: &Sheet) -> wgpu::TextureView {
     let size = wgpu::Extent3d {
         width: sheet.size[0],
         height: sheet.size[1],
@@ -268,7 +268,7 @@ fn upload_sheet(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        sheet.rgba,
+        &sheet.rgba,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(4 * sheet.size[0]),
@@ -292,7 +292,8 @@ fn cleared(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
     }
 }
 
-/// A uniform buffer holding a `Transform`, and its bind group.
+/// A uniform buffer holding a `Transform`, and its bind group (which also
+/// holds the tile sheet, so it's made again when that changes).
 struct Uniform {
     buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -311,7 +312,18 @@ impl Uniform {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = Self::bind(device, layout, &buffer, sheet, sampler);
+        Self { buffer, bind_group }
+    }
+
+    fn bind(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        buffer: &wgpu::Buffer,
+        sheet: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("transform"),
             layout,
             entries: &[
@@ -328,8 +340,18 @@ impl Uniform {
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
-        });
-        Self { buffer, bind_group }
+        })
+    }
+
+    /// Point the bind group at another sheet.
+    fn rebind(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sheet: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) {
+        self.bind_group = Self::bind(device, layout, &self.buffer, sheet, sampler);
     }
 }
 
@@ -368,9 +390,14 @@ pub struct Renderer {
     water_pipeline: wgpu::RenderPipeline,
     unmask_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
+    transform_layout: wgpu::BindGroupLayout,
     shaft_layout: wgpu::BindGroupLayout,
     composite_layout: wgpu::BindGroupLayout,
     composite_params: wgpu::Buffer,
+    /// The tile sheet (a white pixel until one is set), and how it's
+    /// sampled.
+    sheet: wgpu::TextureView,
+    sampler: wgpu::Sampler,
     /// Per layer, onto the view; then onto the whole level, and the view
     /// with no camera (for the interface).
     layer_transforms: Vec<Uniform>,
@@ -611,7 +638,7 @@ impl Renderer {
             cache: None,
         });
 
-        let sheet = upload_sheet(&device, &queue);
+        let sheet = upload_sheet(&device, &queue, &Sheet::white());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("sheet"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -637,9 +664,12 @@ impl Renderer {
             water_pipeline,
             unmask_pipeline,
             composite_pipeline,
+            transform_layout,
             shaft_layout,
             composite_layout,
             composite_params,
+            sheet,
+            sampler,
             layer_transforms,
             world_transform,
             ui_transform,
@@ -662,6 +692,23 @@ impl Renderer {
     pub fn reset(&mut self) {
         self.world = None;
         self.composite_bind_group = None;
+    }
+
+    /// Draw from `sheet` from now on.
+    pub fn set_sheet(&mut self, sheet: &Sheet) {
+        self.sheet = upload_sheet(&self.device, &self.queue, sheet);
+        let all = self
+            .layer_transforms
+            .iter_mut()
+            .chain([&mut self.world_transform, &mut self.ui_transform]);
+        for uniform in all {
+            uniform.rebind(
+                &self.device,
+                &self.transform_layout,
+                &self.sheet,
+                &self.sampler,
+            );
+        }
     }
 
     /// The canvas is now `width` x `height` pixels.
@@ -769,7 +816,8 @@ impl Renderer {
         // sized to the level is at the art's own size, whatever the view's
         // zoom, so zooming keeps what's been seen.
         let zoom = frame.zoom;
-        let seen_zoom = goblin_nightclub_core::tileset::ZOOM;
+        let cell = frame.cell as f32;
+        let seen_zoom = cell / TILE;
         let world_px = frame.world.map(|w| (w * seen_zoom).ceil());
         self.ensure_world(world_px.map(|w| w as u32), frame.depth);
         self.ensure_screen(frame.depth);
@@ -788,7 +836,7 @@ impl Renderer {
             canvases: [std::ops::Range<u32>; 3],
             visible: std::ops::Range<u32>,
             voids: std::ops::Range<u32>,
-            water: std::ops::Range<u32>,
+            liquid: std::ops::Range<u32>,
             standing: std::ops::Range<u32>,
             shaft: Option<std::ops::Range<u32>>,
         }
@@ -814,7 +862,7 @@ impl Renderer {
                     });
                 let visible = push(&mut mask_vertices, &mut fan.into_iter());
                 let voids = push(&mut mask_vertices, &mut poly_triangles(&l.voids));
-                let water = push(&mut mask_vertices, &mut poly_triangles(&l.water));
+                let liquid = push(&mut mask_vertices, &mut poly_triangles(&l.liquid));
                 let standing = push(&mut mask_vertices, &mut l.standing.vertices.iter().copied());
                 let shaft = l
                     .shaft
@@ -824,7 +872,7 @@ impl Renderer {
                     canvases,
                     visible,
                     voids,
-                    water,
+                    liquid,
                     standing,
                     shaft,
                 }
@@ -849,7 +897,7 @@ impl Renderer {
         // Transforms: each layer onto the view, smaller the deeper it is;
         // the whole level onto world-sized targets; the interface as is.
         let center = [frame.view[0] / 2.0, frame.view[1] / 2.0];
-        let parallax = parallax(zoom, ZOOM * frame.ui_scale);
+        let parallax = parallax(zoom, seen_zoom * frame.ui_scale);
         for l in &frame.layers {
             let t = Transform {
                 screen: frame.view,
@@ -857,7 +905,7 @@ impl Renderer {
                 center,
                 scale: parallax.powi((frame.top - l.index) as i32),
                 zoom,
-                cell: CELL as f32,
+                cell,
                 _pad: [0.0; 3],
             };
             let buffer = &self.layer_transforms[l.index].buffer;
@@ -869,7 +917,7 @@ impl Renderer {
             center: [0.0; 2],
             scale: 1.0,
             zoom,
-            cell: CELL as f32,
+            cell,
             _pad: [0.0; 3],
         };
         self.queue.write_buffer(
@@ -989,7 +1037,7 @@ impl Renderer {
                 masks,
                 r.voids.clone(),
             );
-            // Water is void that tints what shows through: mark it half.
+            // Liquid is void that tints what shows through: mark it half.
             pass(
                 &mut encoder,
                 keep(voids),
@@ -997,7 +1045,7 @@ impl Renderer {
                 transform,
                 None,
                 masks,
-                r.water.clone(),
+                r.liquid.clone(),
             );
             // Then clear it again under whatever stands on the layer.
             pass(

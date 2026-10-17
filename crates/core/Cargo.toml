@@ -15,8 +15,6 @@ test-util = []
 
 [dependencies]
 bytemuck.workspace = true
+indexmap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[build-dependencies]
-png.workspace = true

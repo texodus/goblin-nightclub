@@ -1,137 +1,174 @@
-//! The tile sheet and what's in it, built in: art for floors, walls,
-//! stairs and sprites, each a cell (or several, as variants) of
-//! `assets/tiles.png` (decoded at compile time by `build.rs`). Floors and
-//! walls are numbered in table order; levels refer to them by [`FloorId`]
-//! and [`WallId`], generators by name.
+//! Tile sheets: which cells of a sheet image draw which floors, walls,
+//! liquids, stairs and sprites. A tileset is data a level carries (see
+//! [`crate::level_file`]), as JSON with string keys; the sheet image itself
+//! is loaded separately at runtime and handed to the renderer as a
+//! [`Sheet`]. Nothing here knows any material by name: the engine only
+//! asks a part's kind (floor, wall, liquid, void), its cells and its
+//! properties (a wall's bevel colors, a liquid's translucency).
 //!
-//! To add a tile, draw its cell into the sheet and add an entry here.
+//! In memory each table is a list in the file's order, and tiles refer to
+//! entries by index ([`FloorId`], [`WallId`], [`LiquidId`]); files refer to
+//! them by name, so a file survives its tables being reordered.
 
-use crate::layer::{FloorId, TILE, WallId};
+use indexmap::IndexMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::layer::{FloorId, LiquidId, TILE, WallId};
 use crate::palette::{self, Color};
-
-/// Edge of a cell in the sheet, in pixels. At the default zoom, a tile is
-/// drawn this many screen pixels across.
-pub const CELL: u32 = 16;
-
-/// Sheet pixels per world unit: geometry is in world units, [`TILE`] to a
-/// tile, whatever the art's size. Also the default view zoom (screen
-/// pixels per world unit), where the art is shown at its own size.
-pub const ZOOM: f32 = CELL as f32 / TILE;
-
-/// The sheet as `build.rs` decoded it: width and height (little-endian
-/// u32s), then RGBA pixels row by row.
-static SHEET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tiles.rgba"));
 
 /// A cell of the sheet: column and row.
 pub type Cell = [u16; 2];
 
-/// Solid white, for drawing plain colored shapes through the same
-/// pipeline (the sheet's color times the shape's).
-pub const WHITE: Cell = [0, 0];
-pub const STAIRS_UP: Cell = [1, 0];
-pub const STAIRS_DOWN: Cell = [2, 0];
-/// Water, in variants; drawn translucent, at `WATER_ALPHA`.
-pub const WATER: &[Cell] = &[[3, 0], [4, 0]];
-pub const WATER_ALPHA: f32 = 0.55;
+/// Entries a table may have: ids are a byte.
+pub const MAX_ENTRIES: usize = 256;
 
-pub struct Floor {
-    pub name: &'static str,
-    /// Variants, picked per tile.
-    pub cells: &'static [Cell],
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tileset {
+    /// Edge of a cell in the sheet, in pixels. At the default zoom, a tile
+    /// is drawn this many screen pixels across.
+    pub cell: u32,
+    /// Where the sheet image is: a URL, or a `data:` URL holding it.
+    pub image: String,
+    /// A solid white cell, for drawing plain colored shapes through the
+    /// same pipeline (the sheet's color times the shape's).
+    pub white: Cell,
+    /// Stairs up, stairs down.
+    pub stairs: [Cell; 2],
+    pub floors: Vec<Floor>,
+    pub walls: Vec<Wall>,
+    pub liquids: Vec<Liquid>,
+    pub sprites: Vec<Sprite>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Floor {
+    pub name: String,
+    /// Variants, picked per tile.
+    pub cells: Vec<Cell>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Wall {
-    pub name: &'static str,
+    pub name: String,
     /// Variants, picked per tile: the wall seen from above.
-    pub cells: &'static [Cell],
+    pub cells: Vec<Cell>,
     /// Bevel colors along faces facing up or left, and down or right.
     pub light: Color,
     pub dark: Color,
 }
 
+/// Void to the game (impassable, open to sight, the layer below showing
+/// through), drawn as a translucent tile over what's beneath.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Liquid {
+    pub name: String,
+    pub cells: Vec<Cell>,
+    /// Opacity, 0 to 1.
+    pub alpha: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Sprite {
-    pub name: &'static str,
+    pub name: String,
     pub cell: Cell,
 }
 
-pub const FLOORS: &[Floor] = &[
-    Floor {
-        name: "plain",
-        cells: &[[0, 1], [0, 1], [0, 1], [1, 1]],
-    },
-    Floor {
-        name: "planks",
-        cells: &[[2, 1], [3, 1]],
-    },
-    Floor {
-        name: "dirt",
-        cells: &[[4, 1], [5, 1]],
-    },
-    Floor {
-        name: "grate",
-        cells: &[[6, 1], [6, 1], [7, 1]],
-    },
-    Floor {
-        name: "grass",
-        cells: &[[0, 4], [1, 4]],
-    },
-    Floor {
-        name: "sand",
-        cells: &[[2, 4], [3, 4]],
-    },
-    Floor {
-        name: "stone",
-        cells: &[[4, 4], [5, 4]],
-    },
-];
+impl Tileset {
+    /// The floor type named `name`.
+    pub fn floor(&self, name: &str) -> Option<FloorId> {
+        self.floors
+            .iter()
+            .position(|f| f.name == name)
+            .map(|i| i as FloorId)
+    }
 
-pub const WALLS: &[Wall] = &[
-    Wall {
-        name: "rock",
-        cells: &[[2, 2], [3, 2]],
-        light: palette::YELLOW,
-        dark: palette::RED,
-    },
-    Wall {
-        name: "brick",
-        cells: &[[0, 2], [1, 2]],
-        light: palette::LIGHT_RED,
-        dark: palette::BLACK,
-    },
-    Wall {
-        name: "metal",
-        cells: &[[4, 2], [5, 2]],
-        light: palette::WHITE,
-        dark: palette::DARK_GRAY,
-    },
-];
+    /// The wall type named `name`.
+    pub fn wall(&self, name: &str) -> Option<WallId> {
+        self.walls
+            .iter()
+            .position(|w| w.name == name)
+            .map(|i| i as WallId)
+    }
 
-pub const SPRITES: &[Sprite] = &[
-    Sprite {
-        name: "player",
-        cell: [0, 3],
-    },
-    Sprite {
-        name: "npc",
-        cell: [1, 3],
-    },
-];
+    /// The liquid named `name`.
+    pub fn liquid(&self, name: &str) -> Option<LiquidId> {
+        self.liquids
+            .iter()
+            .position(|l| l.name == name)
+            .map(|i| i as LiquidId)
+    }
 
-/// The floor type named `name`.
-pub fn floor(name: &str) -> FloorId {
-    let i = FLOORS.iter().position(|f| f.name == name);
-    i.unwrap_or_else(|| panic!("no floor {name:?}")) as FloorId
-}
+    pub fn sprite(&self, name: &str) -> Option<&Sprite> {
+        self.sprites.iter().find(|s| s.name == name)
+    }
 
-/// The wall type named `name`.
-pub fn wall(name: &str) -> WallId {
-    let i = WALLS.iter().position(|w| w.name == name);
-    i.unwrap_or_else(|| panic!("no wall {name:?}")) as WallId
-}
+    /// Sheet pixels per world unit: geometry is in world units, [`TILE`] to
+    /// a tile, whatever the art's size. Also the default view zoom (screen
+    /// pixels per world unit), where the art is shown at its own size.
+    pub fn zoom(&self) -> f32 {
+        self.cell as f32 / TILE
+    }
 
-pub fn sprite(name: &str) -> &'static Sprite {
-    let s = SPRITES.iter().find(|s| s.name == name);
-    s.unwrap_or_else(|| panic!("no sprite {name:?}"))
+    /// Size of a sprite drawn in the world, in world units: a cell.
+    pub fn sprite_size(&self) -> [f32; 2] {
+        [TILE, TILE]
+    }
+
+    /// Every cell the tileset uses.
+    pub fn cells(&self) -> impl Iterator<Item = Cell> + '_ {
+        self.floors
+            .iter()
+            .flat_map(|f| f.cells.iter().copied())
+            .chain(self.walls.iter().flat_map(|w| w.cells.iter().copied()))
+            .chain(self.liquids.iter().flat_map(|l| l.cells.iter().copied()))
+            .chain(self.sprites.iter().map(|s| s.cell))
+            .chain([self.white, self.stairs[0], self.stairs[1]])
+    }
+
+    /// Check the tileset against a sheet of `size` pixels: every cell must
+    /// be inside it.
+    pub fn check_sheet(&self, size: [u32; 2]) -> Result<(), String> {
+        let (cols, rows) = (size[0] / self.cell, size[1] / self.cell);
+        for c in self.cells() {
+            if c[0] as u32 >= cols || c[1] as u32 >= rows {
+                return Err(format!(
+                    "cell {c:?} is outside the sheet ({cols} x {rows} cells)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check the tileset itself: a cell size, something in every table
+    /// that's drawn from, no table too long for its ids.
+    fn check(&self) -> Result<(), String> {
+        if self.cell == 0 {
+            return Err("a tileset's cell size must be at least 1".into());
+        }
+        if self.floors.is_empty() || self.walls.is_empty() {
+            return Err("a tileset needs at least one floor and one wall".into());
+        }
+        for (table, len) in [
+            ("floors", self.floors.len()),
+            ("walls", self.walls.len()),
+            ("liquids", self.liquids.len()),
+        ] {
+            if len > MAX_ENTRIES {
+                return Err(format!("at most {MAX_ENTRIES} {table}"));
+            }
+        }
+        let empty = self
+            .floors
+            .iter()
+            .map(|f| (&f.name, f.cells.is_empty()))
+            .chain(self.walls.iter().map(|w| (&w.name, w.cells.is_empty())))
+            .chain(self.liquids.iter().map(|l| (&l.name, l.cells.is_empty())))
+            .find(|(_, empty)| *empty);
+        if let Some((name, _)) = empty {
+            return Err(format!("{name:?} has no cells"));
+        }
+        Ok(())
+    }
 }
 
 /// Of `cells`, the variant for tile `(x, y)`: varied, but the same every
@@ -144,20 +181,262 @@ pub fn variant(cells: &[Cell], x: usize, y: usize) -> Cell {
     cells[h as usize % cells.len()]
 }
 
-/// Size of a sprite drawn in the world, in world units.
-pub const SPRITE_SIZE: [f32; 2] = [CELL as f32 / ZOOM, CELL as f32 / ZOOM];
-
-/// The sheet: its size in pixels, and RGBA pixels row by row.
+/// A sheet image, decoded: its size in pixels, and RGBA pixels row by row.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Sheet {
     pub size: [u32; 2],
-    pub rgba: &'static [u8],
+    pub rgba: Vec<u8>,
 }
 
-pub fn sheet() -> Sheet {
-    let word = |i: usize| u32::from_le_bytes(SHEET[i..i + 4].try_into().unwrap());
-    Sheet {
-        size: [word(0), word(4)],
-        rgba: &SHEET[8..],
+impl Sheet {
+    /// A sheet of `size` pixels from `rgba`, if that's the right amount.
+    pub fn new(size: [u32; 2], rgba: Vec<u8>) -> Result<Self, String> {
+        if rgba.len() != (size[0] * size[1] * 4) as usize {
+            return Err(format!(
+                "a {} x {} sheet has {} bytes of RGBA, not {}",
+                size[0],
+                size[1],
+                size[0] * size[1] * 4,
+                rgba.len()
+            ));
+        }
+        Ok(Self { size, rgba })
+    }
+
+    /// A single white pixel: what's drawn before any sheet is loaded, so
+    /// plain shapes still show.
+    pub fn white() -> Self {
+        Self {
+            size: [1, 1],
+            rgba: vec![255; 4],
+        }
+    }
+}
+
+// --- JSON -----------------------------------------------------------------
+// Tables are JSON objects keyed by name, in order.
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Raw {
+    pub(crate) cell: u32,
+    pub(crate) image: String,
+    pub(crate) white: Cell,
+    pub(crate) stairs: RawStairs,
+    pub(crate) floors: IndexMap<String, RawFloor>,
+    pub(crate) walls: IndexMap<String, RawWall>,
+    #[serde(default)]
+    pub(crate) liquids: IndexMap<String, RawLiquid>,
+    #[serde(default)]
+    pub(crate) sprites: IndexMap<String, RawSprite>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RawStairs {
+    up: Cell,
+    down: Cell,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RawFloor {
+    cells: Vec<Cell>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RawWall {
+    cells: Vec<Cell>,
+    light: String,
+    dark: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RawLiquid {
+    cells: Vec<Cell>,
+    alpha: f32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RawSprite {
+    cell: Cell,
+}
+
+impl Tileset {
+    /// The tileset as the file holds it.
+    pub(crate) fn raw(&self) -> Raw {
+        Raw {
+            cell: self.cell,
+            image: self.image.clone(),
+            white: self.white,
+            stairs: RawStairs {
+                up: self.stairs[0],
+                down: self.stairs[1],
+            },
+            floors: self
+                .floors
+                .iter()
+                .map(|f| {
+                    (
+                        f.name.clone(),
+                        RawFloor {
+                            cells: f.cells.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            walls: self
+                .walls
+                .iter()
+                .map(|w| {
+                    (
+                        w.name.clone(),
+                        RawWall {
+                            cells: w.cells.clone(),
+                            light: palette::hex(w.light),
+                            dark: palette::hex(w.dark),
+                        },
+                    )
+                })
+                .collect(),
+            liquids: self
+                .liquids
+                .iter()
+                .map(|l| {
+                    (
+                        l.name.clone(),
+                        RawLiquid {
+                            cells: l.cells.clone(),
+                            alpha: l.alpha,
+                        },
+                    )
+                })
+                .collect(),
+            sprites: self
+                .sprites
+                .iter()
+                .map(|s| (s.name.clone(), RawSprite { cell: s.cell }))
+                .collect(),
+        }
+    }
+}
+
+impl Serialize for Tileset {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.raw().serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Tileset {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Tileset, D::Error> {
+        use serde::de::Error;
+        let raw = Raw::deserialize(d)?;
+        let color = |name: &str, s: &str| {
+            palette::parse_hex(s)
+                .ok_or_else(|| D::Error::custom(format!("{name}: bad color {s:?}")))
+        };
+        let tileset = Tileset {
+            cell: raw.cell,
+            image: raw.image,
+            white: raw.white,
+            stairs: [raw.stairs.up, raw.stairs.down],
+            floors: raw
+                .floors
+                .into_iter()
+                .map(|(name, f)| Floor {
+                    name,
+                    cells: f.cells,
+                })
+                .collect(),
+            walls: raw
+                .walls
+                .into_iter()
+                .map(|(name, w)| {
+                    Ok(Wall {
+                        light: color(&name, &w.light)?,
+                        dark: color(&name, &w.dark)?,
+                        name,
+                        cells: w.cells,
+                    })
+                })
+                .collect::<Result<_, D::Error>>()?,
+            liquids: raw
+                .liquids
+                .into_iter()
+                .map(|(name, l)| Liquid {
+                    name,
+                    cells: l.cells,
+                    alpha: l.alpha.clamp(0.0, 1.0),
+                })
+                .collect(),
+            sprites: raw
+                .sprites
+                .into_iter()
+                .map(|(name, s)| Sprite { name, cell: s.cell })
+                .collect(),
+        };
+        tileset.check().map_err(D::Error::custom)?;
+        Ok(tileset)
+    }
+}
+
+/// A small tileset for tests: floors `plain`, `planks`, `dirt`, `grate`;
+/// walls `rock`, `brick`, `metal`; liquid `water`; sprites `player`,
+/// `npc`. Cells are laid out like the placeholder sheet's.
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing {
+    use super::*;
+
+    pub fn tileset() -> Tileset {
+        let floor = |name: &str, cells: &[Cell]| Floor {
+            name: name.into(),
+            cells: cells.to_vec(),
+        };
+        let wall = |name: &str, cells: &[Cell], light, dark| Wall {
+            name: name.into(),
+            cells: cells.to_vec(),
+            light,
+            dark,
+        };
+        Tileset {
+            cell: 16,
+            image: "tiles.png".into(),
+            white: [0, 0],
+            stairs: [[1, 0], [2, 0]],
+            floors: vec![
+                floor("plain", &[[0, 1], [0, 1], [0, 1], [1, 1]]),
+                floor("planks", &[[2, 1], [3, 1]]),
+                floor("dirt", &[[4, 1], [5, 1]]),
+                floor("grate", &[[6, 1], [6, 1], [7, 1]]),
+            ],
+            walls: vec![
+                wall("rock", &[[2, 2], [3, 2]], palette::YELLOW, palette::RED),
+                wall(
+                    "brick",
+                    &[[0, 2], [1, 2]],
+                    palette::LIGHT_RED,
+                    palette::BLACK,
+                ),
+                wall(
+                    "metal",
+                    &[[4, 2], [5, 2]],
+                    palette::WHITE,
+                    palette::DARK_GRAY,
+                ),
+            ],
+            liquids: vec![Liquid {
+                name: "water".into(),
+                cells: vec![[3, 0], [4, 0]],
+                alpha: 0.55,
+            }],
+            sprites: vec![
+                Sprite {
+                    name: "player".into(),
+                    cell: [0, 3],
+                },
+                Sprite {
+                    name: "npc".into(),
+                    cell: [1, 3],
+                },
+            ],
+        }
     }
 }
 
@@ -166,36 +445,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_cell_is_in_the_sheet() {
-        let sheet = sheet();
-        assert_eq!(
-            sheet.rgba.len(),
-            (sheet.size[0] * sheet.size[1] * 4) as usize
-        );
-        let cols = (sheet.size[0] / CELL) as u16;
-        let rows = (sheet.size[1] / CELL) as u16;
-        let cells = FLOORS
-            .iter()
-            .flat_map(|f| f.cells)
-            .chain(WALLS.iter().flat_map(|w| w.cells))
-            .chain(SPRITES.iter().map(|s| &s.cell))
-            .chain(WATER)
-            .chain([&WHITE, &STAIRS_UP, &STAIRS_DOWN]);
-        for c in cells {
-            assert!(c[0] < cols && c[1] < rows, "{c:?} outside the sheet");
-        }
-        // Plain shapes draw from the white cell's top-left pixel.
-        assert_eq!(&sheet.rgba[..4], &[255, 255, 255, 255]);
-    }
-
-    #[test]
     fn names_and_variants() {
-        assert_eq!(WALLS[wall("brick") as usize].name, "brick");
-        assert_eq!(FLOORS[floor("dirt") as usize].name, "dirt");
-        assert_eq!(sprite("npc").cell, [1, 3]);
-        let cells = FLOORS[0].cells;
+        let t = testing::tileset();
+        assert_eq!(t.walls[t.wall("brick").unwrap() as usize].name, "brick");
+        assert_eq!(t.floors[t.floor("dirt").unwrap() as usize].name, "dirt");
+        assert_eq!(t.liquid("water"), Some(0));
+        assert_eq!(t.sprite("npc").unwrap().cell, [1, 3]);
+        assert_eq!(t.floor("lava"), None);
+        let cells = &t.floors[0].cells;
         assert_eq!(variant(cells, 3, 4), variant(cells, 3, 4));
         let picked: std::collections::HashSet<_> = (0..20).map(|x| variant(cells, x, 0)).collect();
         assert!(picked.len() > 1, "varies across tiles");
+        assert_eq!(t.zoom(), 1.6);
+    }
+
+    #[test]
+    fn round_trips_as_json_in_order() {
+        let t = testing::tileset();
+        let json = serde_json::to_string(&t).unwrap();
+        let back: Tileset = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
+        // Keys keep the file's order, so ids are stable.
+        assert!(json.find("\"plain\"").unwrap() < json.find("\"planks\"").unwrap());
+        assert!(json.contains("\"light\":\"#ffff55\""));
+        let shuffled = json.replacen("\"plain\":{\"cells\":[[0,1],[0,1],[0,1],[1,1]]},", "", 1);
+        let back: Tileset = serde_json::from_str(&shuffled).unwrap();
+        assert_eq!(back.floor("planks"), Some(0), "first in the file");
+    }
+
+    #[test]
+    fn bad_tilesets_are_refused() {
+        let t = testing::tileset();
+        let json = serde_json::to_string(&t).unwrap();
+        for (from, to) in [
+            ("\"cell\":16", "\"cell\":0"),
+            ("\"#ffff55\"", "\"yellow\""),
+            ("\"cells\":[[2,2],[3,2]]", "\"cells\":[]"),
+        ] {
+            let bad = json.replacen(from, to, 1);
+            assert_ne!(bad, json);
+            assert!(serde_json::from_str::<Tileset>(&bad).is_err(), "{to}");
+        }
+        assert!(t.check_sheet([128, 80]).is_ok());
+        assert!(t.check_sheet([128, 48]).is_err(), "sprites' row cut off");
+        assert!(Sheet::new([2, 1], vec![0; 8]).is_ok());
+        assert!(Sheet::new([2, 1], vec![0; 7]).is_err());
     }
 }

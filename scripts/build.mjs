@@ -13,7 +13,6 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 export const DIST = path.join(ROOT, "dist");
 const WWW = path.join(ROOT, "www");
 export const APP = path.join(ROOT, "crates", "app");
-export const ASSETS = path.join(ROOT, "crates", "core", "assets");
 
 function run(cmd, args) {
     return new Promise((resolve, reject) => {
@@ -39,9 +38,8 @@ export async function buildWasm({ dev = false } = {}) {
 
 export async function copyStatic() {
     await mkdir(DIST, { recursive: true });
+    // Includes www/assets: the tile sheet, loaded by the game at runtime.
     await cp(WWW, DIST, { recursive: true });
-    // The tile sheet, for the editor's palette.
-    await cp(ASSETS, path.join(DIST, "assets"), { recursive: true });
 }
 
 export async function build({ dev = false } = {}) {

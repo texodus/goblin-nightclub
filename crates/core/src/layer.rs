@@ -9,7 +9,7 @@ use crate::draw::{Canvas, faces_light, inset_corner, inward_normal};
 use crate::palette;
 #[cfg(any(test, feature = "test-util"))]
 use crate::rng::Rng;
-use crate::tileset;
+use crate::tileset::{self, Tileset};
 
 /// Tile edge length in pixels.
 pub const TILE: f32 = 10.0;
@@ -119,21 +119,25 @@ pub enum Dir {
     Down,
 }
 
-/// Index of a wall type in [`crate::tileset::WALLS`].
+/// Index of a wall type in the level's tileset ([`Tileset::walls`]).
 pub type WallId = u8;
-/// Index of a floor type in [`crate::tileset::FLOORS`].
+/// Index of a floor type in the level's tileset ([`Tileset::floors`]).
 pub type FloorId = u8;
+/// Index of a liquid in the level's tileset ([`Tileset::liquids`]).
+pub type LiquidId = u8;
 
-/// What a part of a tile is made of.
+/// What a part of a tile is made of. The engine knows only these kinds;
+/// which material an id is (planks, rock, water) is the tileset's business.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
     Wall(WallId),
     Floor(FloorId),
     /// No floor: the layer below shows through.
     Void,
-    /// Water: void to the game (impassable, open to sight, the layer below
-    /// showing through), drawn as a translucent tile over what's beneath.
-    Water,
+    /// A liquid: void to the game (impassable, open to sight, the layer
+    /// below showing through), drawn as a translucent tile over what's
+    /// beneath.
+    Liquid(LiquidId),
 }
 
 /// The shape of some part of a tile: what rays, collision and outlines run
@@ -284,11 +288,11 @@ impl PartialEq for Tile {
 impl Eq for Tile {}
 
 impl Tile {
-    /// Plain floor, wall and void, of the first type of each.
+    /// Plain floor, wall, void and liquid, of the first type of each.
     pub const FLOOR: Tile = Tile::Whole(Part::Floor(0));
     pub const WALL: Tile = Tile::Whole(Part::Wall(0));
     pub const VOID: Tile = Tile::Whole(Part::Void);
-    pub const WATER: Tile = Tile::Whole(Part::Water);
+    pub const LIQUID: Tile = Tile::Whole(Part::Liquid(0));
 
     /// Wall in `corner`'s half, floor in the rest.
     pub fn slope(corner: Corner) -> Tile {
@@ -353,20 +357,28 @@ impl Tile {
         Solid::from_quarters(self.quarters_where(|p| matches!(p, Part::Wall(_))), true)
     }
 
-    /// Where it's void (or water), open to the layer below.
+    /// Where it's void (or liquid), open to the layer below.
     pub fn void(self) -> Solid {
         Solid::from_quarters(self.void_quarters(), true)
     }
 
-    /// The quarters that are void or water, as bits: open to the layer
+    /// The quarters that are void or liquid, as bits: open to the layer
     /// below, impassable, and no block to sight.
     pub fn void_quarters(self) -> u8 {
-        self.quarters_where(|p| matches!(p, Part::Void | Part::Water))
+        self.quarters_where(|p| matches!(p, Part::Void | Part::Liquid(_)))
     }
 
-    /// The quarters that are water, as bits.
-    pub fn water_quarters(self) -> u8 {
-        self.quarters_where(|p| p == Part::Water)
+    /// The quarters that are liquid, as bits.
+    pub fn liquid_quarters(self) -> u8 {
+        self.quarters_where(|p| matches!(p, Part::Liquid(_)))
+    }
+
+    /// Its liquid, if any of it is liquid.
+    pub fn liquid_id(self) -> Option<LiquidId> {
+        self.parts().into_iter().find_map(|p| match p {
+            Part::Liquid(l) => Some(l),
+            _ => None,
+        })
     }
 
     /// Its wall type, if any of it is wall.
@@ -620,8 +632,8 @@ impl Layer {
     /// Build a layer from rows of `.` (floor), `#` (wall), `◸ ◹ ◺ ◿`
     /// (wall in that corner, floor in the rest), `◤ ◥ ◣ ◢` (wall in that
     /// corner over void), `▛ ▜ ▙ ▟` (floor in that corner, void in the
-    /// rest), `~` (void), `≈` (water) and `<` `>` (stairs up and down), for
-    /// tests.
+    /// rest), `~` (void), `≈` (liquid) and `<` `>` (stairs up and down),
+    /// for tests. Materials are the first of each kind in the tileset.
     #[cfg(any(test, feature = "test-util"))]
     pub fn from_ascii(rows: &[&str]) -> Self {
         use Corner::*;
@@ -633,7 +645,7 @@ impl Layer {
             .map(|c| match c {
                 '.' => Tile::FLOOR,
                 '~' => Tile::VOID,
-                '≈' => Tile::WATER,
+                '≈' => Tile::LIQUID,
                 '<' => Tile::Stairs(Dir::Up, 0),
                 '>' => Tile::Stairs(Dir::Down, 0),
                 '#' => Tile::WALL,
@@ -687,7 +699,7 @@ impl Layer {
         self.solids[y as usize * self.cols + x as usize]
     }
 
-    /// Is point `p` (pixels) over void (or water): in a void quarter of
+    /// Is point `p` (pixels) over void (or liquid): in a void quarter of
     /// its tile? Outside the layer, no.
     pub fn is_void_at(&self, p: [f32; 2]) -> bool {
         let [x, y] = [(p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32];
@@ -1346,31 +1358,40 @@ impl Layer {
         best.or(fallback)
     }
 
-    /// Draw each tile's art from the tile sheet (each part's floor or
-    /// wall, nothing where void, stairs over the whole tile), and a bevel
+    /// Draw each tile's art from `tileset` (each part's floor, wall or
+    /// liquid, nothing where void, stairs over the whole tile), and a bevel
     /// `width` wide along the outline edges `bevel(edge index)` picks: the
     /// wall's light color on faces facing up or left, its dark color on
     /// faces facing down or right. Strips along each loop are mitered at
     /// its corners so they meet exactly.
-    pub fn draw(&self, canvas: &mut Canvas, bevel: impl Fn(usize) -> bool, width: f32) {
+    pub fn draw(
+        &self,
+        tileset: &Tileset,
+        canvas: &mut Canvas,
+        bevel: impl Fn(usize) -> bool,
+        width: f32,
+    ) {
         for (i, tile) in self.tiles.iter().enumerate() {
             let (x, y) = (i % self.cols, i / self.cols);
             let origin = [x as f32 * TILE, y as f32 * TILE];
             let mut part = |shape: Option<Shape>, part: Part| {
                 let (cell, color) = match part {
                     Part::Floor(f) => (
-                        tileset::variant(tileset::FLOORS[f as usize].cells, x, y),
+                        tileset::variant(&tileset.floors[f as usize].cells, x, y),
                         palette::WHITE,
                     ),
                     Part::Wall(w) => (
-                        tileset::variant(tileset::WALLS[w as usize].cells, x, y),
+                        tileset::variant(&tileset.walls[w as usize].cells, x, y),
                         palette::WHITE,
                     ),
                     // Translucent, so what's beneath shows through.
-                    Part::Water => (
-                        tileset::variant(tileset::WATER, x, y),
-                        [1.0, 1.0, 1.0, tileset::WATER_ALPHA],
-                    ),
+                    Part::Liquid(l) => {
+                        let liquid = &tileset.liquids[l as usize];
+                        (
+                            tileset::variant(&liquid.cells, x, y),
+                            [1.0, 1.0, 1.0, liquid.alpha],
+                        )
+                    }
                     Part::Void => return,
                 };
                 if let Some(shape) = shape {
@@ -1379,8 +1400,8 @@ impl Layer {
             };
             if let Some(dir) = tile.stairs() {
                 let cell = match dir {
-                    Dir::Up => tileset::STAIRS_UP,
-                    Dir::Down => tileset::STAIRS_DOWN,
+                    Dir::Up => tileset.stairs[0],
+                    Dir::Down => tileset.stairs[1],
                 };
                 canvas.textured(
                     &Solid::Full.shape(x, y).unwrap(),
@@ -1424,7 +1445,7 @@ impl Layer {
                     let e = self.edges[i];
                     if bevel(i) && self.in_bounds(e.solid) {
                         let wall = self.tile(e.solid[0], e.solid[1]).wall_id().unwrap_or(0);
-                        let wall = &tileset::WALLS[wall as usize];
+                        let wall = &tileset.walls[wall as usize];
                         let color = if lit { wall.light } else { wall.dark };
                         let a = inner(e.a, start, inset[k]);
                         let b = inner(e.b, end, inset[(k + 1) % n]);
@@ -1891,10 +1912,11 @@ mod tests {
     /// Area of everything drawn after the floor, grid and tile fills: the
     /// bevel strips.
     fn bevel_area(level: &Layer, bevel: impl Fn(usize) -> bool) -> f32 {
-        let mut base = Canvas::default();
-        level.draw(&mut base, |_| false, 1.0);
-        let mut canvas = Canvas::default();
-        level.draw(&mut canvas, bevel, 1.0);
+        let tileset = tileset::testing::tileset();
+        let mut base = Canvas::new(&tileset);
+        level.draw(&tileset, &mut base, |_| false, 1.0);
+        let mut canvas = Canvas::new(&tileset);
+        level.draw(&tileset, &mut canvas, bevel, 1.0);
         canvas.vertices[base.vertices.len()..]
             .chunks(3)
             .map(|t| {
@@ -2004,16 +2026,18 @@ mod tests {
     }
 
     #[test]
-    fn water_is_void_to_the_game() {
+    fn liquid_is_void_to_the_game() {
         let t = Layer::from_ascii(&["≈"]).tile(0, 0);
-        assert_eq!(t, Tile::WATER);
+        assert_eq!(t, Tile::LIQUID);
         assert_eq!(t.void(), Solid::Full);
-        assert_eq!(t.water_quarters(), 0b1111);
-        assert_eq!(Tile::VOID.water_quarters(), 0);
+        assert_eq!(t.liquid_quarters(), 0b1111);
+        assert_eq!(t.liquid_id(), Some(0));
+        assert_eq!(Tile::VOID.liquid_quarters(), 0);
         assert_eq!(t.wall(), Solid::None, "no block to sight");
-        let half = Tile::split(Corner::NW, Part::Floor(0), Part::Water);
+        let half = Tile::split(Corner::NW, Part::Floor(0), Part::Liquid(1));
         assert_eq!(half.void(), Solid::Slope(Corner::SE));
-        assert_eq!(half.water_quarters(), half.void_quarters());
+        assert_eq!(half.liquid_quarters(), half.void_quarters());
+        assert_eq!(half.liquid_id(), Some(1));
     }
 
     #[test]
@@ -2023,7 +2047,7 @@ mod tests {
         assert!(!l.is_void_at([2.0, 3.0]));
         assert!(l.is_void_at([8.0, 7.0]));
         assert!(l.is_void_at([15.0, 5.0]), "void");
-        assert!(l.is_void_at([5.0, 15.0]), "water counts");
+        assert!(l.is_void_at([5.0, 15.0]), "liquid counts");
         assert!(!l.is_void_at([25.0, 5.0]), "floor");
         assert!(!l.is_void_at([15.0, 15.0]), "wall");
         assert!(!l.is_void_at([-1.0, 5.0]), "outside");

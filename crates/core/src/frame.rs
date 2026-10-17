@@ -22,9 +22,9 @@ pub struct LayerFrame {
     /// Where this layer is void, as convex polygons: where the layer below
     /// shows through.
     pub voids: Vec<Vec<[f32; 2]>>,
-    /// The part of `voids` that is water: drawn as a translucent tint over
-    /// the layer below instead of simply showing it.
-    pub water: Vec<Vec<[f32; 2]>>,
+    /// The part of `voids` that is liquid: drawn as a translucent tint
+    /// over the layer below instead of simply showing it.
+    pub liquid: Vec<Vec<[f32; 2]>>,
     /// Sprites of things standing on this layer: wherever they're opaque,
     /// the layer is drawn over any void beneath them rather than letting
     /// the layer below show through.
@@ -61,8 +61,10 @@ pub struct Frame {
     /// Size of the view, in screen pixels.
     pub view: [f32; 2],
     /// Screen pixels per world unit (the art is at its own size at
-    /// [`crate::tileset::ZOOM`]).
+    /// `cell / TILE`, see [`crate::tileset::Tileset::zoom`]).
     pub zoom: f32,
+    /// Edge of a cell of the tile sheet, in pixels.
+    pub cell: u32,
     /// Screen pixels per interface pixel, for `ui`.
     pub ui_scale: f32,
     /// Is the viewer under the open sky? Then layers below fade into fog

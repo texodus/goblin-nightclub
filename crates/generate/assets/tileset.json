@@ -1,0 +1,27 @@
+{
+  "cell": 16,
+  "image": "assets/tiles.png",
+  "white": [0, 0],
+  "stairs": { "up": [1, 0], "down": [2, 0] },
+  "floors": {
+    "plain": { "cells": [[0, 1], [0, 1], [0, 1], [1, 1]] },
+    "planks": { "cells": [[2, 1], [3, 1]] },
+    "dirt": { "cells": [[4, 1], [5, 1]] },
+    "grate": { "cells": [[6, 1], [6, 1], [7, 1]] },
+    "grass": { "cells": [[0, 4], [1, 4]] },
+    "sand": { "cells": [[2, 4], [3, 4]] },
+    "stone": { "cells": [[4, 4], [5, 4]] }
+  },
+  "walls": {
+    "rock": { "cells": [[2, 2], [3, 2]], "light": "#ffff55", "dark": "#aa0000" },
+    "brick": { "cells": [[0, 2], [1, 2]], "light": "#ff5555", "dark": "#000000" },
+    "metal": { "cells": [[4, 2], [5, 2]], "light": "#ffffff", "dark": "#555555" }
+  },
+  "liquids": {
+    "water": { "cells": [[3, 0], [4, 0]], "alpha": 0.55 }
+  },
+  "sprites": {
+    "player": { "cell": [0, 3] },
+    "npc": { "cell": [1, 3] }
+  }
+}

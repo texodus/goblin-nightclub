@@ -17,6 +17,7 @@ goblin-nightclub-game = { path = "crates/game" }
 goblin-nightclub-editor = { path = "crates/editor" }
 bytemuck = { version = "1.25", features = ["derive"] }
 console_error_panic_hook = "0.1.7"
+indexmap = { version = "2", features = ["serde"] }
 png = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

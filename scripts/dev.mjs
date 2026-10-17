@@ -108,7 +108,8 @@ await build({ dev });
 
 const onRust = debounce(() => rebuild("wasm"), 100);
 const onStatic = debounce(() => rebuild("static"), 50);
-// Every crate: sources, manifests, and the tile sheet in crates/core/assets.
+// Every crate: sources, manifests, and the generator's tileset.json. The
+// tile sheet itself is under www/.
 watch(path.join(ROOT, "crates"), { recursive: true }, onRust);
 watch(path.join(ROOT, "Cargo.toml"), onRust);
 watch(path.join(ROOT, "www"), { recursive: true }, onStatic);

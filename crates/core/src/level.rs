@@ -18,6 +18,7 @@
 //! visibility work on them unchanged.
 
 use crate::layer::{Layer, Solid};
+use crate::tileset::Tileset;
 
 /// Layers a level may have (the renderer keeps textures for each).
 pub const MAX_LAYERS: usize = 8;
@@ -28,6 +29,8 @@ pub const MAX_TILES: usize = 128 * 128;
 
 pub struct Level {
     layers: Vec<Layer>,
+    /// The art its tiles refer to.
+    tileset: Tileset,
     movement: Vec<Layer>,
     /// `views[top][k]` for `k <= top`; see [`Level::view`].
     views: Vec<Vec<Layer>>,
@@ -38,8 +41,8 @@ pub struct Level {
 
 impl Level {
     /// A level from its layers, bottom first: up to [`MAX_LAYERS`], all the
-    /// same size.
-    pub fn new(layers: Vec<Layer>) -> Self {
+    /// same size, their tiles drawn from `tileset`.
+    pub fn new(layers: Vec<Layer>, tileset: Tileset) -> Self {
         let (cols, rows) = (layers[0].cols, layers[0].rows);
         assert!(layers.iter().all(|l| l.cols == cols && l.rows == rows));
         assert!(layers.len() <= MAX_LAYERS, "at most {MAX_LAYERS} layers");
@@ -108,6 +111,7 @@ impl Level {
             .collect();
         Self {
             layers,
+            tileset,
             movement,
             views,
             shafts,
@@ -128,6 +132,10 @@ impl Level {
 
     pub fn layer(&self, i: usize) -> &Layer {
         &self.layers[i]
+    }
+
+    pub fn tileset(&self) -> &Tileset {
+        &self.tileset
     }
 
     /// What blocks movement on layer `i`: walls and void.
@@ -165,7 +173,10 @@ mod tests {
     use crate::layer::Corner;
 
     fn level(layers: &[&[&str]]) -> Level {
-        Level::new(layers.iter().map(|rows| Layer::from_ascii(rows)).collect())
+        Level::new(
+            layers.iter().map(|rows| Layer::from_ascii(rows)).collect(),
+            crate::tileset::testing::tileset(),
+        )
     }
 
     #[test]
@@ -184,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn water_blocks_movement_and_shows_the_layer_below() {
+    fn liquid_blocks_movement_and_shows_the_layer_below() {
         let l = level(&[&["..."], &["≈.~"]]);
         assert_eq!(l.movement(1).solid(0, 0), Solid::Full, "a pit");
         assert_eq!(l.movement(1).solid(1, 0), Solid::None);

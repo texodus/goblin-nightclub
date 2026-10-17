@@ -28,13 +28,18 @@
 //! pieces of land that nothing else joins: fords cross water, and bridges
 //! a tile wide cross holes. Holes keep a tile clear of water.
 //!
-//! The materials are named in the tile sheet (see [`goblin_nightclub_core::tileset`]).
+//! The materials are named in the generator's tileset, `assets/tileset.json`
+//! (see [`tileset`]), which every generated level carries along with the
+//! sprites the player and NPCs wear.
+
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use goblin_nightclub_core::layer::{Corner, Dir, FloorId, Layer, Part, Side, Solid, TILE, Tile, WallId};
+use goblin_nightclub_core::layer::{Corner, Dir, FloorId, Part, Side, Solid, TILE, Tile, WallId};
 use goblin_nightclub_core::level::{Level, MAX_LAYERS};
+use goblin_nightclub_core::level_file::{LevelFile, Spawn};
 use goblin_nightclub_core::rng::Rng;
-use goblin_nightclub_core::tileset;
+use goblin_nightclub_core::tileset::Tileset;
 
 /// What to generate. Every field has a default; see [`Params::default`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -138,6 +143,33 @@ const ROOM_WALL: &str = "brick";
 const BRIDGE: &str = "planks";
 /// The floor of a canyon, under a hole in the plains.
 const CANYON_FLOOR: &str = "stone";
+const WATER: &str = "water";
+/// Sprites, for the level file.
+const PLAYER_SPRITE: &str = "player";
+const NPC_SPRITE: &str = "npc";
+
+/// A blank level for the editor to start from: `depth` layers of plain
+/// floor with the generator's tileset and sprites.
+pub fn template(cols: usize, rows: usize, depth: usize) -> LevelFile {
+    LevelFile::blank(
+        cols,
+        rows,
+        depth,
+        tileset().clone(),
+        PLAYER_SPRITE,
+        NPC_SPRITE,
+    )
+}
+
+/// The tileset generated levels use: the placeholder sheet's floors,
+/// walls, water and sprites, from `assets/tileset.json`.
+pub fn tileset() -> &'static Tileset {
+    static TILESET: OnceLock<Tileset> = OnceLock::new();
+    TILESET.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/tileset.json"))
+            .expect("assets/tileset.json is a valid tileset")
+    })
+}
 
 /// Generate a level from `seed`, `cols` x `rows` tiles a layer, the player
 /// starting on the plains at `spawn` (pixels).
@@ -148,8 +180,31 @@ pub fn generate_level(
     spawn: [f32; 2],
     params: &Params,
 ) -> Level {
+    world(seed, cols, rows, spawn, params).level()
+}
+
+/// Generate a level as a complete level file: layers, spawn, ground level,
+/// tileset and sprites, the same as [`generate_level`] gives in memory. The
+/// spawn is the tile under `spawn` (pixels), moved inside the level if
+/// need be.
+pub fn world(seed: u32, cols: usize, rows: usize, spawn: [f32; 2], params: &Params) -> LevelFile {
     let spawn = [(spawn[0] / TILE) as i32, (spawn[1] / TILE) as i32];
-    World::new(seed, cols, rows, spawn, params).build()
+    let world = World::new(seed, cols, rows, spawn, params);
+    let (spawn, params) = (world.spawn, world.params.clone());
+    let layers = world.build();
+    LevelFile::new(
+        cols,
+        rows,
+        &layers,
+        Spawn {
+            layer: spawn_layer(&params).min(layers.len() - 1),
+            tile: spawn,
+        },
+        tileset().clone(),
+        PLAYER_SPRITE,
+        NPC_SPRITE,
+    )
+    .with_ground(ground_layer(&params).min(layers.len() - 1))
 }
 
 /// The spawn's layer: the plains, the second overworld layer up.
@@ -177,6 +232,8 @@ struct World {
     /// Terrain noise per column, in [0, 1).
     noise: Vec<f32>,
     rock: Part,
+    /// A tile of water.
+    water: Tile,
     floors: Floors,
 }
 
@@ -199,7 +256,14 @@ impl World {
             .overworld_layers
             .clamp(2, MAX_LAYERS - params.underworld_layers);
         let depth = params.underworld_layers + params.overworld_layers;
-        let rock = Part::Wall(tileset::wall(ROCK));
+        let t = tileset();
+        let wall = |name| t.wall(name).unwrap_or_else(|| panic!("no wall {name:?}"));
+        let floor = |name| t.floor(name).unwrap_or_else(|| panic!("no floor {name:?}"));
+        let liquid = |name| {
+            t.liquid(name)
+                .unwrap_or_else(|| panic!("no liquid {name:?}"))
+        };
+        let rock = Part::Wall(wall(ROCK));
         let spawn = [
             spawn[0].clamp(SPAWN_CLEARANCE + 1, cols as i32 - SPAWN_CLEARANCE - 2),
             spawn[1].clamp(SPAWN_CLEARANCE + 1, rows as i32 - SPAWN_CLEARANCE - 2),
@@ -214,20 +278,22 @@ impl World {
             height: vec![1; cols * rows],
             noise: vec![0.0; cols * rows],
             rock,
+            water: Tile::Whole(Part::Liquid(liquid(WATER))),
             floors: Floors {
-                plains: tileset::floor(PLAINS),
-                hills: tileset::floor(HILLS),
-                mountains: tileset::floor(MOUNTAINS),
-                bed: tileset::floor(BED),
-                cave: tileset::floor(CAVE_FLOOR),
-                room: tileset::floor(ROOM_FLOOR),
-                bridge: tileset::floor(BRIDGE),
-                canyon: tileset::floor(CANYON_FLOOR),
+                plains: floor(PLAINS),
+                hills: floor(HILLS),
+                mountains: floor(MOUNTAINS),
+                bed: floor(BED),
+                cave: floor(CAVE_FLOOR),
+                room: floor(ROOM_FLOOR),
+                bridge: floor(BRIDGE),
+                canyon: floor(CANYON_FLOOR),
             },
         }
     }
 
-    fn build(mut self) -> Level {
+    /// Build the world: its layers, bottom first, each row by row.
+    fn build(mut self) -> Vec<Vec<Tile>> {
         self.terrain();
         self.lakes();
         self.rivers();
@@ -240,16 +306,7 @@ impl World {
         for k in 0..self.layers.len() {
             smooth(&mut self.layers[k], self.cols, self.rows);
         }
-        self.level()
-    }
-
-    fn level(&self) -> Level {
-        Level::new(
-            self.layers
-                .iter()
-                .map(|t| Layer::from_tiles(self.cols, self.rows, t.clone()))
-                .collect(),
-        )
+        self.layers
     }
 
     fn index(&self, [x, y]: [i32; 2]) -> usize {
@@ -379,7 +436,7 @@ impl World {
             let i = self.index(t);
             let low = share > 0.0 && self.noise[i] <= level && self.height[i] == 1;
             if low && self.interior(t) && !self.near_spawn(t, 2) && self.rests(plains, t) {
-                self.layers[plains][i] = Tile::WATER;
+                self.layers[plains][i] = self.water;
             }
         }
     }
@@ -390,7 +447,7 @@ impl World {
     /// is left as land.
     fn rivers(&mut self) {
         let plains = self.over(1);
-        let water =|w: &World, t: [i32; 2]| w.layers[plains][w.index(t)] == Tile::WATER;
+        let water = |w: &World, t: [i32; 2]| w.layers[plains][w.index(t)] == w.water;
         for _ in 0..self.params.rivers {
             let highs: Vec<[i32; 2]> = self
                 .tiles()
@@ -441,7 +498,7 @@ impl World {
                 let ford = self.params.ford_spacing > 0
                     && n % self.params.ford_spacing == self.params.ford_spacing / 2;
                 if !ford && self.rests(plains, t) {
-                    self.layers[plains][i] = Tile::WATER;
+                    self.layers[plains][i] = self.water;
                 }
             }
             loop {
@@ -465,7 +522,7 @@ impl World {
         // A lone tile of land with water on every side becomes water too.
         for t in self.tiles() {
             let i = self.index(t);
-            if self.layers[plains][i] == Tile::WATER || !self.interior(t) || self.near_spawn(t, 2) {
+            if self.layers[plains][i] == self.water || !self.interior(t) || self.near_spawn(t, 2) {
                 continue;
             }
             let landlocked = Side::ALL.into_iter().all(|side| {
@@ -473,7 +530,7 @@ impl World {
                 water(self, [t[0] + dx, t[1] + dy])
             });
             if landlocked && self.height[i] == 1 && self.rests(plains, t) {
-                self.layers[plains][i] = Tile::WATER;
+                self.layers[plains][i] = self.water;
             }
         }
     }
@@ -493,7 +550,7 @@ impl World {
             };
             for k in 0..n {
                 let layer = self.over(k);
-                if self.layers[layer][i] == Tile::WATER {
+                if self.layers[layer][i] == self.water {
                     continue;
                 }
                 self.layers[layer][i] = if k < h {
@@ -534,7 +591,7 @@ impl World {
         (-1..=1).any(|dy| {
             (-1..=1).any(|dx| {
                 let n = [t[0] + dx, t[1] + dy];
-                self.in_bounds(n) && self.layers[k][self.index(n)] == Tile::WATER
+                self.in_bounds(n) && self.layers[k][self.index(n)] == self.water
             })
         })
     }
@@ -556,7 +613,7 @@ impl World {
                     return true;
                 }
                 let tile = self.layers[below][self.index(n)];
-                tile.wall() == Solid::Full || tile == Tile::WATER
+                tile.wall() == Solid::Full || tile == self.water
             })
         })
     }
@@ -766,8 +823,7 @@ impl World {
                     .iter()
                     .copied()
                     .filter(|&t| {
-                        self.layers[upper][self.index(t)].is_floor()
-                            && !self.beside_water(upper, t)
+                        self.layers[upper][self.index(t)].is_floor() && !self.beside_water(upper, t)
                     })
                     .collect();
                 if let Some(&at) = pool.get(self.rng.range(0, pool.len().max(1) - 1)) {
@@ -809,7 +865,7 @@ impl World {
     /// in brick, each with a door and a corridor dug toward the cave.
     fn rooms(&mut self, k: usize) {
         let (brick, planks) = (
-            Part::Wall(tileset::wall(ROOM_WALL)),
+            Part::Wall(tileset().wall(ROOM_WALL).expect("a brick wall")),
             Part::Floor(self.floors.room),
         );
         let mut placed: Vec<[i32; 4]> = Vec::new();
@@ -862,7 +918,7 @@ impl World {
                     break;
                 }
                 let i = self.index(at);
-                if self.layers[k][i].is_floor() || self.layers[k][i] == Tile::WATER {
+                if self.layers[k][i].is_floor() || self.layers[k][i] == self.water {
                     break;
                 }
                 self.layers[k][i] = Tile::Whole(Part::Floor(self.floors.cave));
@@ -903,7 +959,7 @@ impl World {
         let count = ((floor as f32 * share) as usize).min(open.len());
         for (t, _) in open.into_iter().take(count) {
             let i = self.index(t);
-            self.layers[k][i] = Tile::WATER;
+            self.layers[k][i] = self.water;
         }
     }
 
@@ -947,7 +1003,7 @@ impl World {
                         && (-2..=2).all(|dy| {
                             (-2..=3).all(|dx| {
                                 let i = self.index([t[0] + dx, t[1] + dy]);
-                                self.layers[plains][i] != Tile::WATER
+                                self.layers[plains][i] != self.water
                             })
                         })
                 })
@@ -1021,7 +1077,7 @@ impl World {
     fn lay_crossing(&mut self, k: usize, path: Vec<[i32; 2]>) {
         for t in path {
             let i = self.index(t);
-            if self.layers[k][i] == Tile::WATER {
+            if self.layers[k][i] == self.water {
                 self.layers[k][i] = Tile::Whole(Part::Floor(self.floors.bed));
             } else {
                 self.layers[k][i] = Tile::Whole(Part::Floor(self.floors.bridge));
@@ -1092,7 +1148,7 @@ impl World {
                     }
                     // Water can be forded unless water on the layer above
                     // rests on it (a ford is floor: open ground beneath).
-                    let fordable = tile == Tile::WATER
+                    let fordable = tile == self.water
                         && (k + 1 >= self.layers.len() || !self.beside_water(k + 1, n));
                     if fordable || tile == Tile::VOID {
                         next.push(n);
@@ -1163,7 +1219,7 @@ impl World {
                 } else if region.len() <= ISLET && in_water {
                     for t in region {
                         let i = self.index(t);
-                        self.layers[plains][i] = Tile::WATER;
+                        self.layers[plains][i] = self.water;
                     }
                     changed = true;
                 } else {
@@ -1231,7 +1287,7 @@ impl World {
                         .into_iter()
                         .find_map(|side| {
                             lower(self, side)
-                                .filter(|n| self.layers[plains][self.index(*n)] == Tile::WATER)
+                                .filter(|n| self.layers[plains][self.index(*n)] == self.water)
                         })
                         .map(|n| (t, n))
                 });
@@ -1281,7 +1337,7 @@ impl World {
         for (k, reached) in reached.iter().enumerate().take(m) {
             for (i, tile) in self.layers[k].iter_mut().enumerate() {
                 let open = grids[k][i] != Solid::Full;
-                if open && !reached[i] && *tile != Tile::WATER {
+                if open && !reached[i] && *tile != self.water {
                     *tile = Tile::Whole(rock);
                 }
             }
@@ -1523,6 +1579,10 @@ mod tests {
         generate_level(seed, COLS, ROWS, SPAWN, &Params::default())
     }
 
+    fn water() -> Tile {
+        Tile::Whole(Part::Liquid(tileset().liquid(WATER).unwrap()))
+    }
+
     fn spawn_tile() -> [i32; 2] {
         [(SPAWN[0] / TILE) as i32, (SPAWN[1] / TILE) as i32]
     }
@@ -1559,9 +1619,8 @@ mod tests {
                                 "seed {seed} ({x}, {y}) layer {k}"
                             ),
                             std::cmp::Ordering::Equal => {
-                                let ok = t.floor_id().is_some()
-                                    || *t == Tile::WATER
-                                    || t.stairs().is_some();
+                                let ok =
+                                    t.floor_id().is_some() || *t == water() || t.stairs().is_some();
                                 assert!(ok, "seed {seed} ({x}, {y}): {t:?} at the surface");
                             }
                             std::cmp::Ordering::Greater => {
@@ -1670,7 +1729,7 @@ mod tests {
             for k in 0..level.depth() {
                 for y in 0..ROWS as i32 {
                     for x in 0..COLS as i32 {
-                        if level.layer(k).tile(x, y) != Tile::WATER {
+                        if level.layer(k).tile(x, y) != water() {
                             continue;
                         }
                         if k == plains {
@@ -1688,7 +1747,7 @@ mod tests {
                             for dx in -1..=1 {
                                 let under = level.layer(below).tile(x + dx, y + dy);
                                 assert!(
-                                    under.wall() == Solid::Full || under == Tile::WATER,
+                                    under.wall() == Solid::Full || under == water(),
                                     "seed {seed}: water at ({x}, {y}) on layer {k} over {under:?} at ({}, {})",
                                     x + dx,
                                     y + dy
@@ -1714,7 +1773,7 @@ mod tests {
                 for y in 1..ROWS as i32 - 1 {
                     for x in 1..COLS as i32 - 1 {
                         let t = level.layer(k).tile(x, y);
-                        if k == plains && t.floor_id() == Some(tileset::floor(BRIDGE)) {
+                        if k == plains && t.floor_id() == tileset().floor(BRIDGE) {
                             bridges += 1;
                         }
                         if t != Tile::VOID || k > plains {
@@ -1737,7 +1796,7 @@ mod tests {
                             for dx in -1..=1 {
                                 let n = level.layer(k).tile(x + dx, y + dy);
                                 assert_eq!(
-                                    n.water_quarters(),
+                                    n.liquid_quarters(),
                                     0,
                                     "seed {seed}: hole at ({x}, {y}) beside water"
                                 );
@@ -1844,6 +1903,42 @@ mod tests {
             }
             assert!(pairs >= 2, "seed {seed}: {pairs} staircases");
         }
+    }
+
+    /// A generated level file has everything the game needs: the tileset,
+    /// the characters' sprites, the spawn on the plains and the ground
+    /// level there.
+    #[test]
+    fn level_files_carry_the_tileset_and_sprites() {
+        let p = Params::default();
+        let file = super::world(7, COLS, ROWS, SPAWN, &p);
+        assert_eq!(file.tileset, *tileset());
+        assert_eq!(file.spawn.layer, spawn_layer(&p));
+        assert_eq!(file.spawn.tile, spawn_tile());
+        assert_eq!(file.ground, ground_layer(&p));
+        assert!(file.tileset.sprite(&file.player.sprite).is_some());
+        assert!(file.tileset.sprite(&file.npc.sprite).is_some());
+        let back = LevelFile::from_json(&file.to_json()).unwrap();
+        assert_eq!(back, file);
+        assert_eq!(back.level().depth(), world(7).depth());
+    }
+
+    /// Every cell the tileset names is in the placeholder sheet, and its
+    /// white cell is white (so plain shapes draw right).
+    #[test]
+    fn the_tileset_fits_the_placeholder_sheet() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../www/assets/tiles.png");
+        let file = std::fs::File::open(path).expect("www/assets/tiles.png (run `npm run tiles`)");
+        let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
+        let mut reader = decoder.read_info().unwrap();
+        let mut rgba = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut rgba).unwrap();
+        let t = tileset();
+        t.check_sheet([info.width, info.height]).unwrap();
+        let [cx, cy] = t.white;
+        let i = ((cy as u32 * t.cell) * info.width + cx as u32 * t.cell) as usize * 4;
+        assert_eq!(&rgba[i..i + 4], &[255, 255, 255, 255], "white cell");
     }
 
     #[test]

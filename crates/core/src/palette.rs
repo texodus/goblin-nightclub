@@ -26,6 +26,27 @@ pub const LIGHT_MAGENTA: Color = rgb(0xFF, 0x55, 0xFF);
 pub const YELLOW: Color = rgb(0xFF, 0xFF, 0x55);
 pub const WHITE: Color = rgb(0xFF, 0xFF, 0xFF);
 
+/// `c` as `#rrggbb` (its alpha dropped), as tile sheets name colors.
+pub fn hex(c: Color) -> String {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", byte(c[0]), byte(c[1]), byte(c[2]))
+}
+
+/// A color from `#rrggbb` (or `#rgb`), opaque.
+pub fn parse_hex(s: &str) -> Option<Color> {
+    let digits = s.strip_prefix('#')?;
+    let channel = |from: usize, len: usize| {
+        let v = u8::from_str_radix(digits.get(from..from + len)?, 16).ok()?;
+        Some(if len == 1 { v * 17 } else { v })
+    };
+    let [r, g, b] = match digits.len() {
+        6 => [channel(0, 2)?, channel(2, 2)?, channel(4, 2)?],
+        3 => [channel(0, 1)?, channel(1, 1)?, channel(2, 1)?],
+        _ => return None,
+    };
+    Some(rgb(r, g, b))
+}
+
 pub const ALL: [Color; 16] = [
     BLACK,
     BLUE,

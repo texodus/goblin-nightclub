@@ -5,11 +5,11 @@
 use goblin_nightclub_core::entity::Entity;
 use goblin_nightclub_core::layer::testing::check_outlines;
 use goblin_nightclub_core::level::Level;
-use goblin_nightclub_core::level_file::{LevelFile, Spawn};
+use goblin_nightclub_core::level_file::LevelFile;
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::vision::Vision;
 use goblin_nightclub_core::vision::testing::{OpenPoint, band_covers, check_polygon, is_open_point};
-use goblin_nightclub_generate::{Params, generate_level, spawn_layer};
+use goblin_nightclub_generate::{Params, generate_level, spawn_layer, world};
 
 const SPAWN: [f32; 2] = [325.0, 205.0];
 
@@ -116,11 +116,9 @@ fn generated_levels_round_trip_as_files() {
                 .collect()
         })
         .collect();
-    let spawn = Spawn {
-        layer: spawn_layer(&Params::default()),
-        tile: [32, 20],
-    };
-    let file = LevelFile::new(64, 40, &layers, spawn);
+    let file = world(4, 64, 40, SPAWN, &Params::default());
+    assert_eq!(file.spawn.layer, spawn_layer(&Params::default()));
+    assert_eq!(file.tiles(), layers, "the file holds the same level");
     let back = LevelFile::from_json(&file.to_json()).unwrap();
     assert_eq!(back.tiles(), layers);
     let loaded = back.level();
