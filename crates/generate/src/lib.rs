@@ -35,7 +35,7 @@
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use goblin_nightclub_core::layer::{Corner, Dir, FloorId, Part, Side, Solid, TILE, Tile, WallId};
+use goblin_nightclub_core::layer::{Corner, Dir, FloorId, Part, Side, Solid, TILE, Tile};
 use goblin_nightclub_core::level::{Level, MAX_LAYERS};
 use goblin_nightclub_core::level_file::{LevelFile, Spawn};
 use goblin_nightclub_core::rng::Rng;
@@ -303,9 +303,7 @@ impl World {
         self.underworld();
         self.entrances();
         self.connect();
-        for k in 0..self.layers.len() {
-            smooth(&mut self.layers[k], self.cols, self.rows);
-        }
+        self.chamfer();
         self.layers
     }
 
@@ -586,12 +584,25 @@ impl World {
         self.carve_voids(plains, &allowed);
     }
 
-    /// Is any tile within one of `t` (itself included) water, on layer `k`?
+    /// Is any tile within one of `t` (itself included) water, in any part,
+    /// on layer `k`?
     fn beside_water(&self, k: usize, t: [i32; 2]) -> bool {
+        self.beside(k, t, |tile| tile.liquid_quarters() != 0)
+    }
+
+    /// Is any tile within one of `t` (itself included) void, in any part,
+    /// on layer `k`?
+    fn beside_void(&self, k: usize, t: [i32; 2]) -> bool {
+        self.beside(k, t, |tile| {
+            tile.void_quarters() & !tile.liquid_quarters() != 0
+        })
+    }
+
+    fn beside(&self, k: usize, t: [i32; 2], f: impl Fn(Tile) -> bool) -> bool {
         (-1..=1).any(|dy| {
             (-1..=1).any(|dx| {
                 let n = [t[0] + dx, t[1] + dy];
-                self.in_bounds(n) && self.layers[k][self.index(n)] == self.water
+                self.in_bounds(n) && f(self.layers[k][self.index(n)])
             })
         })
     }
@@ -613,9 +624,78 @@ impl World {
                     return true;
                 }
                 let tile = self.layers[below][self.index(n)];
-                tile.wall() == Solid::Full || tile == self.water
+                tile.wall().quarters() | tile.liquid_quarters() == 0b1111
             })
         })
+    }
+
+    /// Put 45-degree edges where two kinds of tile meet in a stair step
+    /// (see [`chamfer_layer`]), on every layer, bottom up: walls into
+    /// floor as ever, and now hole rims and shores both ways, and rock into
+    /// pools. Never where it would break a rule: not at the spawn, not on
+    /// bridges or fords, water only onto solid ground and away from holes,
+    /// holes away from water, and the column under a new piece of hole
+    /// gets a floor like the rest of the hole's bottom.
+    fn chamfer(&mut self) {
+        let rock = Tile::Whole(self.rock);
+        let canyon = Tile::Whole(Part::Floor(self.floors.canyon));
+        let plains = self.over(1);
+        // Top down, so the floor put under a new piece of hole is there
+        // before the layer below is looked at. Candidates come from the
+        // layer as it was; each is checked against the level as it is when
+        // its turn comes, so two chamfers can't together break a rule
+        // neither breaks alone.
+        for k in (0..self.layers.len()).rev() {
+            for c in chamfer_layer(&self.layers[k], self.cols, self.rows) {
+                let i = c.index;
+                let t = [(i % self.cols) as i32, (i / self.cols) as i32];
+                if !self.chamfer_allowed(k, t, c.rule)
+                    || !apply(&mut self.layers[k], self.cols, self.rows, c)
+                {
+                    continue;
+                }
+                // Under a new piece of hole in the plains, the floor the
+                // rest of the hole's bottom has (in the caves, the rock
+                // stays: a floor there would be cut off).
+                if c.rule.from == Kind::Void && k == plains && self.layers[k - 1][i] == rock {
+                    self.layers[k - 1][i] = canyon;
+                }
+            }
+        }
+    }
+
+    /// May tile `t` on layer `k` be chamfered by `rule` (see
+    /// [`World::chamfer`])?
+    fn chamfer_allowed(&self, k: usize, t: [i32; 2], rule: Rule) -> bool {
+        if self.near_spawn(t, 0) {
+            return false;
+        }
+        let i = self.index(t);
+        let floor = self.layers[k][i].floor_id();
+        let crossing = floor == Some(self.floors.bridge) || floor == Some(self.floors.bed);
+        match rule {
+            Rule {
+                into: Kind::Floor,
+                from: Kind::Void,
+            } => {
+                // Not over a room or stairs, and clear of water (which a
+                // hole keeps a tile from).
+                let soft = k == 0 || {
+                    let below = self.layers[k - 1][i];
+                    below == Tile::Whole(self.rock) || below.is_floor()
+                };
+                !crossing && soft && !self.beside_water(k, t)
+            }
+            Rule {
+                into: Kind::Floor,
+                from: Kind::Liquid,
+            } => !crossing && self.rests(k, t) && !self.beside_void(k, t),
+            Rule {
+                into: Kind::Liquid,
+                from: Kind::Floor,
+            } => k + 1 >= self.layers.len() || !self.beside_water(k + 1, t),
+            _ => true,
+        }
     }
 
     /// Open [`Params::holes`] holes and [`Params::canyons`] canyons as void
@@ -1519,49 +1599,193 @@ pub fn reachable_from(tiles: &[Solid], cols: usize, rows: usize, starts: &[[i32;
     seen
 }
 
-/// Fill stair-step corners with slopes: an open tile with solid on two
-/// neighboring sides (say north and west) and open space on the other two
-/// and the diagonal between them gets a slope in that corner. Only ever
-/// adds solid, and leaves a way around, so it never thins a wall or cuts
-/// a passage.
-pub fn smooth(tiles: &mut [Tile], cols: usize, rows: usize) {
-    let snapshot = tiles.to_vec();
+/// The kinds of tile the chamfer tells apart (materials aside).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    Floor,
+    Wall,
+    Liquid,
+    Void,
+}
+
+impl Kind {
+    fn of(part: Part) -> Kind {
+        match part {
+            Part::Floor(_) => Kind::Floor,
+            Part::Wall(_) => Kind::Wall,
+            Part::Liquid(_) => Kind::Liquid,
+            Part::Void => Kind::Void,
+        }
+    }
+}
+
+/// A chamfer: a tile of kind `into` whose corner is pinched by `from` on
+/// both sides gets a 45-degree edge, that corner becoming `from`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub into: Kind,
+    pub from: Kind,
+}
+
+/// The chamfers made, in order; a tile gets at most one, the first that
+/// fits. Walls into floor (the old smoothing), hole rims both ways,
+/// shores both ways, rock into pools.
+pub const RULES: [Rule; 6] = [
+    Rule {
+        into: Kind::Floor,
+        from: Kind::Wall,
+    },
+    Rule {
+        into: Kind::Floor,
+        from: Kind::Void,
+    },
+    Rule {
+        into: Kind::Void,
+        from: Kind::Floor,
+    },
+    Rule {
+        into: Kind::Floor,
+        from: Kind::Liquid,
+    },
+    Rule {
+        into: Kind::Liquid,
+        from: Kind::Floor,
+    },
+    Rule {
+        into: Kind::Liquid,
+        from: Kind::Wall,
+    },
+];
+
+/// The part of `tile` along its side `s`: of a split tile, the half that
+/// side belongs to.
+fn part_at_side(tile: Tile, s: Side) -> Part {
+    match tile {
+        Tile::Whole(p) => p,
+        Tile::Stairs(_, f) => Part::Floor(f),
+        Tile::Split { corner, at, rest } => {
+            if corner.sides().contains(&s) {
+                at
+            } else {
+                rest
+            }
+        }
+    }
+}
+
+/// The part of `tile` at its corner `c`: of a split tile, the half that
+/// corner is in, or none if the split's diagonal runs through it.
+fn part_at_corner(tile: Tile, c: Corner) -> Option<Part> {
+    match tile {
+        Tile::Whole(p) => Some(p),
+        Tile::Stairs(_, f) => Some(Part::Floor(f)),
+        Tile::Split { corner, at, .. } if corner == c => Some(at),
+        Tile::Split { corner, rest, .. } if corner == c.opposite() => Some(rest),
+        Tile::Split { .. } => None,
+    }
+}
+
+/// A chamfer to make: tile `index`'s `corner`, by `rule`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chamfer {
+    pub index: usize,
+    pub corner: Corner,
+    pub rule: Rule,
+}
+
+/// Does `rule` fit tile `(x, y)` of `tiles` at `corner` right now: a whole
+/// tile of the rule's kind, the other kind across the corner's two sides,
+/// its own kind across the other two and on the diagonal between them
+/// (where that diagonal tile touches this one)? If so, the part the
+/// corner becomes (the material of the neighbor it continues).
+fn fits(
+    tiles: &[Tile],
+    cols: usize,
+    rows: usize,
+    x: i32,
+    y: i32,
+    corner: Corner,
+    rule: Rule,
+) -> Option<Part> {
     let tile = |x: i32, y: i32| {
         if x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 {
             Tile::WALL
         } else {
-            snapshot[y as usize * cols + x as usize]
+            tiles[y as usize * cols + x as usize]
         }
     };
+    let Tile::Whole(own) = tile(x, y) else {
+        return None;
+    };
+    if Kind::of(own) != rule.into {
+        return None;
+    }
+    // What's across each side, as far as this tile is concerned.
+    let across = |side: Side| {
+        let [dx, dy] = side.offset();
+        part_at_side(tile(x + dx, y + dy), side.opposite())
+    };
+    let [a, b] = corner.sides();
+    let [c, d] = corner.opposite().sides();
+    let [ox, oy] = [c, d]
+        .map(|s| s.offset())
+        .into_iter()
+        .fold([0, 0], |acc, o| [acc[0] + o[0], acc[1] + o[1]]);
+    // The diagonal tile touches this one at the corner opposite the cut.
+    let diagonal = part_at_corner(tile(x + ox, y + oy), corner);
+    let ok = Kind::of(across(a)) == rule.from
+        && Kind::of(across(b)) == rule.from
+        && Kind::of(across(c)) == rule.into
+        && Kind::of(across(d)) == rule.into
+        && diagonal.is_some_and(|p| Kind::of(p) == rule.into);
+    ok.then(|| across(a))
+}
+
+/// Where to put 45-degree edges in stair-step corners of `tiles`: a whole
+/// tile of one kind with another kind on two neighboring sides (say north
+/// and west), its own kind on the other two and on the diagonal between
+/// them, gets that corner cut to the other kind (see [`RULES`] and
+/// [`fits`]). Each tile keeps a way through to its own region, so this
+/// never thins a wall or cuts a passage. At most one per tile, the first
+/// rule and corner that fit, decided from `tiles` as they are; the caller
+/// applies them one by one, checking each still [`fits`] when its turn
+/// comes (see [`apply`]), so no two together strand a piece of ground.
+pub fn chamfer_layer(tiles: &[Tile], cols: usize, rows: usize) -> Vec<Chamfer> {
+    let mut found = Vec::new();
     for y in 0..rows as i32 {
         for x in 0..cols as i32 {
-            let here = tile(x, y);
-            if !here.is_floor() {
-                continue;
-            }
-            let solid = |side: Side| {
-                let [dx, dy] = side.offset();
-                tile(x + dx, y + dy).wall().covers(side.opposite())
-            };
-            for corner in Corner::CLOCKWISE {
-                let [a, b] = corner.sides();
-                let [c, d] = corner.opposite().sides();
-                let [ox, oy] = [c, d]
-                    .map(|s| s.offset())
+            let found_here = RULES.iter().find_map(|&rule| {
+                Corner::CLOCKWISE
                     .into_iter()
-                    .fold([0, 0], |acc, o| [acc[0] + o[0], acc[1] + o[1]]);
-                if solid(a) && solid(b) && !solid(c) && !solid(d) && tile(x + ox, y + oy).is_floor()
-                {
-                    // The wall of the neighbor it continues, over this floor.
-                    let [ax, ay] = a.offset();
-                    let wall: WallId = tile(x + ax, y + ay).wall_id().unwrap_or(0);
-                    let floor = here.floor_id().unwrap_or(0);
-                    tiles[y as usize * cols + x as usize] =
-                        Tile::split(corner, Part::Wall(wall), Part::Floor(floor));
-                    break;
-                }
-            }
+                    .find(|&corner| fits(tiles, cols, rows, x, y, corner, rule).is_some())
+                    .map(|corner| Chamfer {
+                        index: y as usize * cols + x as usize,
+                        corner,
+                        rule,
+                    })
+            });
+            found.extend(found_here);
         }
+    }
+    found
+}
+
+/// Make chamfer `c` in `tiles` if it still fits; whether it was made.
+pub fn apply(tiles: &mut [Tile], cols: usize, rows: usize, c: Chamfer) -> bool {
+    let (x, y) = ((c.index % cols) as i32, (c.index / cols) as i32);
+    match fits(tiles, cols, rows, x, y, c.corner, c.rule) {
+        Some(part) => {
+            tiles[c.index] = tiles[c.index].chamfer(c.corner, part);
+            true
+        }
+        None => false,
+    }
+}
+
+/// [`chamfer_layer`], applied.
+pub fn chamfer(tiles: &mut [Tile], cols: usize, rows: usize) {
+    for c in chamfer_layer(tiles, cols, rows) {
+        apply(tiles, cols, rows, c);
     }
 }
 
@@ -1619,8 +1843,9 @@ mod tests {
                                 "seed {seed} ({x}, {y}) layer {k}"
                             ),
                             std::cmp::Ordering::Equal => {
-                                let ok =
-                                    t.floor_id().is_some() || *t == water() || t.stairs().is_some();
+                                let ok = t.floor_id().is_some()
+                                    || t.liquid_quarters() != 0
+                                    || t.stairs().is_some();
                                 assert!(ok, "seed {seed} ({x}, {y}): {t:?} at the surface");
                             }
                             std::cmp::Ordering::Greater => {
@@ -1729,7 +1954,7 @@ mod tests {
             for k in 0..level.depth() {
                 for y in 0..ROWS as i32 {
                     for x in 0..COLS as i32 {
-                        if level.layer(k).tile(x, y) != water() {
+                        if level.layer(k).tile(x, y).liquid_quarters() == 0 {
                             continue;
                         }
                         if k == plains {
@@ -1747,7 +1972,7 @@ mod tests {
                             for dx in -1..=1 {
                                 let under = level.layer(below).tile(x + dx, y + dy);
                                 assert!(
-                                    under.wall() == Solid::Full || under == water(),
+                                    under.wall().quarters() | under.liquid_quarters() == 0b1111,
                                     "seed {seed}: water at ({x}, {y}) on layer {k} over {under:?} at ({}, {})",
                                     x + dx,
                                     y + dy
@@ -1958,26 +2183,154 @@ mod tests {
         assert!(level.depth() <= MAX_LAYERS);
     }
 
-    #[test]
-    fn smoothing_fills_stair_steps_only() {
-        let rows = ["#####", "#....", "#....", "#...."];
-        let mut tiles: Vec<Tile> = rows
-            .iter()
+    /// Tiles from rows of `#` wall, `.` floor, `~` void, `≈` water.
+    fn tiles(rows: &[&str]) -> Vec<Tile> {
+        rows.iter()
             .flat_map(|r| r.chars())
-            .map(|c| if c == '#' { Tile::WALL } else { Tile::FLOOR })
-            .collect();
-        smooth(&mut tiles, 5, 4);
-        assert_eq!(tiles[5 + 1], Tile::slope(Corner::NW));
-        assert_eq!(tiles[2 * 5 + 2], Tile::FLOOR);
+            .map(|c| match c {
+                '#' => Tile::WALL,
+                '~' => Tile::VOID,
+                '≈' => water(),
+                _ => Tile::FLOOR,
+            })
+            .collect()
+    }
 
-        let bend = ["#####", "#..##", "##.##", "#####"];
-        let mut tiles: Vec<Tile> = bend
-            .iter()
-            .flat_map(|r| r.chars())
-            .map(|c| if c == '#' { Tile::WALL } else { Tile::FLOOR })
-            .collect();
-        let before = tiles.clone();
-        smooth(&mut tiles, 5, 4);
-        assert_eq!(tiles, before);
+    #[test]
+    fn chamfer_fills_stair_steps_only() {
+        use Corner::*;
+        let (floor, void, liquid) = (Part::Floor(0), Part::Void, water().liquid_id().unwrap());
+        let mut t = tiles(&["#####", "#....", "#....", "#...."]);
+        chamfer(&mut t, 5, 4);
+        assert_eq!(t[5 + 1], Tile::slope(NW), "wall into floor");
+        assert_eq!(t[2 * 5 + 2], Tile::FLOOR);
+
+        let bend = tiles(&["#####", "#..##", "##.##", "#####"]);
+        let mut t = bend.clone();
+        chamfer(&mut t, 5, 4);
+        assert_eq!(t, bend, "a bend in a passage is left alone");
+
+        // A hole's rim: the void at its convex corners gets floor (a 2x2
+        // hole becomes a diamond), the floor at a concave corner opens.
+        let mut t = tiles(&[".....", ".~~..", ".~~..", "....."]);
+        chamfer(&mut t, 5, 4);
+        assert_eq!(t[5 + 1], Tile::split(NW, floor, void), "convex corner");
+        assert_eq!(t[2 * 5 + 2], Tile::split(SE, floor, void));
+        assert_eq!(t[5 + 2], Tile::split(NE, floor, void));
+        assert_eq!(t[5 + 3], Tile::FLOOR, "a straight edge stays");
+        let mut t = tiles(&["~~~..", "~~~..", "~~...", "~~..."]);
+        chamfer(&mut t, 5, 4);
+        assert_eq!(
+            t[5 + 2],
+            Tile::split(SE, floor, void),
+            "void's convex corner"
+        );
+        // The floor's concave corner just below would zigzag against it:
+        // the first chamfer made wins, the other no longer fits.
+        assert_eq!(t[2 * 5 + 2], Tile::FLOOR, "vetoed by its neighbor");
+        assert_eq!(t[2 * 5 + 3], Tile::FLOOR, "a straight edge stays");
+        let mut split = t.clone();
+        chamfer(&mut split, 5, 4);
+        assert_eq!(split, t, "nothing cascades: split tiles are left alone");
+        // On its own, the concave corner opens.
+        let mut t = tiles(&["~~~~~", "~~~~~", "~~...", "~~..."]);
+        chamfer(&mut t, 5, 4);
+        assert_eq!(
+            t[2 * 5 + 2],
+            Tile::split(NW, void, floor),
+            "floor's concave corner"
+        );
+        assert_eq!(t[5 + 2], Tile::VOID, "a straight void edge stays");
+
+        // A shore, both ways; and rock into a pool.
+        let mut t = tiles(&["..≈≈≈", "..≈≈≈", "....≈", "....."]);
+        chamfer(&mut t, 5, 4);
+        assert_eq!(t[5 + 1], Tile::FLOOR, "straight shore");
+        assert_eq!(
+            t[2 * 5 + 3],
+            Tile::split(NE, Part::Liquid(liquid), floor),
+            "water into the floor's corner"
+        );
+        assert_eq!(
+            t[5 + 2],
+            Tile::split(SW, floor, Part::Liquid(liquid)),
+            "floor into the water's corner"
+        );
+        let mut t = tiles(&["#####", "#≈≈≈≈", "#≈≈≈≈", "#≈≈≈≈"]);
+        chamfer(&mut t, 5, 4);
+        assert_eq!(
+            t[5 + 1],
+            Tile::split(NW, Part::Wall(0), Part::Liquid(liquid))
+        );
+    }
+
+    /// Generated levels have 45-degree hole rims and shores, each obeying
+    /// the rules: the right kinds either side, nothing under water but
+    /// solid ground, floor under every piece of hole on the plains, and
+    /// never on stairs, bridges, fords or at the spawn.
+    #[test]
+    fn shores_and_hole_rims_are_chamfered() {
+        let p = Params::default();
+        let plains = p.underworld_layers + 1;
+        let t = tileset();
+        let (bridge, ford) = (t.floor(BRIDGE), t.floor(BED));
+        let mut counts = std::collections::HashMap::new();
+        for seed in 0..20 {
+            let level = world(seed);
+            for k in 0..level.depth() {
+                for y in 0..ROWS as i32 {
+                    for x in 0..COLS as i32 {
+                        let Tile::Split { corner, at, rest } = level.layer(k).tile(x, y) else {
+                            continue;
+                        };
+                        let (from, into) = (Kind::of(at), Kind::of(rest));
+                        *counts.entry((into, from)).or_insert(0) += 1;
+                        assert!(
+                            RULES.contains(&Rule { into, from }),
+                            "seed {seed} ({x}, {y}) layer {k}: {at:?} over {rest:?}"
+                        );
+                        let s = spawn_tile();
+                        assert!((x - s[0]).abs().max((y - s[1]).abs()) > SPAWN_CLEARANCE);
+                        // Holes and water keep off bridges and fords (a
+                        // wall's corner in a plank room is fine).
+                        if let (Part::Floor(f), Kind::Void | Kind::Liquid) = (rest, from) {
+                            assert!(
+                                Some(f) != bridge && Some(f) != ford,
+                                "seed {seed}: on a crossing"
+                            );
+                        }
+                        // The neighbors across the corner's sides are what
+                        // the corner became (unless chamfered too, later).
+                        for side in corner.sides() {
+                            let [dx, dy] = side.offset();
+                            let n = level.layer(k).tile(x + dx, y + dy);
+                            assert!(
+                                Kind::of(part_at_side(n, side.opposite())) == from
+                                    || matches!(n, Tile::Split { .. }),
+                                "seed {seed} ({x}, {y}) layer {k}: {n:?} across {side:?}"
+                            );
+                        }
+                        if from == Kind::Void && k == plains {
+                            let under = level.layer(k - 1).tile(x, y);
+                            assert!(
+                                under.floor_id().is_some(),
+                                "seed {seed} ({x}, {y}): {under:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for (into, from) in [
+            (Kind::Floor, Kind::Void),
+            (Kind::Void, Kind::Floor),
+            (Kind::Floor, Kind::Liquid),
+            (Kind::Liquid, Kind::Floor),
+        ] {
+            assert!(
+                counts.get(&(into, from)).is_some_and(|n| *n > 20),
+                "{from:?} into {into:?}: {counts:?}"
+            );
+        }
     }
 }

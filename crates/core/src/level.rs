@@ -276,6 +276,101 @@ mod tests {
         assert_eq!(l.view(1, 1).solid(3, 0), Solid::Full);
     }
 
+    /// Any two kinds of part may share a tile along a diagonal, in any
+    /// corner; movement, sight, the liquid tint, drawing and level files
+    /// all follow the quarters.
+    #[test]
+    fn every_pairing_of_parts_splits_consistently() {
+        use crate::draw::Canvas;
+        use crate::layer::{Part, Tile};
+        let tileset = crate::tileset::testing::tileset();
+        let kinds = [Part::Floor(1), Part::Wall(1), Part::Liquid(0), Part::Void];
+        let open = |p: Part| !matches!(p, Part::Floor(_));
+        let liquid = |p: Part| matches!(p, Part::Liquid(_));
+        for at in kinds {
+            for rest in kinds.into_iter().filter(|r| *r != at) {
+                for corner in Corner::CLOCKWISE {
+                    let tile = Tile::split(corner, at, rest);
+                    let (atq, restq) = (corner.quarters(), !corner.quarters() & 0b1111);
+                    let mut middle = vec![Tile::FLOOR; 9];
+                    middle[4] = tile;
+                    let level = Level::new(
+                        vec![
+                            Layer::from_ascii(&["...", "...", "..."]),
+                            Layer::from_tiles(3, 3, middle),
+                        ],
+                        tileset.clone(),
+                    );
+                    let why = format!("{at:?} at {corner:?} over {rest:?}");
+                    // Blocked where not floor.
+                    let blocked =
+                        (if open(at) { atq } else { 0 }) | (if open(rest) { restq } else { 0 });
+                    assert_eq!(
+                        level.movement(1).solid(1, 1),
+                        Solid::from_quarters(blocked, true),
+                        "{why}: movement"
+                    );
+                    // Sight from the layer itself: its walls.
+                    assert_eq!(level.view(1, 1).solid(1, 1), tile.wall(), "{why}: view");
+                    // Open to the layer below where void or liquid.
+                    let void = (if matches!(at, Part::Void | Part::Liquid(_)) {
+                        atq
+                    } else {
+                        0
+                    }) | (if matches!(rest, Part::Void | Part::Liquid(_)) {
+                        restq
+                    } else {
+                        0
+                    });
+                    assert_eq!(tile.void_quarters(), void, "{why}");
+                    assert_eq!(level.shaft(1, 0)[4], void != 0, "{why}: shaft");
+                    assert_eq!(
+                        level.visible_layers(1),
+                        if void != 0 { vec![1, 0] } else { vec![1] },
+                        "{why}"
+                    );
+                    let tint =
+                        (if liquid(at) { atq } else { 0 }) | (if liquid(rest) { restq } else { 0 });
+                    assert_eq!(tile.liquid_quarters(), tint, "{why}");
+                    // Points in either half, by quarter.
+                    let layer = level.layer(1);
+                    let [ox, oy] = corner.offset();
+                    let near = [10.0 + ox as f32 * 8.0 + 1.0, 10.0 + oy as f32 * 8.0 + 1.0];
+                    let far = [
+                        10.0 + (1 - ox) as f32 * 8.0 + 1.0,
+                        10.0 + (1 - oy) as f32 * 8.0 + 1.0,
+                    ];
+                    assert_eq!(
+                        layer.is_void_at(near),
+                        matches!(at, Part::Void | Part::Liquid(_)),
+                        "{why}"
+                    );
+                    assert_eq!(
+                        layer.is_void_at(far),
+                        matches!(rest, Part::Void | Part::Liquid(_)),
+                        "{why}"
+                    );
+                    // Drawn: a triangle per half that isn't void, liquid
+                    // translucent.
+                    let alone = Layer::from_tiles(1, 1, vec![tile]);
+                    let mut canvas = Canvas::new(&tileset);
+                    alone.draw(&tileset, &mut canvas, |_| false, 1.0);
+                    let halves = [at, rest].iter().filter(|p| **p != Part::Void).count();
+                    assert_eq!(canvas.vertices.len(), 3 * halves, "{why}: drawn");
+                    let translucent = canvas.vertices.iter().filter(|v| v.color[3] < 1.0).count();
+                    assert_eq!(
+                        translucent,
+                        3 * [at, rest].iter().filter(|p| liquid(**p)).count(),
+                        "{why}"
+                    );
+                    // And written down.
+                    let text = tile.to_text(&tileset);
+                    assert_eq!(Tile::from_text(&text, &tileset), Ok(tile), "{why}: {text}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn layers_below_are_drawn_only_with_void_all_the_way_up() {
         let l = level(&[&["...."], &["~~.~"], &["~.~~"]]);

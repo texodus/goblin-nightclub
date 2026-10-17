@@ -177,8 +177,8 @@ const W: u8 = 8;
 const QUARTERS: [u8; 4] = [N, E, S, W];
 
 impl Corner {
-    /// The quarters making up the half of a tile at this corner.
-    fn quarters(self) -> u8 {
+    /// The quarters making up the half of a tile at this corner, as bits.
+    pub fn quarters(self) -> u8 {
         match self {
             Corner::NW => N | W,
             Corner::NE => N | E,
@@ -414,6 +414,16 @@ impl Tile {
         matches!(self, Tile::Whole(Part::Floor(_)))
     }
 
+    /// A whole tile with `corner`'s half made `part` (any kind): a 45-degree
+    /// edge between the two. Stairs and tiles already split are left as
+    /// they are.
+    pub fn chamfer(self, corner: Corner, part: Part) -> Tile {
+        match self {
+            Tile::Whole(own) => Tile::split(corner, part, own),
+            _ => self,
+        }
+    }
+
     pub fn stairs(self) -> Option<Dir> {
         match self {
             Tile::Stairs(d, _) => Some(d),
@@ -632,13 +642,14 @@ impl Layer {
     /// Build a layer from rows of `.` (floor), `#` (wall), `◸ ◹ ◺ ◿`
     /// (wall in that corner, floor in the rest), `◤ ◥ ◣ ◢` (wall in that
     /// corner over void), `▛ ▜ ▙ ▟` (floor in that corner, void in the
-    /// rest), `~` (void), `≈` (liquid) and `<` `>` (stairs up and down),
-    /// for tests. Materials are the first of each kind in the tileset.
+    /// rest), `~` (void), `≈` (liquid), `◜ ◝ ◟ ◞` (liquid in that corner
+    /// over floor) and `<` `>` (stairs up and down), for tests. Materials
+    /// are the first of each kind in the tileset.
     #[cfg(any(test, feature = "test-util"))]
     pub fn from_ascii(rows: &[&str]) -> Self {
         use Corner::*;
         let cols = rows[0].chars().count();
-        let (wall, floor) = (Part::Wall(0), Part::Floor(0));
+        let (wall, floor, liquid) = (Part::Wall(0), Part::Floor(0), Part::Liquid(0));
         let tiles = rows
             .iter()
             .flat_map(|r| r.chars())
@@ -661,6 +672,10 @@ impl Layer {
                 '▜' => Tile::split(NE, floor, Part::Void),
                 '▙' => Tile::split(SW, floor, Part::Void),
                 '▟' => Tile::split(SE, floor, Part::Void),
+                '◜' => Tile::split(NW, liquid, floor),
+                '◝' => Tile::split(NE, liquid, floor),
+                '◟' => Tile::split(SW, liquid, floor),
+                '◞' => Tile::split(SE, liquid, floor),
                 _ => panic!("unknown tile {c:?}"),
             })
             .collect();
