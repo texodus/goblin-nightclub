@@ -19,9 +19,11 @@ pub mod path;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
 pub mod rng;
+pub mod tileset;
 pub mod vision;
 
-/// Logical (internal) resolution. The canvas is upscaled with CSS
-/// `image-rendering: pixelated`, so every game pixel stays crisp.
+/// The screen the interface is laid out for, and the view shows about as
+/// much of the level as: the real screen (the canvas at its own
+/// resolution) is a whole number of times this, more or less.
 pub const WIDTH: u32 = 320;
 pub const HEIGHT: u32 = 200;

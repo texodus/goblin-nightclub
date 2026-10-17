@@ -10,8 +10,10 @@
 //! Then it composites to the screen, from the viewer's layer down through
 //! void, styling each pixel by its layer's masks, and draws the overlay
 //! (world space, on the viewer's layer) and the interface (view space) on
-//! top. `seen` is kept in world space so it survives camera moves and the
-//! viewer changing layers; it's sized to the level on the first frame.
+//! top. `seen` is kept in world space so it survives camera moves, zooming
+//! and the viewer changing layers; it's sized to the level on the first
+//! frame. Everything else is sized to the screen, at its own resolution,
+//! and made again when that changes.
 
 use wasm_bindgen::JsError;
 use web_sys::HtmlCanvasElement;
@@ -19,6 +21,7 @@ use web_sys::HtmlCanvasElement;
 use crate::draw::Vertex;
 use crate::frame::Frame;
 use crate::level::MAX_LAYERS;
+use crate::tileset::CELL;
 
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
@@ -27,7 +30,7 @@ const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const MASK_SAMPLES: u32 = 4;
 
 /// Scale of each layer relative to the one above it.
-const PARALLAX: f32 = 0.97;
+const PARALLAX: f32 = 0.95;
 
 /// Mirrors `Globals` in shapes.wgsl: how world positions land on a target.
 #[repr(C)]
@@ -37,7 +40,9 @@ struct Transform {
     camera: [f32; 2],
     center: [f32; 2],
     scale: f32,
-    _pad: f32,
+    zoom: f32,
+    cell: f32,
+    _pad: [f32; 3],
 }
 
 /// Mirrors `Params` in composite.wgsl.
@@ -55,7 +60,9 @@ struct CompositeParams {
     radius_step: f32,
     camera: [f32; 2],
     radius_min: f32,
-    _pad: f32,
+    zoom: f32,
+    seen_zoom: f32,
+    _pad: [f32; 3],
 }
 
 /// A vertex buffer that grows (to the next power of two) as needed.
@@ -211,6 +218,43 @@ impl Msaa {
     }
 }
 
+/// The tile sheet as a texture, for `textureLoad` in shapes.wgsl. Not
+/// sRGB, so its colors reach the screen as is, like vertex colors.
+fn upload_sheet(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
+    let sheet = crate::tileset::sheet();
+    let size = wgpu::Extent3d {
+        width: sheet.size[0],
+        height: sheet.size[1],
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tile sheet"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        sheet.rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * sheet.size[0]),
+            rows_per_image: Some(sheet.size[1]),
+        },
+        size,
+    );
+    texture.create_view(&Default::default())
+}
+
 /// A plain single-sample attachment, cleared first.
 fn cleared(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
     wgpu::RenderPassColorAttachment {
@@ -231,7 +275,12 @@ struct Uniform {
 }
 
 impl Uniform {
-    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sheet: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> Self {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("transform"),
             size: size_of::<Transform>() as u64,
@@ -241,23 +290,46 @@ impl Uniform {
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("transform"),
             layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(sheet),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
         });
         Self { buffer, bind_group }
     }
 }
 
-/// What's sized to the level rather than the view.
+/// What's sized to the level rather than the screen, a layer each.
 struct World {
-    size: [f32; 2],
+    /// In pixels.
+    size: [u32; 2],
+    depth: usize,
     seen: ArrayTexture,
     shafts: ArrayTexture,
     /// Per layer, reading its shaft mask in `fs_mask_shaft`.
     shaft_bind_groups: Vec<wgpu::BindGroup>,
-    composite_bind_group: wgpu::BindGroup,
+}
+
+/// What's sized to the screen, a layer each.
+struct Screen {
+    size: [u32; 2],
+    depth: usize,
+    /// Per layer `a`: visible, remembered, unknown at `3a`, `3a + 1`,
+    /// `3a + 2`.
+    canvases: ArrayTexture,
+    now: ArrayTexture,
+    voids: ArrayTexture,
+    now_msaa: Vec<Msaa>,
 }
 
 pub struct Renderer {
@@ -279,13 +351,11 @@ pub struct Renderer {
     layer_transforms: Vec<Uniform>,
     world_transform: Uniform,
     ui_transform: Uniform,
-    /// Per layer `a`, in view space: visible, remembered, unknown at `3a`,
-    /// `3a + 1`, `3a + 2`.
-    canvases: ArrayTexture,
-    now: ArrayTexture,
-    voids: ArrayTexture,
-    now_msaa: Vec<Msaa>,
+    config: wgpu::SurfaceConfiguration,
+    screen: Option<Screen>,
     world: Option<World>,
+    /// Reads `screen` and `world`; made again with either.
+    composite_bind_group: Option<wgpu::BindGroup>,
     canvas_vertices: GrowBuffer,
     mask_vertices: GrowBuffer,
 }
@@ -324,13 +394,14 @@ fn texture_entry(
     }
 }
 
-/// Two triangles per rect `(pos, size)`.
-fn rect_triangles(rects: &[([f32; 2], [f32; 2])]) -> impl Iterator<Item = Vertex> + '_ {
-    rects.iter().flat_map(|&([x, y], [w, h])| {
-        let (x1, y1) = (x + w, y + h);
-        [[x, y], [x1, y], [x, y1], [x, y1], [x1, y], [x1, y1]].map(|pos| Vertex {
-            pos,
-            ..Default::default()
+/// Each convex polygon as a triangle fan.
+fn poly_triangles(polys: &[Vec<[f32; 2]>]) -> impl Iterator<Item = Vertex> + '_ {
+    polys.iter().flat_map(|p| {
+        (1..p.len().saturating_sub(1)).flat_map(move |i| {
+            [p[0], p[i], p[i + 1]].map(|pos| Vertex {
+                pos,
+                ..Default::default()
+            })
         })
     })
 }
@@ -362,11 +433,29 @@ impl Renderer {
         config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
         surface.configure(&device, &config);
         let format = config.format;
-        let size = [width, height];
 
+        // The sheet is sampled filtered (see `sharp` in shapes.wgsl).
         let transform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("transform"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX)],
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let shaft_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shaft"),
@@ -385,13 +474,18 @@ impl Renderer {
                 ..Default::default()
             });
 
-        // Canvases and masks all draw colored triangles from the same
-        // vertices; masks just ignore the color.
+        // Canvases and masks all draw triangles from the same vertices;
+        // masks ignore the color, and mostly the sheet.
         let shapes = device.create_shader_module(wgpu::include_wgsl!("shaders/shapes.wgsl"));
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![
+                0 => Float32x2,
+                1 => Float32x2,
+                2 => Float32x2,
+                3 => Float32x4,
+            ],
         };
         let triangles =
             |label, layout: &wgpu::PipelineLayout, fs, target: wgpu::ColorTargetState, samples| {
@@ -444,14 +538,6 @@ impl Renderer {
         let fill_pipeline = triangles("fill", plain, "fs_mask", MASK_FORMAT.into(), 1);
         let unmask_pipeline = triangles("unmask", plain, "fs_unmask", MASK_FORMAT.into(), 1);
 
-        let layers = MAX_LAYERS as u32;
-        let canvases = ArrayTexture::new(&device, "canvases", size, 3 * layers, format);
-        let now = ArrayTexture::new(&device, "mask now", size, layers, MASK_FORMAT);
-        let voids = ArrayTexture::new(&device, "voids", size, layers, MASK_FORMAT);
-        let now_msaa = (0..MAX_LAYERS)
-            .map(|_| Msaa::new(&device, "now msaa", size))
-            .collect();
-
         let composite_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("composite params"),
             size: size_of::<CompositeParams>() as u64,
@@ -499,11 +585,17 @@ impl Renderer {
             cache: None,
         });
 
-        let layer_transforms = (0..MAX_LAYERS)
-            .map(|_| Uniform::new(&device, &transform_layout))
-            .collect();
-        let world_transform = Uniform::new(&device, &transform_layout);
-        let ui_transform = Uniform::new(&device, &transform_layout);
+        let sheet = upload_sheet(&device, &queue);
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sheet"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let uniform = || Uniform::new(&device, &transform_layout, &sheet, &sampler);
+        let layer_transforms = (0..MAX_LAYERS).map(|_| uniform()).collect();
+        let world_transform = uniform();
+        let ui_transform = uniform();
         let canvas_vertices =
             GrowBuffer::new(&device, "canvas vertices", wgpu::BufferUsages::VERTEX);
         let mask_vertices = GrowBuffer::new(&device, "mask vertices", wgpu::BufferUsages::VERTEX);
@@ -524,23 +616,63 @@ impl Renderer {
             layer_transforms,
             world_transform,
             ui_transform,
-            canvases,
-            now,
-            voids,
-            now_msaa,
+            config,
+            screen: None,
             world: None,
+            composite_bind_group: None,
             canvas_vertices,
             mask_vertices,
         })
     }
 
-    /// (Re)create what's sized to the level, if its size changed.
-    fn ensure_world(&mut self, size: [f32; 2]) {
-        if self.world.as_ref().is_some_and(|w| w.size == size) {
+    /// The canvas is now `width` x `height` pixels.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if [width, height] == [self.config.width, self.config.height] || width * height == 0 {
             return;
         }
-        let px = [size[0].ceil() as u32, size[1].ceil() as u32];
-        let layers = MAX_LAYERS as u32;
+        self.config.width = width;
+        self.config.height = height;
+        self.surface.configure(&self.device, &self.config);
+    }
+
+    /// (Re)create what's sized to the screen, for `depth` layers, if that
+    /// changed.
+    fn ensure_screen(&mut self, depth: usize) {
+        let size = [self.config.width, self.config.height];
+        if self
+            .screen
+            .as_ref()
+            .is_some_and(|s| s.size == size && s.depth == depth)
+        {
+            return;
+        }
+        let device = &self.device;
+        let layers = depth as u32;
+        let format = self.config.format;
+        self.screen = Some(Screen {
+            size,
+            depth,
+            canvases: ArrayTexture::new(device, "canvases", size, 3 * layers, format),
+            now: ArrayTexture::new(device, "mask now", size, layers, MASK_FORMAT),
+            voids: ArrayTexture::new(device, "voids", size, layers, MASK_FORMAT),
+            now_msaa: (0..depth)
+                .map(|_| Msaa::new(device, "now msaa", size))
+                .collect(),
+        });
+        self.composite_bind_group = None;
+    }
+
+    /// (Re)create what's sized to the level, `px` pixels and `depth`
+    /// layers, if that changed.
+    fn ensure_world(&mut self, px: [u32; 2], depth: usize) {
+        if self
+            .world
+            .as_ref()
+            .is_some_and(|w| w.size == px && w.depth == depth)
+        {
+            return;
+        }
+        let layers = depth as u32;
         let seen = ArrayTexture::new(&self.device, "mask seen", px, layers, MASK_FORMAT);
         let shafts = ArrayTexture::new(&self.device, "shafts", px, layers, MASK_FORMAT);
         let shaft_bind_groups = shafts
@@ -557,35 +689,53 @@ impl Renderer {
                 })
             })
             .collect();
+        self.world = Some(World {
+            size: px,
+            depth,
+            seen,
+            shafts,
+            shaft_bind_groups,
+        });
+        self.composite_bind_group = None;
+    }
+
+    fn ensure_composite(&mut self) {
+        if self.composite_bind_group.is_some() {
+            return;
+        }
+        let (screen, world) = (self.screen.as_ref().unwrap(), self.world.as_ref().unwrap());
         let texture = |binding, view| wgpu::BindGroupEntry {
             binding,
             resource: wgpu::BindingResource::TextureView(view),
         };
-        let composite_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("composite"),
-            layout: &self.composite_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.composite_params.as_entire_binding(),
-                },
-                texture(1, &self.canvases.whole),
-                texture(2, &self.now.whole),
-                texture(3, &seen.whole),
-                texture(4, &self.voids.whole),
-            ],
-        });
-        self.world = Some(World {
-            size,
-            seen,
-            shafts,
-            shaft_bind_groups,
-            composite_bind_group,
-        });
+        self.composite_bind_group =
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("composite"),
+                layout: &self.composite_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.composite_params.as_entire_binding(),
+                    },
+                    texture(1, &screen.canvases.whole),
+                    texture(2, &screen.now.whole),
+                    texture(3, &world.seen.whole),
+                    texture(4, &screen.voids.whole),
+                ],
+            }));
     }
 
     pub fn draw(&mut self, frame: &Frame) {
-        self.ensure_world(frame.world);
+        // The camera on a whole pixel, so the tile art stays crisp. What's
+        // sized to the level is at the art's own size, whatever the view's
+        // zoom, so zooming keeps what's been seen.
+        let zoom = frame.zoom;
+        let seen_zoom = crate::tileset::ZOOM;
+        let world_px = frame.world.map(|w| (w * seen_zoom).ceil());
+        self.ensure_world(world_px.map(|w| w as u32), frame.depth);
+        self.ensure_screen(frame.depth);
+        self.ensure_composite();
+        let camera = frame.camera.map(|c| (c * zoom).round() / zoom);
 
         // All vertices go in two buffers; each pass draws its range.
         let mut canvas_vertices = Vec::new();
@@ -623,12 +773,12 @@ impl Renderer {
                         ..Default::default()
                     });
                 let visible = push(&mut mask_vertices, &mut fan.into_iter());
-                let voids = push(&mut mask_vertices, &mut rect_triangles(&l.voids));
-                let standing = push(&mut mask_vertices, &mut rect_triangles(&l.standing));
+                let voids = push(&mut mask_vertices, &mut poly_triangles(&l.voids));
+                let standing = push(&mut mask_vertices, &mut l.standing.vertices.iter().copied());
                 let shaft = l
                     .shaft
                     .as_ref()
-                    .map(|rects| push(&mut mask_vertices, &mut rect_triangles(rects)));
+                    .map(|polys| push(&mut mask_vertices, &mut poly_triangles(polys)));
                 Ranges {
                     canvases,
                     visible,
@@ -660,30 +810,34 @@ impl Renderer {
         for l in &frame.layers {
             let t = Transform {
                 screen: frame.view,
-                camera: frame.camera,
+                camera,
                 center,
                 scale: PARALLAX.powi((frame.top - l.index) as i32),
-                _pad: 0.0,
+                zoom,
+                cell: CELL as f32,
+                _pad: [0.0; 3],
             };
             let buffer = &self.layer_transforms[l.index].buffer;
             self.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&t));
         }
-        let flat = |screen| Transform {
+        let flat = |screen, zoom| Transform {
             screen,
             camera: [0.0; 2],
             center: [0.0; 2],
             scale: 1.0,
-            _pad: 0.0,
+            zoom,
+            cell: CELL as f32,
+            _pad: [0.0; 3],
         };
         self.queue.write_buffer(
             &self.world_transform.buffer,
             0,
-            bytemuck::bytes_of(&flat(frame.world)),
+            bytemuck::bytes_of(&flat(world_px, seen_zoom)),
         );
         self.queue.write_buffer(
             &self.ui_transform.buffer,
             0,
-            bytemuck::bytes_of(&flat(frame.view)),
+            bytemuck::bytes_of(&flat(frame.view, frame.ui_scale)),
         );
 
         let present = frame
@@ -702,9 +856,11 @@ impl Renderer {
             present,
             scale: PARALLAX,
             radius_step: frame.radius_step,
-            camera: frame.camera,
+            camera,
             radius_min: frame.radius_min,
-            _pad: 0.0,
+            zoom,
+            seen_zoom,
+            _pad: [0.0; 3],
         };
         self.queue
             .write_buffer(&self.composite_params, 0, bytemuck::bytes_of(&params));
@@ -716,6 +872,7 @@ impl Renderer {
         };
         let screen = output.texture.create_view(&Default::default());
         let world = self.world.as_ref().unwrap();
+        let screen_textures = self.screen.as_ref().unwrap();
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
         // One pass drawing `range` of a vertex buffer with `pipeline`,
@@ -759,7 +916,7 @@ impl Renderer {
             let (canvas, masks) = (&self.canvas_vertices.buffer, &self.mask_vertices.buffer);
             for (i, range) in r.canvases.iter().enumerate() {
                 let attachment = wgpu::RenderPassColorAttachment {
-                    view: &self.canvases.layers[3 * a + i],
+                    view: &screen_textures.canvases.layers[3 * a + i],
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -777,7 +934,7 @@ impl Renderer {
                     range.clone(),
                 );
             }
-            let voids = &self.voids.layers[a];
+            let voids = &screen_textures.voids.layers[a];
             pass(
                 &mut encoder,
                 cleared(voids),
@@ -797,7 +954,7 @@ impl Renderer {
                 masks,
                 r.standing.clone(),
             );
-            let now = self.now_msaa[a].attachment(&self.now.layers[a], true);
+            let now = screen_textures.now_msaa[a].attachment(&screen_textures.now.layers[a], true);
             pass(
                 &mut encoder,
                 now,
@@ -860,7 +1017,7 @@ impl Renderer {
                 ..Default::default()
             });
             pass.set_pipeline(&self.composite_pipeline);
-            pass.set_bind_group(0, &world.composite_bind_group, &[]);
+            pass.set_bind_group(0, self.composite_bind_group.as_ref().unwrap(), &[]);
             pass.draw(0..3, 0..1);
         }
 

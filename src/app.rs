@@ -25,11 +25,15 @@ impl App {
     /// Initialize WebGPU on `canvas`. Async because adapter/device requests
     /// are promises in the browser. `seed` drives level generation.
     pub async fn create(canvas: HtmlCanvasElement, seed: u32) -> Result<App, JsError> {
-        canvas.set_width(WIDTH);
-        canvas.set_height(HEIGHT);
-        let renderer = Renderer::new(canvas, WIDTH, HEIGHT).await?;
+        // The canvas is sized already (see `resize`), unless it's empty.
+        if canvas.width() * canvas.height() == 0 {
+            canvas.set_width(WIDTH);
+            canvas.set_height(HEIGHT);
+        }
+        let (width, height) = (canvas.width(), canvas.height());
+        let renderer = Renderer::new(canvas, width, height).await?;
         Ok(App {
-            game: Game::new(WIDTH as f32, HEIGHT as f32, seed),
+            game: Game::new(width as f32, height as f32, seed),
             renderer,
             last_time: None,
         })
@@ -56,9 +60,21 @@ impl App {
         }
     }
 
-    /// A click at `(x, y)` in canvas pixels (the logical resolution).
+    /// A click at `(x, y)` in canvas pixels.
     pub fn click(&mut self, x: f32, y: f32) {
         self.game.click([x, y]);
+    }
+
+    /// Zoom in (`steps > 0`) or out by `steps` levels about `(x, y)` in
+    /// canvas pixels (the mouse wheel).
+    pub fn zoom(&mut self, steps: i32, x: f32, y: f32) {
+        self.game.zoom_by(steps, [x, y]);
+    }
+
+    /// The canvas is now `width` x `height` pixels.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.renderer.resize(width, height);
+        self.game.resize([width as f32, height as f32]);
     }
 
     /// The pointer moved to `(x, y)` in canvas pixels.

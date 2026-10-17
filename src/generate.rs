@@ -10,11 +10,14 @@
 //!
 //! Either way the area around the spawn is open, the level edge is solid
 //! or open floor, and any open space not connected to the spawn is filled
-//! in.
+//! in. Each style builds with its own materials, named in the tile sheet
+//! (see [`crate::tileset`]).
 
-use crate::layer::{Corner, Dir, Layer, Side, TILE, Tile};
+use crate::layer::{Corner, Dir, Layer, Part, Side, Solid, TILE, Tile};
+use crate::layer::{FloorId, WallId};
 use crate::level::Level;
 use crate::rng::Rng;
+use crate::tileset;
 
 /// A solid piece to stamp into a level: tiles that together form one
 /// convex shape.
@@ -23,6 +26,14 @@ pub struct Piece {
 }
 
 impl Piece {
+    /// The piece built of wall type `wall`.
+    pub fn of(mut self, wall: WallId) -> Self {
+        for (_, tile) in &mut self.tiles {
+            *tile = tile.with_wall(wall);
+        }
+        self
+    }
+
     /// A `w` x `h` block of full tiles at `(x, y)`, with each corner (in
     /// `Corner::CLOCKWISE` order) optionally cut off by a slope. Corners are
     /// only cut on blocks at least 2x2.
@@ -30,7 +41,7 @@ impl Piece {
         let mut tiles = Vec::new();
         for ty in y..y + h {
             for tx in x..x + w {
-                tiles.push(([tx, ty], Tile::Full));
+                tiles.push(([tx, ty], Tile::WALL));
             }
         }
         if w >= 2 && h >= 2 {
@@ -39,7 +50,7 @@ impl Piece {
                     let [dx, dy] = corner.offset();
                     let at = [x + dx * (w - 1), y + dy * (h - 1)];
                     // Keep the half facing into the block.
-                    let tile = Tile::Slope(corner.opposite());
+                    let tile = Tile::slope(corner.opposite());
                     tiles.iter_mut().find(|(t, _)| *t == at).unwrap().1 = tile;
                 }
             }
@@ -60,10 +71,10 @@ impl Piece {
         };
         let mut tiles = Vec::new();
         for i in 0..len {
-            tiles.push(([x + i, y + dy * i], Tile::Full));
+            tiles.push(([x + i, y + dy * i], Tile::WALL));
             if i + 1 < len {
-                tiles.push(([x + i + 1, y + dy * i], Tile::Slope(beside)));
-                tiles.push(([x + i, y + dy * (i + 1)], Tile::Slope(across)));
+                tiles.push(([x + i + 1, y + dy * i], Tile::slope(beside)));
+                tiles.push(([x + i, y + dy * (i + 1)], Tile::slope(across)));
             }
         }
         Self { tiles }
@@ -73,7 +84,7 @@ impl Piece {
     fn stamp(&self, tiles: &mut [Tile], cols: usize) {
         for ([x, y], tile) in &self.tiles {
             let i = *y as usize * cols + *x as usize;
-            tiles[i] = tiles[i].union(*tile);
+            tiles[i] = tiles[i].stamp(*tile);
         }
     }
 }
@@ -90,12 +101,20 @@ pub enum Style {
 pub const LAYERS: usize = 5;
 const _: () = assert!(LAYERS <= crate::level::MAX_LAYERS);
 
-/// Void openings in each deck of a layered level.
+/// Void openings in the top deck of a layered level, and how many more
+/// (or, if negative, fewer) in each deck below it.
 const HOLE_COUNT: usize = 16;
+const HOLE_GROWTH: i32 = 10;
 const HOLE_MAX_W: usize = 8;
 const HOLE_MAX_H: usize = 6;
-/// Blocks on each deck.
-const DECK_BLOCKS: usize = 8;
+/// Chance of cutting each corner of an opening at 45 degrees, and of the
+/// cut being a wall (rather than floor) over the void.
+const HOLE_CUT_CHANCE: f32 = 0.5;
+const HOLE_CUT_WALL_CHANCE: f32 = 0.5;
+/// Blocks on the top deck, and how many more (or fewer) on each deck below
+/// it.
+const DECK_BLOCKS: usize = 18;
+const BLOCK_GROWTH: i32 = 0;
 /// Staircases between each layer and the one below.
 const STAIRS: usize = 2;
 
@@ -122,6 +141,17 @@ const CAVE_STEPS: usize = 4;
 /// Retry until at least this share of the level is reachable floor.
 const CAVE_MIN_OPEN: f32 = 0.35;
 
+/// Materials, by name in the tile sheet: caves of dirt and rock; worlds of
+/// plain floor with brick blocks and metal bars; every deck of metal, with
+/// the same floor.
+const CAVE_FLOOR: &str = "planks";
+const CAVE_WALL: &str = "rock";
+const WORLD_FLOOR: &str = "plain";
+const WORLD_BLOCKS: &str = "brick";
+const WORLD_BARS: &str = "metal";
+const DECK_FLOOR: &str = "planks";
+const DECK_WALL: &str = "metal";
+
 /// Pieces may not come within this many tiles (Chebyshev) of the spawn.
 const SPAWN_CLEARANCE: i32 = 2;
 
@@ -146,8 +176,8 @@ pub fn generate_level(style: Style, seed: u32, cols: usize, rows: usize, spawn: 
 }
 
 /// A cave at the bottom, and above it [`LAYERS`]` - 1` decks: floor with
-/// void openings (walkable where they open onto a wall below, pits where
-/// onto anything else), some blocks, and stairs down to the layer below.
+/// void openings (impassable, but you can see down through them), some
+/// blocks, and stairs down to the layer below.
 /// The player starts on the top deck.
 fn layered(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Level {
     let mut rng = Rng::new(seed ^ 0x5EED_1A7E);
@@ -157,9 +187,19 @@ fn layered(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Level {
     };
 
     let mut layers = vec![cave(seed, cols, rows, spawn)];
-    for _ in 1..LAYERS {
-        let mut deck = vec![Tile::Empty; cols * rows];
-        for _ in 0..HOLE_COUNT {
+    // Each layer's floor and wall types.
+    let mut floors = vec![tileset::floor(CAVE_FLOOR)];
+    let mut walls = vec![tileset::wall(CAVE_WALL)];
+    for k in 1..LAYERS {
+        let floor = tileset::floor(DECK_FLOOR);
+        let wall = tileset::wall(DECK_WALL);
+        floors.push(floor);
+        walls.push(wall);
+        // Decks below the top have `GROWTH` more of each per deck down.
+        let depth = (LAYERS - 1 - k) as i32;
+        let grown = |base: usize, growth: i32| (base as i32 + growth * depth).max(0) as usize;
+        let mut deck = vec![Tile::Whole(Part::Floor(floor)); cols * rows];
+        for _ in 0..grown(HOLE_COUNT, HOLE_GROWTH) {
             let (w, h) = (
                 rng.range(3, HOLE_MAX_W) as i32,
                 rng.range(2, HOLE_MAX_H) as i32,
@@ -169,13 +209,14 @@ fn layered(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Level {
             for y in y0..y0 + h {
                 for x in x0..x0 + w {
                     if !near_spawn(x, y, 1) {
-                        deck[index(x, y)] = Tile::Void;
+                        deck[index(x, y)] = Tile::VOID;
                     }
                 }
             }
         }
-        for _ in 0..DECK_BLOCKS {
-            let piece = random_block(&mut rng, cols, rows);
+        cut_hole_corners(&mut deck, cols, rows, &mut rng, floor, wall);
+        for _ in 0..grown(DECK_BLOCKS, BLOCK_GROWTH) {
+            let piece = random_block(&mut rng, cols, rows).of(wall);
             if piece.tiles.iter().all(|([x, y], _)| !near_spawn(*x, *y, 0)) {
                 piece.stamp(&mut deck, cols);
             }
@@ -190,7 +231,7 @@ fn layered(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Level {
     // above. If there's no such spot, clear one around reachable floor:
     // every layer needs a way down, or everything below it is cut off.
     let clear = |tiles: &[Tile], x: i32, y: i32| {
-        (-1..=1).all(|dy| (-1..=1).all(|dx| tiles[index(x + dx, y + dy)] == Tile::Empty))
+        (-1..=1).all(|dy| (-1..=1).all(|dx| tiles[index(x + dx, y + dy)].is_floor()))
     };
     let interior: Vec<[i32; 2]> = (2..rows as i32 - 2)
         .flat_map(|y| (2..cols as i32 - 2).map(move |x| [x, y]))
@@ -218,8 +259,8 @@ fn layered(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Level {
             // Plain floor only: not the stairs arriving from above.
             let floor = |t: [i32; 2]| {
                 reachable(t)
-                    && layers[upper][index(t[0], t[1])] == Tile::Empty
-                    && !matches!(layers[upper - 1][index(t[0], t[1])], Tile::Stairs(_))
+                    && layers[upper][index(t[0], t[1])].is_floor()
+                    && layers[upper - 1][index(t[0], t[1])].stairs().is_none()
             };
             let away: Vec<[i32; 2]> = interior
                 .iter()
@@ -240,8 +281,8 @@ fn layered(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Level {
                     for dx in -1..=1 {
                         // Leave stairs placed already.
                         let tile = &mut layers[k][index(at[0] + dx, at[1] + dy)];
-                        if !matches!(tile, Tile::Stairs(_)) {
-                            *tile = Tile::Empty;
+                        if tile.stairs().is_none() {
+                            *tile = Tile::Whole(Part::Floor(floors[k]));
                         }
                     }
                 }
@@ -253,36 +294,28 @@ fn layered(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Level {
                 break;
             }
             let [x, y] = candidates.swap_remove(rng.range(0, candidates.len() - 1));
-            layers[upper][index(x, y)] = Tile::Stairs(Dir::Down);
-            layers[upper - 1][index(x, y)] = Tile::Stairs(Dir::Up);
+            layers[upper][index(x, y)] = Tile::Stairs(Dir::Down, floors[upper]);
+            layers[upper - 1][index(x, y)] = Tile::Stairs(Dir::Up, floors[upper - 1]);
             // Keep staircases apart.
             candidates.retain(|c| (c[0] - x).abs().max((c[1] - y).abs()) > 4);
         }
     }
 
-    // Fill in whatever the player can't reach. Filling a layer's floor can
-    // turn void above it into a new wall top, so repeat until settled.
-    for _ in 0..16 {
-        let level = Level::new(
-            layers
-                .iter()
-                .map(|t| Layer::from_tiles(cols, rows, t.clone()))
-                .collect(),
-        );
-        let reached = reachable_across(&level, layers.len() - 1, spawn);
-        let mut changed = false;
-        for (k, tiles) in layers.iter_mut().enumerate() {
-            let movement = level.movement(k);
-            for (i, tile) in tiles.iter_mut().enumerate() {
-                let open = movement.tile((i % cols) as i32, (i / cols) as i32) != Tile::Full;
-                if open && !reached[k][i] {
-                    *tile = Tile::Full;
-                    changed = true;
-                }
+    // Fill in whatever floor the player can't reach.
+    let level = Level::new(
+        layers
+            .iter()
+            .map(|t| Layer::from_tiles(cols, rows, t.clone()))
+            .collect(),
+    );
+    let reached = reachable_across(&level, layers.len() - 1, spawn);
+    for (k, tiles) in layers.iter_mut().enumerate() {
+        let movement = level.movement(k);
+        for (i, tile) in tiles.iter_mut().enumerate() {
+            let open = movement.solid((i % cols) as i32, (i / cols) as i32) != Solid::Full;
+            if open && !reached[k][i] {
+                *tile = Tile::Whole(Part::Wall(walls[k]));
             }
-        }
-        if !changed {
-            break;
         }
     }
     Level::new(
@@ -293,15 +326,68 @@ fn layered(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Level {
     )
 }
 
+/// Cut the corners of void openings at 45 degrees: a void tile with
+/// floor on two neighboring sides and void on the other two (and across
+/// from the corner between the floor sides) becomes, by chance, floor or
+/// wall in that corner's half and void in the rest.
+fn cut_hole_corners(
+    deck: &mut [Tile],
+    cols: usize,
+    rows: usize,
+    rng: &mut Rng,
+    floor_type: FloorId,
+    wall_type: WallId,
+) {
+    let snapshot = deck.to_vec();
+    let tile = |x: i32, y: i32| {
+        if x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 {
+            Tile::WALL
+        } else {
+            snapshot[y as usize * cols + x as usize]
+        }
+    };
+    let step = |[x, y]: [i32; 2], sides: &[Side]| {
+        sides
+            .iter()
+            .fold([x, y], |[x, y], s| [x + s.offset()[0], y + s.offset()[1]])
+    };
+    for y in 0..rows as i32 {
+        for x in 0..cols as i32 {
+            if tile(x, y) != Tile::VOID {
+                continue;
+            }
+            for corner in Corner::CLOCKWISE {
+                let floor = corner.sides().map(|s| step([x, y], &[s]));
+                let open = corner.opposite().sides().map(|s| step([x, y], &[s]));
+                let across = step([x, y], &corner.opposite().sides());
+                let is = |t: [i32; 2], want: Tile| tile(t[0], t[1]) == want;
+                if floor.iter().all(|t| tile(t[0], t[1]).is_floor())
+                    && open.iter().all(|t| is(*t, Tile::VOID))
+                    && is(across, Tile::VOID)
+                    && rng.unit() < HOLE_CUT_CHANCE
+                {
+                    let part = if rng.unit() < HOLE_CUT_WALL_CHANCE {
+                        Part::Wall(wall_type)
+                    } else {
+                        Part::Floor(floor_type)
+                    };
+                    deck[y as usize * cols + x as usize] = Tile::split(corner, part, Part::Void);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Which tiles of each layer the player can walk to from `start` on layer
 /// `top`, across each layer's movement grid and up and down stairs.
 pub fn reachable_across(level: &Level, top: usize, start: [i32; 2]) -> Vec<Vec<bool>> {
     let (cols, rows) = (level.cols(), level.rows());
-    let grids: Vec<Vec<Tile>> = (0..level.depth())
+    let grids: Vec<Vec<Solid>> = (0..level.depth())
         .map(|k| {
             let m = level.movement(k);
             (0..cols * rows)
-                .map(|i| m.tile((i % cols) as i32, (i / cols) as i32))
+                .map(|i| m.solid((i % cols) as i32, (i / cols) as i32))
                 .collect()
         })
         .collect();
@@ -320,9 +406,9 @@ pub fn reachable_across(level: &Level, top: usize, start: [i32; 2]) -> Vec<Vec<b
                     reached[k][i] = true;
                     grew = true;
                     let at = [(i % cols) as i32, (i / cols) as i32];
-                    match level.layer(k).tile(at[0], at[1]) {
-                        Tile::Stairs(Dir::Down) if k > 0 => seeds[k - 1].push(at),
-                        Tile::Stairs(Dir::Up) if k + 1 < level.depth() => seeds[k + 1].push(at),
+                    match level.layer(k).tile(at[0], at[1]).stairs() {
+                        Some(Dir::Down) if k > 0 => seeds[k - 1].push(at),
+                        Some(Dir::Up) if k + 1 < level.depth() => seeds[k + 1].push(at),
                         _ => {}
                     }
                 }
@@ -337,19 +423,23 @@ pub fn reachable_across(level: &Level, top: usize, start: [i32; 2]) -> Vec<Vec<b
 fn world(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Vec<Tile> {
     let mut rng = Rng::new(seed);
     let mut occupied = vec![false; cols * rows];
-    let mut tiles = vec![Tile::Empty; cols * rows];
+    let mut tiles = vec![Tile::Whole(Part::Floor(tileset::floor(WORLD_FLOOR))); cols * rows];
 
     // Bars first, since they're the hardest to fit.
-    for (count, make) in [
-        (BAR_COUNT, random_bar as fn(&mut Rng, usize, usize) -> Piece),
-        (BLOCK_COUNT, random_block),
+    for (count, make, wall) in [
+        (
+            BAR_COUNT,
+            random_bar as fn(&mut Rng, usize, usize) -> Piece,
+            WORLD_BARS,
+        ),
+        (BLOCK_COUNT, random_block, WORLD_BLOCKS),
     ] {
         let mut placed = 0;
         for _ in 0..count * 50 {
             if placed == count {
                 break;
             }
-            let piece = make(&mut rng, cols, rows);
+            let piece = make(&mut rng, cols, rows).of(tileset::wall(wall));
             let merge = rng.unit() < MERGE_CHANCE;
             if fits(&piece, &occupied, cols, rows, spawn, merge) {
                 for ([x, y], _) in &piece.tiles {
@@ -361,11 +451,15 @@ fn world(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Vec<Tile> {
         }
     }
     // Merged pieces can enclose pockets.
-    fill_unreachable(&mut tiles, cols, rows, spawn);
+    fill_unreachable(&mut tiles, cols, rows, spawn, tileset::wall(WORLD_BLOCKS));
     tiles
 }
 
 fn cave(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Vec<Tile> {
+    let (wall, floor) = (
+        Part::Wall(tileset::wall(CAVE_WALL)),
+        Part::Floor(tileset::floor(CAVE_FLOOR)),
+    );
     let index = |x: i32, y: i32| y as usize * cols + x as usize;
     let edge = |x: i32, y: i32| x == 0 || y == 0 || x == cols as i32 - 1 || y == rows as i32 - 1;
     // The most open attempt so far, and how many open tiles it has.
@@ -403,10 +497,10 @@ fn cave(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Vec<Tile> {
         }
         let mut tiles: Vec<Tile> = rock
             .iter()
-            .map(|r| if *r { Tile::Full } else { Tile::Empty })
+            .map(|r| Tile::Whole(if *r { wall } else { floor }))
             .collect();
-        fill_unreachable(&mut tiles, cols, rows, spawn);
-        let open = tiles.iter().filter(|t| **t == Tile::Empty).count();
+        fill_unreachable(&mut tiles, cols, rows, spawn, tileset::wall(CAVE_WALL));
+        let open = tiles.iter().filter(|t| t.is_floor()).count();
         if open > best.1 {
             best = (tiles, open);
         }
@@ -420,26 +514,29 @@ fn cave(seed: u32, cols: usize, rows: usize, spawn: [i32; 2]) -> Vec<Tile> {
 }
 
 /// Fill in (make full) every tile with open space that can't be reached
-/// from `start`, moving between tiles across sides neither one covers.
-fn fill_unreachable(tiles: &mut [Tile], cols: usize, rows: usize, start: [i32; 2]) {
-    let reached = reachable(tiles, cols, rows, start);
+/// from `start`, moving between tiles across sides neither one covers:
+/// with its own wall type, if it has one, else `wall`.
+fn fill_unreachable(tiles: &mut [Tile], cols: usize, rows: usize, start: [i32; 2], wall: WallId) {
+    let solids: Vec<Solid> = tiles.iter().map(|t| t.wall()).collect();
+    let reached = reachable(&solids, cols, rows, start);
     for (tile, reached) in tiles.iter_mut().zip(reached) {
-        if !reached && *tile != Tile::Full {
-            *tile = Tile::Full;
+        if !reached && tile.wall() != Solid::Full {
+            *tile = Tile::Whole(Part::Wall(tile.wall_id().unwrap_or(wall)));
         }
     }
 }
 
-/// Which tiles can be reached from `start` across open sides.
-pub fn reachable(tiles: &[Tile], cols: usize, rows: usize, start: [i32; 2]) -> Vec<bool> {
-    reachable_from(tiles, cols, rows, &[start])
+/// Which tiles can be reached from `start` across open sides, given where
+/// each tile is solid.
+pub fn reachable(solids: &[Solid], cols: usize, rows: usize, start: [i32; 2]) -> Vec<bool> {
+    reachable_from(solids, cols, rows, &[start])
 }
 
 /// Which tiles can be reached from any of `starts` across open sides.
-fn reachable_from(tiles: &[Tile], cols: usize, rows: usize, starts: &[[i32; 2]]) -> Vec<bool> {
+fn reachable_from(tiles: &[Solid], cols: usize, rows: usize, starts: &[[i32; 2]]) -> Vec<bool> {
     let tile = |x: i32, y: i32| {
         if x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 {
-            Tile::Full
+            Solid::Full
         } else {
             tiles[y as usize * cols + x as usize]
         }
@@ -447,7 +544,7 @@ fn reachable_from(tiles: &[Tile], cols: usize, rows: usize, starts: &[[i32; 2]])
     let mut seen = vec![false; cols * rows];
     let mut stack = starts.to_vec();
     while let Some([x, y]) = stack.pop() {
-        if tile(x, y) == Tile::Full || seen[y as usize * cols + x as usize] {
+        if tile(x, y) == Solid::Full || seen[y as usize * cols + x as usize] {
             continue;
         }
         seen[y as usize * cols + x as usize] = true;
@@ -471,19 +568,20 @@ fn smooth(tiles: &mut [Tile], cols: usize, rows: usize) {
     let snapshot = tiles.to_vec();
     let tile = |x: i32, y: i32| {
         if x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 {
-            Tile::Full
+            Tile::WALL
         } else {
             snapshot[y as usize * cols + x as usize]
         }
     };
     for y in 0..rows as i32 {
         for x in 0..cols as i32 {
-            if tile(x, y) != Tile::Empty {
+            let here = tile(x, y);
+            if !here.is_floor() {
                 continue;
             }
             let solid = |side: Side| {
                 let [dx, dy] = side.offset();
-                tile(x + dx, y + dy).covers(side.opposite())
+                tile(x + dx, y + dy).wall().covers(side.opposite())
             };
             for corner in Corner::CLOCKWISE {
                 let [a, b] = corner.sides();
@@ -492,13 +590,14 @@ fn smooth(tiles: &mut [Tile], cols: usize, rows: usize) {
                     .map(|s| s.offset())
                     .into_iter()
                     .fold([0, 0], |acc, o| [acc[0] + o[0], acc[1] + o[1]]);
-                if solid(a)
-                    && solid(b)
-                    && !solid(c)
-                    && !solid(d)
-                    && tile(x + ox, y + oy) == Tile::Empty
+                if solid(a) && solid(b) && !solid(c) && !solid(d) && tile(x + ox, y + oy).is_floor()
                 {
-                    tiles[y as usize * cols + x as usize] = Tile::Slope(corner);
+                    // The wall of the neighbor it continues, over this floor.
+                    let [ax, ay] = a.offset();
+                    let wall = tile(x + ax, y + ay).wall_id().unwrap_or(0);
+                    let floor = here.floor_id().unwrap_or(0);
+                    tiles[y as usize * cols + x as usize] =
+                        Tile::split(corner, Part::Wall(wall), Part::Floor(floor));
                     break;
                 }
             }
@@ -514,7 +613,7 @@ fn random_block(rng: &mut Rng, cols: usize, rows: usize) -> Piece {
     if w == 1 && h == 1 && rng.unit() < LONE_SLOPE_CHANCE {
         let corner = Corner::CLOCKWISE[rng.range(0, 3)];
         return Piece {
-            tiles: vec![([x, y], Tile::Slope(corner))],
+            tiles: vec![([x, y], Tile::slope(corner))],
         };
     }
     let cut = [(); 4].map(|_| rng.unit() < CUT_CHANCE);
@@ -574,16 +673,20 @@ mod tests {
             .collect()
     }
 
+    fn solids_of(tiles: &[Tile]) -> Vec<Solid> {
+        tiles.iter().map(|t| t.wall()).collect()
+    }
+
     #[test]
     fn open_space_is_connected() {
         for style in STYLES {
             for seed in 0..100 {
                 let level = generate(style, seed, 32, 20, SPAWN);
                 let tiles = tiles_of(&level);
-                let reached = reachable(&tiles, 32, 20, spawn_tile());
+                let reached = reachable(&solids_of(&tiles), 32, 20, spawn_tile());
                 for (i, t) in tiles.iter().enumerate() {
                     assert!(
-                        *t == Tile::Full || reached[i],
+                        t.wall() == Solid::Full || reached[i],
                         "{style:?} seed {seed}: tile {i} cut off"
                     );
                 }
@@ -611,14 +714,14 @@ mod tests {
             let level = generate(Style::World, seed, 32, 20, SPAWN);
             for y in 0..20 {
                 for x in 0..32 {
-                    let tile = level.tile(x, y);
-                    slopes += matches!(tile, Tile::Slope(_)) as usize;
+                    let tile = level.solid(x, y);
+                    slopes += matches!(tile, Solid::Slope(_)) as usize;
                     // A bar's signature: full tiles diagonally adjacent with
                     // a slope filling the step between them.
-                    let full = |dx, dy| level.tile(x + dx, y + dy) == Tile::Full;
-                    let step = level.tile(x + 1, y);
-                    let rising = full(0, 0) && full(1, -1) && step == Tile::Slope(Corner::NW);
-                    let falling = full(0, 0) && full(1, 1) && step == Tile::Slope(Corner::SW);
+                    let full = |dx, dy| level.solid(x + dx, y + dy) == Solid::Full;
+                    let step = level.solid(x + 1, y);
+                    let rising = full(0, 0) && full(1, -1) && step == Solid::Slope(Corner::NW);
+                    let falling = full(0, 0) && full(1, 1) && step == Solid::Slope(Corner::SW);
                     bars += (rising || falling) as usize;
                 }
             }
@@ -643,10 +746,10 @@ mod tests {
             // Slopes (from smoothing) are half open.
             let open = tiles
                 .iter()
-                .map(|t| match t {
-                    Tile::Empty | Tile::Void | Tile::Stairs(_) => 1.0,
-                    Tile::Slope(_) => 0.5,
-                    Tile::Full => 0.0,
+                .map(|t| match t.wall() {
+                    Solid::None => 1.0,
+                    Solid::Slope(_) => 0.5,
+                    Solid::Full => 0.0,
                 })
                 .sum::<f32>()
                 / tiles.len() as f32;
@@ -655,11 +758,11 @@ mod tests {
                 "seed {seed}: {open} open"
             );
             for x in 0..32 {
-                assert_eq!(level.tile(x, 0), Tile::Full);
-                assert_eq!(level.tile(x, 19), Tile::Full);
+                assert_eq!(level.solid(x, 0), Solid::Full);
+                assert_eq!(level.solid(x, 19), Solid::Full);
             }
             assert!(
-                tiles.iter().any(|t| matches!(t, Tile::Slope(_))),
+                tiles.iter().any(|t| matches!(t.wall(), Solid::Slope(_))),
                 "seed {seed}: no slopes"
             );
         }
@@ -684,7 +787,7 @@ mod tests {
             for (k, reached) in reached.iter().enumerate() {
                 let m = level.movement(k);
                 for i in 0..32 * 20 {
-                    let open = m.tile(i % 32, i / 32) != Tile::Full;
+                    let open = m.solid(i % 32, i / 32) != Solid::Full;
                     assert!(
                         !open || reached[i as usize],
                         "seed {seed}: layer {k} tile {i} cut off"
@@ -698,11 +801,11 @@ mod tests {
                 let mut pairs = 0;
                 for y in 0..20 {
                     for x in 0..32 {
-                        if level.layer(upper).tile(x, y) == Tile::Stairs(Dir::Down) {
+                        if level.layer(upper).tile(x, y).stairs() == Some(Dir::Down) {
                             pairs += 1;
                             assert_eq!(
-                                level.layer(upper - 1).tile(x, y),
-                                Tile::Stairs(Dir::Up),
+                                level.layer(upper - 1).tile(x, y).stairs(),
+                                Some(Dir::Up),
                                 "seed {seed}"
                             );
                             for k in [upper - 1, upper] {
@@ -726,6 +829,74 @@ mod tests {
     }
 
     #[test]
+    fn decks_cut_opening_corners_with_walls_and_floor() {
+        let (mut walls, mut floors) = (0, 0);
+        for seed in 0..10 {
+            let level = generate_level(Style::Layered, seed, 32, 20, SPAWN);
+            for k in 1..level.depth() {
+                for y in 0..20 {
+                    for x in 0..32 {
+                        if let Tile::Split {
+                            at,
+                            rest: Part::Void,
+                            ..
+                        } = level.layer(k).tile(x, y)
+                        {
+                            walls += matches!(at, Part::Wall(_)) as usize;
+                            floors += matches!(at, Part::Floor(_)) as usize;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            walls > 20 && floors > 20,
+            "{walls} wall and {floors} floor cuts"
+        );
+    }
+
+    #[test]
+    fn styles_build_with_their_materials() {
+        let types = |layer: &Layer| {
+            let mut walls = std::collections::BTreeSet::new();
+            let mut floors = std::collections::BTreeSet::new();
+            for y in 0..layer.rows as i32 {
+                for x in 0..layer.cols as i32 {
+                    let t = layer.tile(x, y);
+                    walls.extend(t.wall_id());
+                    floors.extend(t.floor_id());
+                }
+            }
+            (walls, floors)
+        };
+        let set = |names: &[u8]| {
+            names
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<u8>>()
+        };
+        let (wall, floor) = (tileset::wall, tileset::floor);
+
+        let cave = generate(Style::Cave, 3, 32, 20, SPAWN);
+        assert_eq!(
+            types(&cave),
+            (set(&[wall(CAVE_WALL)]), set(&[floor(CAVE_FLOOR)]))
+        );
+        let world = generate(Style::World, 3, 32, 20, SPAWN);
+        let (walls, floors) = types(&world);
+        assert_eq!(walls, set(&[wall(WORLD_BLOCKS), wall(WORLD_BARS)]));
+        assert_eq!(floors, set(&[floor(WORLD_FLOOR)]));
+
+        // Every deck alike.
+        let level = generate_level(Style::Layered, 3, 32, 20, SPAWN);
+        for k in 1..level.depth() {
+            let (walls, floors) = types(level.layer(k));
+            assert_eq!(floors, set(&[floor(DECK_FLOOR)]), "deck {k}");
+            assert_eq!(walls, set(&[wall(DECK_WALL)]), "deck {k}");
+        }
+    }
+
+    #[test]
     fn bigger_levels_stay_connected() {
         let spawn = [325.0, 205.0];
         let start = [32, 20];
@@ -741,7 +912,7 @@ mod tests {
             for (k, reached) in reached.iter().enumerate() {
                 let m = level.movement(k);
                 for i in 0..64 * 40 {
-                    let open = m.tile(i % 64, i / 64) != Tile::Full;
+                    let open = m.solid(i % 64, i / 64) != Solid::Full;
                     assert!(
                         !open || reached[i as usize],
                         "seed {seed}: layer {k} tile {i} cut off"
@@ -754,12 +925,12 @@ mod tests {
                     .flat_map(|y| (0..64).map(move |x| (x, y)))
                     .map(|(x, y)| layer.tile(x, y))
                     .collect();
-                let reached = reachable(&tiles, 64, 40, start);
+                let reached = reachable(&solids_of(&tiles), 64, 40, start);
                 assert!(
                     tiles
                         .iter()
                         .zip(&reached)
-                        .all(|(t, r)| *t == Tile::Full || *r),
+                        .all(|(t, r)| t.wall() == Solid::Full || *r),
                     "{style:?} {seed}"
                 );
             }
@@ -774,17 +945,17 @@ mod tests {
         let mut tiles: Vec<Tile> = rows
             .iter()
             .flat_map(|r| r.chars())
-            .map(|c| if c == '#' { Tile::Full } else { Tile::Empty })
+            .map(|c| if c == '#' { Tile::WALL } else { Tile::FLOOR })
             .collect();
         smooth(&mut tiles, 5, 4);
-        assert_eq!(tiles[5 + 1], Tile::Slope(Corner::NW));
-        assert_eq!(tiles[2 * 5 + 2], Tile::Empty);
+        assert_eq!(tiles[5 + 1], Tile::slope(Corner::NW));
+        assert_eq!(tiles[2 * 5 + 2], Tile::FLOOR);
 
         let bend = ["#####", "#..##", "##.##", "#####"];
         let mut tiles: Vec<Tile> = bend
             .iter()
             .flat_map(|r| r.chars())
-            .map(|c| if c == '#' { Tile::Full } else { Tile::Empty })
+            .map(|c| if c == '#' { Tile::WALL } else { Tile::FLOOR })
             .collect();
         let before = tiles.clone();
         smooth(&mut tiles, 5, 4);

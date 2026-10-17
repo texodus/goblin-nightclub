@@ -1,8 +1,8 @@
 //! A level: a stack of layers, from the bottom (0) up, and the single-layer
 //! grids derived from them that movement and sight run on.
 //!
-//! - Movement on a layer: walls block, and so do pits, void with no wall
-//!   below to stand on (a void over a wall is that wall's top, walkable).
+//! - Movement on a layer: only floor is walkable. Walls block, and so does
+//!   void, whatever is below it; half a tile can be either.
 //! - Sight from layer `top` down to a lower layer `k`: walls on the layers
 //!   above `k` up to `top` block it, but `k`'s own walls don't (looking
 //!   down, you see over them, onto their tops); and layer `k` shows only
@@ -13,7 +13,7 @@
 //! visibility work on them unchanged.
 
 use crate::generate::Style;
-use crate::layer::{Layer, TILE, Tile};
+use crate::layer::{Layer, Solid, TILE};
 
 /// Layers a level may have (the renderer keeps textures for each).
 pub const MAX_LAYERS: usize = 8;
@@ -27,8 +27,10 @@ pub struct Level {
     movement: Vec<Layer>,
     /// `sight[top][k]` for `k <= top`.
     sight: Vec<Vec<Layer>>,
-    /// `shafts[top][k][tile]`.
-    shafts: Vec<Vec<Vec<bool>>>,
+    /// `shafts[top][k][tile]`: the quarters of each tile (as bits) open
+    /// from layer `k` up to `top`, and whether any are.
+    shafts: Vec<Vec<Vec<u8>>>,
+    shafts_any: Vec<Vec<Vec<bool>>>,
 }
 
 impl Level {
@@ -43,20 +45,19 @@ impl Level {
             "at most {MAX_TILES} tiles a layer"
         );
         let n = cols * rows;
-        let at = |l: &Layer, i: usize| l.tile((i % cols) as i32, (i / cols) as i32);
+        let pos = |i: usize| ((i % cols) as i32, (i / cols) as i32);
+        let solid = |l: &Layer, i: usize| l.solid(pos(i).0, pos(i).1);
+        let void = |l: &Layer, i: usize| l.tile(pos(i).0, pos(i).1).void_quarters();
 
-        let movement = (0..layers.len())
-            .map(|i| {
-                let tiles = (0..n)
-                    .map(|t| match at(&layers[i], t) {
-                        // Standing on the wall below; elsewhere a pit.
-                        Tile::Void if i == 0 => Tile::Full,
-                        Tile::Void => Tile::Full.carve(at(&layers[i - 1], t).wall()),
-                        Tile::Stairs(_) => Tile::Empty,
-                        tile => tile,
-                    })
+        // Blocked where wall or void. A part of a tile no shape can be
+        // rounds up to blocking the whole tile.
+        let movement = layers
+            .iter()
+            .map(|l| {
+                let solids = (0..n)
+                    .map(|t| Solid::from_quarters(solid(l, t).quarters() | void(l, t), true))
                     .collect();
-                Layer::from_tiles(cols, rows, tiles)
+                Layer::from_solids(cols, rows, solids)
             })
             .collect();
 
@@ -64,27 +65,39 @@ impl Level {
             .map(|top| {
                 (0..=top)
                     .map(|k| {
-                        let tiles = (0..n)
+                        let solids = (0..n)
                             .map(|t| {
                                 layers[k..=top]
                                     .iter()
-                                    .fold(Tile::Empty, |acc, l| acc.union(at(l, t).wall()))
+                                    .fold(Solid::None, |acc, l| acc.union(solid(l, t)))
                             })
                             .collect();
-                        Layer::from_tiles(cols, rows, tiles)
+                        Layer::from_solids(cols, rows, solids)
                     })
                     .collect()
             })
             .collect();
 
-        let shafts = (0..layers.len())
+        let shafts: Vec<Vec<Vec<u8>>> = (0..layers.len())
             .map(|top| {
                 (0..=top)
                     .map(|k| {
                         (0..n)
-                            .map(|t| layers[k + 1..=top].iter().all(|l| at(l, t) == Tile::Void))
+                            .map(|t| {
+                                layers[k + 1..=top]
+                                    .iter()
+                                    .fold(0b1111, |q, l| q & void(l, t))
+                            })
                             .collect()
                     })
+                    .collect()
+            })
+            .collect();
+        let shafts_any = shafts
+            .iter()
+            .map(|by_k| {
+                by_k.iter()
+                    .map(|qs| qs.iter().map(|q| *q != 0).collect())
                     .collect()
             })
             .collect();
@@ -94,6 +107,7 @@ impl Level {
             movement,
             sight,
             shafts,
+            shafts_any,
         }
     }
 
@@ -119,7 +133,7 @@ impl Level {
         &self.layers[i]
     }
 
-    /// What blocks movement on layer `i`: walls and pits.
+    /// What blocks movement on layer `i`: walls and void.
     pub fn movement(&self, i: usize) -> &Layer {
         &self.movement[i]
     }
@@ -137,8 +151,15 @@ impl Level {
         &self.sight[top][(k + 1).min(top)]
     }
 
-    /// For each tile, whether layer `k` shows through to layer `top`.
+    /// For each tile, whether layer `k` shows through to layer `top`
+    /// anywhere in it.
     pub fn shaft(&self, top: usize, k: usize) -> &[bool] {
+        &self.shafts_any[top][k]
+    }
+
+    /// For each tile, the quarters (as bits, see [`crate::layer::quarter_shapes`]) where
+    /// layer `k` shows through to layer `top`.
+    pub fn shaft_quarters(&self, top: usize, k: usize) -> &[u8] {
         &self.shafts[top][k]
     }
 
@@ -149,7 +170,7 @@ impl Level {
             && y >= 0
             && (x as usize) < self.cols()
             && (y as usize) < self.rows()
-            && self.shafts[top][k][y as usize * self.cols() + x as usize]
+            && self.shafts_any[top][k][y as usize * self.cols() + x as usize]
     }
 
     /// The layers seen from `top`: itself, and each below it showing
@@ -157,7 +178,7 @@ impl Level {
     pub fn visible_layers(&self, top: usize) -> Vec<usize> {
         (0..=top)
             .rev()
-            .filter(|&k| self.shafts[top][k].iter().any(|s| *s))
+            .filter(|&k| self.shafts_any[top][k].iter().any(|s| *s))
             .collect()
     }
 }
@@ -172,30 +193,47 @@ mod tests {
     }
 
     #[test]
-    fn void_over_wall_is_walkable_and_over_floor_is_a_pit() {
+    fn only_floor_is_walkable() {
         let l = level(&[
             &["#..◸"], //
             &["~~.~"],
         ]);
         let m = l.movement(1);
-        assert_eq!(m.tile(0, 0), Tile::Empty, "top of the wall below");
-        assert_eq!(m.tile(1, 0), Tile::Full, "pit over floor");
-        assert_eq!(m.tile(2, 0), Tile::Empty, "floor");
-        assert_eq!(
-            m.tile(3, 0),
-            Tile::Slope(Corner::SE),
-            "half wall top, half pit"
-        );
-        // On the bottom layer, void has nothing under it.
+        assert_eq!(m.solid(0, 0), Solid::Full, "void over a wall");
+        assert_eq!(m.solid(1, 0), Solid::Full, "void over floor");
+        assert_eq!(m.solid(2, 0), Solid::None, "floor");
+        assert_eq!(m.solid(3, 0), Solid::Full, "void over a slope");
         let bottom = level(&[&["~."]]);
-        assert_eq!(bottom.movement(0).tile(0, 0), Tile::Full);
+        assert_eq!(bottom.movement(0).solid(0, 0), Solid::Full);
     }
 
     #[test]
-    fn stacked_voids_make_a_deeper_pit() {
-        let l = level(&[&["#"], &["~"], &["~"]]);
-        assert_eq!(l.movement(1).tile(0, 0), Tile::Empty, "wall top one down");
-        assert_eq!(l.movement(2).tile(0, 0), Tile::Full, "two down is a pit");
+    fn half_void_tiles_block_their_void_half() {
+        let l = level(&[
+            &["#◤▛◺"], //
+            &["▛◥▙~"],
+        ]);
+        let m = l.movement(1);
+        // Floor in the NW half, void in the SE half, even over a wall.
+        assert_eq!(m.solid(0, 0), Solid::Full.carve(Solid::Slope(Corner::NW)));
+        // Wall in one half, void in the other: blocked throughout.
+        assert_eq!(m.solid(1, 0), Solid::Full);
+        // Floor in the SW half: the NE half blocks.
+        assert_eq!(m.solid(2, 0), Solid::Slope(Corner::NE));
+    }
+
+    #[test]
+    fn shafts_follow_void_quarters() {
+        let l = level(&[
+            &["..."], //
+            &["▛▟~"],
+            &["~▛▛"],
+        ]);
+        // Bits N = 1, E = 2, S = 4, W = 8: the SE half is 6, the NW half 9.
+        assert_eq!(l.shaft_quarters(2, 0), &[6, 0, 6]);
+        assert_eq!(l.shaft(2, 0), &[true, false, true]);
+        assert_eq!(l.shaft_quarters(2, 1), &[15, 6, 6]);
+        assert_eq!(l.layer(1).tile(1, 0).void(), Solid::Slope(Corner::NW));
     }
 
     #[test]
@@ -206,12 +244,12 @@ mod tests {
         ]);
         // Looking at layer 0 from layer 1: walls of both.
         let s = l.sight(1, 0);
-        assert_eq!(s.tile(0, 0), Tile::Full);
-        assert_eq!(s.tile(3, 0), Tile::Full);
-        assert_eq!(s.tile(1, 0), Tile::Empty);
+        assert_eq!(s.solid(0, 0), Solid::Full);
+        assert_eq!(s.solid(3, 0), Solid::Full);
+        assert_eq!(s.solid(1, 0), Solid::None);
         // Layer 1 on its own: just its wall.
-        assert_eq!(l.sight(1, 1).tile(0, 0), Tile::Empty);
-        assert_eq!(l.sight(1, 1).tile(3, 0), Tile::Full);
+        assert_eq!(l.sight(1, 1).solid(0, 0), Solid::None);
+        assert_eq!(l.sight(1, 1).solid(3, 0), Solid::Full);
     }
 
     #[test]
@@ -221,10 +259,10 @@ mod tests {
             &["~~~#"],
         ]);
         // Layer 0 from layer 1: only layer 1's wall blocks.
-        assert_eq!(l.view(1, 0).tile(0, 0), Tile::Empty);
-        assert_eq!(l.view(1, 0).tile(3, 0), Tile::Full);
+        assert_eq!(l.view(1, 0).solid(0, 0), Solid::None);
+        assert_eq!(l.view(1, 0).solid(3, 0), Solid::Full);
         // Layer 1 itself: its own wall.
-        assert_eq!(l.view(1, 1).tile(3, 0), Tile::Full);
+        assert_eq!(l.view(1, 1).solid(3, 0), Solid::Full);
     }
 
     #[test]

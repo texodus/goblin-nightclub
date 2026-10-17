@@ -8,15 +8,18 @@ body {
 }
 
 body {
+    overflow: hidden;
     display: grid;
     place-items: center;
 }
 
-/* The canvas is 320x200 internally; scale it to fit while keeping the 16:10
-   aspect and hard pixel edges. */
+/* The canvas fills the window, rendered at its own resolution (see
+   main.js); if that's capped, it's scaled up by a whole number, with hard
+   pixel edges. */
 #game {
-    width: min(100vw, 160vh);
-    aspect-ratio: 16 / 10;
+    display: block;
+    width: 100vw;
+    height: 100vh;
     image-rendering: pixelated;
     outline: none;
 }

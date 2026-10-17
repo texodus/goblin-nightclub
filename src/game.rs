@@ -3,15 +3,16 @@
 use std::collections::HashSet;
 
 use crate::draw::Canvas;
-use crate::entity::{Entity, EntityId};
+use crate::entity::{Entity, EntityId, Kind};
 use crate::frame::{Frame, LayerFrame};
 use crate::generate::Style;
-use crate::layer::{Dir, TILE, Tile};
+use crate::layer::{Dir, Shape, Solid, TILE, quarter_shapes};
 use crate::level::Level;
 use crate::memory::Memory;
 use crate::palette;
 use crate::path;
 use crate::rng::Rng;
+use crate::tileset::{self, Cell, ZOOM};
 use crate::vision::Vision;
 
 #[derive(Default)]
@@ -55,10 +56,12 @@ pub struct Game {
     paused: bool,
     /// Where the player is walking, if anywhere.
     route: Option<Route>,
-    /// Top-left of the view, in world pixels.
+    /// Top-left of the view, in world units.
     camera: [f32; 2],
-    /// Size of the view, in pixels.
+    /// Size of the view, in screen pixels.
     view: [f32; 2],
+    /// Zoom relative to the default (see [`Game::zoom`]).
+    zoom_factor: f32,
     /// Last pointer position, in view pixels.
     pointer: Option<[f32; 2]>,
 }
@@ -74,13 +77,20 @@ struct Route {
 }
 
 const PLAYER_SIZE: [f32; 2] = [8.0, 8.0];
+const PLAYER_SPRITE: &tileset::Sprite = &tileset::SPRITES[0];
 const PLAYER_SPEED: f32 = 90.0;
 
 /// Pause on reaching the destination.
 const AUTO_PAUSE: bool = true;
 
-/// Camera panning speed, in pixels a second.
-const CAMERA_SPEED: f32 = 160.0;
+/// Each wheel notch zooms by this factor.
+const ZOOM_STEP: f32 = 1.1;
+/// The most zoomed in, relative to the default. Zooming out stops where a
+/// pixel of the art is a pixel of the screen.
+const ZOOM_MAX: f32 = 3.0;
+
+/// Camera panning speed, in screen pixels a second.
+const CAMERA_SPEED: f32 = 600.0;
 
 /// Which kind of level to generate, and its size in tiles.
 const LEVEL_STYLE: Style = Style::Layered;
@@ -104,7 +114,7 @@ const NPC_DENSITY: usize = 4;
 /// NPCs spawn at least this far (pixels) from the player.
 const NPC_SPAWN_DIST: f32 = 60.0;
 
-/// The pause button, in view pixels from the top-right corner.
+/// The pause button, in interface pixels from the top-right corner.
 const BUTTON_SIZE: [f32; 2] = [14.0, 12.0];
 const BUTTON_MARGIN: f32 = 3.0;
 
@@ -159,6 +169,7 @@ impl Game {
             route: None,
             camera: [0.0; 2],
             view,
+            zoom_factor: 1.0,
             pointer: None,
         };
         game.center_camera();
@@ -212,13 +223,53 @@ impl Game {
             self.paused = !self.paused;
             return;
         }
-        let world = [self.camera[0] + p[0], self.camera[1] + p[1]];
-        self.walk_to(tile_of(world));
+        self.walk_to(tile_of(self.to_world(p)));
+    }
+
+    /// Screen pixels per interface pixel: the interface is laid out for
+    /// a [`crate::WIDTH`] x [`crate::HEIGHT`] screen and scaled up by the
+    /// largest whole number that fits the view.
+    pub fn ui_scale(&self) -> f32 {
+        let fit = (self.view[0] / crate::WIDTH as f32).min(self.view[1] / crate::HEIGHT as f32);
+        fit.floor().max(1.0)
+    }
+
+    /// Screen pixels per world unit. By default the art is drawn at the
+    /// interface's scale (a pixel of the art an interface pixel), so the
+    /// view shows about as much of the level at any resolution.
+    pub fn zoom(&self) -> f32 {
+        ZOOM * self.ui_scale() * self.zoom_factor
+    }
+
+    /// Zoom in (`steps > 0`) or out by that many wheel notches, keeping the
+    /// world point under `p` (view pixels) where it is.
+    pub fn zoom_by(&mut self, steps: i32, p: [f32; 2]) {
+        let anchor = self.to_world(p);
+        let min = 1.0 / self.ui_scale();
+        self.zoom_factor = (self.zoom_factor * ZOOM_STEP.powi(steps)).clamp(min, ZOOM_MAX);
+        let zoom = self.zoom();
+        self.camera = [anchor[0] - p[0] / zoom, anchor[1] - p[1] / zoom];
+    }
+
+    /// The view is now `view` screen pixels: keep what's at its center
+    /// there, and the zoom within bounds.
+    pub fn resize(&mut self, view: [f32; 2]) {
+        let center = self.to_world([self.view[0] / 2.0, self.view[1] / 2.0]);
+        self.view = view;
+        self.zoom_factor = self.zoom_factor.clamp(1.0 / self.ui_scale(), ZOOM_MAX);
+        let world = self.view_world();
+        self.camera = [center[0] - world[0] / 2.0, center[1] - world[1] / 2.0];
+    }
+
+    /// The world point at view pixel `p`.
+    fn to_world(&self, p: [f32; 2]) -> [f32; 2] {
+        let zoom = self.zoom();
+        [self.camera[0] + p[0] / zoom, self.camera[1] + p[1] / zoom]
     }
 
     /// Plan a walk to tile `goal` on the player's layer and set off. Plans
     /// on what the player knows: unexplored tiles are assumed walkable.
-    /// A known pit is ignored (no clicking through holes); a known wall
+    /// Known void is ignored (no clicking through holes); a known wall
     /// sends the player as near it as they can get.
     fn walk_to(&mut self, goal: [i32; 2]) {
         let layer = self.level.layer(self.top);
@@ -226,7 +277,8 @@ impl Game {
             return;
         }
         let known = self.visions[self.top].is_explored(goal[0] as usize, goal[1] as usize);
-        if known && layer.tile(goal[0], goal[1]) == Tile::Void && !self.walkable(goal, goal) {
+        let void = layer.tile(goal[0], goal[1]).void() != Solid::None;
+        if known && void && !self.walkable(goal, goal) {
             return;
         }
         let start = tile_of(center(self.player, PLAYER_SIZE));
@@ -270,11 +322,11 @@ impl Game {
         if !layer.in_bounds(t) {
             return false;
         }
-        if let Tile::Stairs(_) = layer.tile(t[0], t[1]) {
+        if layer.tile(t[0], t[1]).stairs().is_some() {
             return t == goal;
         }
         !self.visions[self.top].is_explored(t[0] as usize, t[1] as usize)
-            || self.level.movement(self.top).tile(t[0], t[1]) == Tile::Empty
+            || self.level.movement(self.top).is_open(t[0], t[1])
     }
 
     /// Head for the next waypoint, sliding along anything in the way.
@@ -345,14 +397,19 @@ impl Game {
         if here == before {
             return;
         }
-        match self.level.layer(self.top).tile(here[0], here[1]) {
-            Tile::Stairs(Dir::Down) if self.top > 0 => self.top -= 1,
-            Tile::Stairs(Dir::Up) if self.top + 1 < self.level.depth() => self.top += 1,
+        match self.level.layer(self.top).tile(here[0], here[1]).stairs() {
+            Some(Dir::Down) if self.top > 0 => self.top -= 1,
+            Some(Dir::Up) if self.top + 1 < self.level.depth() => self.top += 1,
             _ => {}
         }
     }
 
-    /// Size of the level, in pixels.
+    /// Size of the view, in world units.
+    fn view_world(&self) -> [f32; 2] {
+        [self.view[0] / self.zoom(), self.view[1] / self.zoom()]
+    }
+
+    /// Size of the level, in world units.
     fn world(&self) -> [f32; 2] {
         [
             self.level.cols() as f32 * TILE,
@@ -360,23 +417,10 @@ impl Game {
         ]
     }
 
-    /// Keep the view inside the level (centered, if the level is smaller).
-    fn clamp_camera(&mut self) {
-        let world = self.world();
-        for ((camera, world), view) in self.camera.iter_mut().zip(world).zip(self.view) {
-            let max = world - view;
-            *camera = if max <= 0.0 {
-                max / 2.0
-            } else {
-                camera.clamp(0.0, max)
-            };
-        }
-    }
-
     fn center_camera(&mut self) {
         let c = center(self.player, PLAYER_SIZE);
-        self.camera = [c[0] - self.view[0] / 2.0, c[1] - self.view[1] / 2.0];
-        self.clamp_camera();
+        let view = self.view_world();
+        self.camera = [c[0] - view[0] / 2.0, c[1] - view[1] / 2.0];
     }
 
     /// Arrow keys or WASD pan the view, paused or not.
@@ -387,30 +431,35 @@ impl Game {
         let dy = self
             .input
             .axis(&["ArrowUp", "KeyW"], &["ArrowDown", "KeyS"]);
+        let speed = CAMERA_SPEED / self.zoom();
         self.camera = [
-            self.camera[0] + dx * CAMERA_SPEED * dt,
-            self.camera[1] + dy * CAMERA_SPEED * dt,
+            self.camera[0] + dx * speed * dt,
+            self.camera[1] + dy * speed * dt,
         ];
-        self.clamp_camera();
     }
 
-    /// The pause button's top-left, in view pixels.
+    /// The pause button's top-left, in interface pixels.
     fn button_pos(&self) -> [f32; 2] {
-        [self.view[0] - BUTTON_SIZE[0] - BUTTON_MARGIN, BUTTON_MARGIN]
+        let width = self.view[0] / self.ui_scale();
+        [width - BUTTON_SIZE[0] - BUTTON_MARGIN, BUTTON_MARGIN]
     }
 
+    /// Is view pixel `p` on the pause button?
     fn on_button(&self, p: [f32; 2]) -> bool {
+        let p = p.map(|v| v / self.ui_scale());
         let b = self.button_pos();
         p[0] >= b[0] && p[1] >= b[1] && p[0] < b[0] + BUTTON_SIZE[0] && p[1] < b[1] + BUTTON_SIZE[1]
     }
 
     /// World-space marks over everything: the route being walked, dotted,
-    /// and its destination.
+    /// and its destination, in lines a pixel of the art wide.
     fn overlay(&self) -> Canvas {
         let mut canvas = Canvas::default();
         let Some(route) = &self.route else {
             return canvas;
         };
+        let px = 1.0 / ZOOM;
+        let snap = |v: f32| (v * ZOOM).floor() / ZOOM;
         let mut at = center(self.player, PLAYER_SIZE);
         for &w in &route.waypoints[route.next..] {
             let len = (w[0] - at[0]).hypot(w[1] - at[1]);
@@ -418,17 +467,18 @@ impl Game {
             for i in 1..=dots {
                 let t = i as f32 * 4.0 / len;
                 let p = [at[0] + (w[0] - at[0]) * t, at[1] + (w[1] - at[1]) * t];
-                canvas.rect([p[0].floor(), p[1].floor()], [1.0, 1.0], palette::YELLOW);
+                canvas.rect([snap(p[0]), snap(p[1])], [px, px], palette::YELLOW);
             }
             at = w;
         }
         let goal = path::center(*route.tiles.last().unwrap());
-        canvas.outline([goal[0] - 2.0, goal[1] - 2.0], [5.0, 5.0], palette::YELLOW);
+        let corner = [snap(goal[0] - 2.5), snap(goal[1] - 2.5)];
+        canvas.outline(corner, [5.0, 5.0], px, palette::YELLOW);
         canvas
     }
 
-    /// View-space interface: the pause button, showing what a click does
-    /// (pause while running, play while paused).
+    /// The interface, in interface pixels: the pause button, showing what a
+    /// click does (pause while running, play while paused).
     fn ui(&self) -> Canvas {
         let mut canvas = Canvas::default();
         let [x, y] = self.button_pos();
@@ -439,7 +489,7 @@ impl Game {
             palette::BLUE
         };
         canvas.rect([x, y], BUTTON_SIZE, fill);
-        canvas.outline([x, y], BUTTON_SIZE, palette::LIGHT_GRAY);
+        canvas.outline([x, y], BUTTON_SIZE, 1.0, palette::LIGHT_GRAY);
         if self.paused {
             canvas.poly(
                 &[[x + 5.0, y + 3.0], [x + 10.0, y + 6.0], [x + 5.0, y + 9.0]],
@@ -479,56 +529,77 @@ impl Game {
     /// renderer shows it only where the matching visibility applies, so live
     /// NPCs go in `visible` and last-seen markers in `remembered`.
     pub fn frame(&self) -> Frame {
+        let bevel = 1.0 / ZOOM;
         let layers = self
             .level
             .visible_layers(self.top)
             .into_iter()
             .map(|k| {
                 let (layer, vision) = (self.level.layer(k), &self.visions[k]);
-                // Bevels only on faces seen: now for the visible canvas,
-                // ever for the remembered one. Otherwise a lit wall would
-                // show the bevel of a face behind it nobody has seen.
-                let mut visible = Canvas::default();
-                layer.draw(&mut visible, |i| vision.edge_visible()[i]);
-                for npc in self.npcs.iter().filter(|n| n.layer == k) {
-                    visible.rect(npc.pos, npc.size, palette::LIGHT_RED);
-                }
-                if k == self.top {
-                    visible.rect(self.player, PLAYER_SIZE, palette::LIGHT_CYAN);
-                }
-
-                let mut remembered = Canvas::default();
-                layer.draw(&mut remembered, |i| vision.edge_seen()[i]);
-                for (_, m) in self.memories[k].stale() {
-                    remembered.outline(m.pos, m.size, palette::LIGHT_RED);
-                }
-
-                let tiles_where = |f: &dyn Fn(usize) -> bool| -> Vec<([f32; 2], [f32; 2])> {
-                    (0..layer.cols * layer.rows)
-                        .filter(|&i| f(i))
-                        .map(|i| {
-                            let (x, y) = (i % layer.cols, i / layer.cols);
-                            ([x as f32 * TILE, y as f32 * TILE], [TILE, TILE])
-                        })
-                        .collect()
-                };
-                let voids = tiles_where(&|i| {
-                    layer.tile((i % layer.cols) as i32, (i / layer.cols) as i32) == Tile::Void
-                });
-                let shaft = (k < self.top).then(|| {
-                    let shaft = self.level.shaft(self.top, k);
-                    tiles_where(&|i| shaft[i])
-                });
-                // Whatever stands on this layer covers the void beneath it
-                // (e.g. the player on the top of a wall below).
-                let mut standing: Vec<([f32; 2], [f32; 2])> = self
+                // Bevels a pixel of the art wide, only on faces seen: now for
+                // the visible canvas, ever for the remembered one.
+                // Otherwise a lit wall would show the bevel of a face behind
+                // it nobody has seen.
+                // Characters drawn on this layer, as sprites centered on
+                // their boxes: live NPCs where visible, the last sighting of
+                // each (a gray ghost, in the remembered style) elsewhere.
+                let memory = &self.memories[k];
+                let mut live: Vec<([f32; 2], Cell)> = self
                     .npcs
                     .iter()
                     .filter(|n| n.layer == k)
-                    .map(|n| (n.pos, n.size))
+                    .map(|n| (n.center(), sprite(n.kind)))
                     .collect();
                 if k == self.top {
-                    standing.push((self.player, PLAYER_SIZE));
+                    live.push((center(self.player, PLAYER_SIZE), PLAYER_SPRITE.cell));
+                }
+                let stale: Vec<([f32; 2], Cell)> = memory
+                    .stale()
+                    .map(|(_, m)| (center(m.pos, m.size), sprite(m.kind)))
+                    .collect();
+
+                let mut visible = Canvas::default();
+                layer.draw(&mut visible, |i| vision.edge_visible()[i], bevel);
+                for &(at, cell) in &live {
+                    visible.sprite(at, cell, palette::WHITE);
+                }
+                let mut remembered = Canvas::default();
+                layer.draw(&mut remembered, |i| vision.edge_seen()[i], bevel);
+                for &(at, cell) in &stale {
+                    remembered.sprite(at, cell, palette::WHITE);
+                }
+
+                // The parts of each tile given by `quarters(tile index)`.
+                let parts = |quarters: &dyn Fn(usize) -> u8| -> Vec<Shape> {
+                    (0..layer.cols * layer.rows)
+                        .flat_map(|i| quarter_shapes(i % layer.cols, i / layer.cols, quarters(i)))
+                        .collect()
+                };
+                let voids = parts(&|i| {
+                    let (x, y) = ((i % layer.cols) as i32, (i / layer.cols) as i32);
+                    layer.tile(x, y).void_quarters()
+                });
+                let shaft = (k < self.top).then(|| {
+                    let shaft = self.level.shaft_quarters(self.top, k);
+                    parts(&|i| shaft[i])
+                });
+                // Characters drawn on this layer cover any void their
+                // sprites overhang: the player, NPCs in view and last
+                // sightings.
+                let mut standing = Canvas::default();
+                let in_view = self
+                    .npcs
+                    .iter()
+                    .filter(|n| n.layer == k && memory.is_visible(n.id));
+                for n in in_view {
+                    standing.sprite(n.center(), sprite(n.kind), palette::WHITE);
+                }
+                if k == self.top {
+                    let at = center(self.player, PLAYER_SIZE);
+                    standing.sprite(at, PLAYER_SPRITE.cell, palette::WHITE);
+                }
+                for &(at, cell) in &stale {
+                    standing.sprite(at, cell, palette::WHITE);
                 }
 
                 LayerFrame {
@@ -547,6 +618,7 @@ impl Game {
 
         let vision = &self.visions[self.top];
         Frame {
+            depth: self.level.depth(),
             top: self.top,
             layers,
             origin: vision.origin(),
@@ -556,10 +628,19 @@ impl Game {
             time: self.time,
             camera: self.camera,
             view: self.view,
+            zoom: self.zoom(),
+            ui_scale: self.ui_scale(),
             world: self.world(),
             overlay: self.overlay(),
             ui: self.ui(),
         }
+    }
+}
+
+/// The sheet cell drawn for an entity of `kind`.
+fn sprite(kind: Kind) -> Cell {
+    match kind {
+        Kind::Npc => tileset::sprite("npc").cell,
     }
 }
 
@@ -591,11 +672,17 @@ mod tests {
         game
     }
 
-    /// Click tile `t` (the camera's at the origin for small levels) and
-    /// play until paused, up to `max` frames.
+    /// Click world point `p`, through the camera.
+    fn click_world(game: &mut Game, p: [f32; 2]) {
+        game.click([
+            (p[0] - game.camera[0]) * game.zoom(),
+            (p[1] - game.camera[1]) * game.zoom(),
+        ]);
+    }
+
+    /// Click tile `t` and play until paused, up to `max` frames.
     fn click_and_run(game: &mut Game, t: [i32; 2], max: usize) {
-        let c = path::center(t);
-        game.click([c[0] - game.camera[0], c[1] - game.camera[1]]);
+        click_world(game, path::center(t));
         for _ in 0..max {
             if game.paused {
                 break;
@@ -696,31 +783,91 @@ mod tests {
     }
 
     #[test]
-    fn camera_pans_independently_and_stays_in_the_level() {
+    fn camera_pans_independently_and_freely() {
         let rows: Vec<String> = (0..40).map(|_| ".".repeat(64)).collect();
         let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
         let l = Level::new(vec![Layer::from_ascii(&rows)]);
         let mut game = game(l, [32, 20]);
-        let start = game.camera;
+        // The view is 320 x 200 screen pixels, so 200 x 125 world units.
+        let view = [VIEW[0] / ZOOM, VIEW[1] / ZOOM];
+        assert_eq!(view, [200.0, 125.0]);
         assert_eq!(
-            start,
-            [320.0 + 5.0 - 160.0, 200.0 + 5.0 - 100.0],
+            game.camera,
+            [325.0 - view[0] / 2.0, 205.0 - view[1] / 2.0],
             "centered"
         );
         game.input.set("ArrowRight", true);
         for _ in 0..600 {
             game.update(1.0 / 60.0);
         }
-        assert_eq!(game.camera[0], 640.0 - 320.0, "clamped at the edge");
+        // Ten seconds of panning: well past the level's edge.
+        let panned = game.camera[0] - (325.0 - view[0] / 2.0);
+        let expected = 10.0 * CAMERA_SPEED / ZOOM;
+        assert!((panned - expected).abs() < 1.0, "{panned}");
+        assert!(game.camera[0] > 640.0, "no boundary");
         assert_eq!(game.player, game.player, "player didn't move");
         // Clicking maps through the camera.
         game.input.set("ArrowRight", false);
-        let c = path::center([60, 20]);
-        game.click([c[0] - game.camera[0], c[1] - game.camera[1]]);
+        click_world(&mut game, path::center([60, 20]));
         assert_eq!(
             *game.route.as_ref().unwrap().tiles.last().unwrap(),
             [60, 20]
         );
+    }
+
+    #[test]
+    fn zooming_keeps_the_point_under_the_pointer() {
+        let rows: Vec<String> = (0..40).map(|_| ".".repeat(64)).collect();
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let l = Level::new(vec![Layer::from_ascii(&rows)]);
+        let mut game = game(l, [32, 20]);
+        let pointer = [100.0, 60.0];
+        let anchor = game.to_world(pointer);
+        game.zoom_by(1, pointer);
+        assert_eq!(game.zoom(), ZOOM_STEP * ZOOM);
+        let after = game.to_world(pointer);
+        assert!((after[0] - anchor[0]).abs() < 1e-3 && (after[1] - anchor[1]).abs() < 1e-3);
+        // Clicks map through the zoom too.
+        click_world(&mut game, path::center([33, 21]));
+        assert_eq!(
+            *game.route.as_ref().unwrap().tiles.last().unwrap(),
+            [33, 21]
+        );
+        // Zoom stops at either end: at 320 x 200, the default already
+        // shows a pixel of the art per pixel of the screen.
+        game.zoom_by(100, pointer);
+        assert_eq!(game.zoom(), ZOOM_MAX * ZOOM);
+        game.zoom_by(-100, pointer);
+        assert_eq!(game.zoom(), ZOOM);
+        assert_eq!(game.frame().zoom, game.zoom());
+    }
+
+    #[test]
+    fn bigger_views_scale_up_and_zoom_out_further() {
+        let rows: Vec<String> = (0..40).map(|_| ".".repeat(64)).collect();
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let l = Level::new(vec![Layer::from_ascii(&rows)]);
+        let mut game = game(l, [32, 20]);
+        let center = game.to_world([160.0, 100.0]);
+        // Four times the pixels each way (and a bit): the same view of the
+        // level, everything four times the size.
+        game.resize([1300.0, 820.0]);
+        assert_eq!(game.ui_scale(), 4.0);
+        assert_eq!(game.zoom(), 4.0 * ZOOM);
+        let now = game.to_world([650.0, 410.0]);
+        assert!((now[0] - center[0]).abs() < 1e-3 && (now[1] - center[1]).abs() < 1e-3);
+        // The pause button scales with the interface.
+        let b = game.button_pos();
+        game.click([(b[0] + 2.0) * 4.0, (b[1] + 2.0) * 4.0]);
+        assert!(!game.paused);
+        // Zoomed all the way out, a pixel of the art is a screen pixel, and
+        // the whole level fits, with room around it.
+        let corner = game.to_world([0.0, 0.0]);
+        game.zoom_by(-100, [0.0, 0.0]);
+        assert_eq!(game.zoom(), ZOOM);
+        let view = game.view_world();
+        assert!(view[0] > 640.0 && view[1] > 400.0);
+        assert_eq!(game.to_world([0.0, 0.0]), corner, "zoomed about the corner");
     }
 
     #[test]
@@ -763,6 +910,28 @@ mod tests {
         );
         assert_eq!(game.visions[0].radius(), near_r);
         assert_eq!(view_radius(10), VIEW_RADIUS_MIN);
+    }
+
+    #[test]
+    fn only_characters_drawn_cover_the_void() {
+        let l = level(&[
+            &["....................", "...................."],
+            &["....................", "~~~~~~~~~~~~~~~~~~~~"],
+        ]);
+        let mut game = game(l, [0, 0]);
+        // Along the edge of the void: one NPC in view, one beyond the view
+        // radius.
+        game.npcs.push(Entity::npc(1, [32.0, 2.0]));
+        game.npcs.push(Entity::npc(2, [182.0, 2.0]));
+        for n in &mut game.npcs {
+            n.layer = 1;
+        }
+        game.observe();
+        let frame = game.frame();
+        let top = &frame.layers[0];
+        // Player and the visible NPC: a square each.
+        assert_eq!(top.standing.vertices.len(), 2 * 6);
+        assert!(top.voids.len() == 20, "a whole void tile each");
     }
 
     #[test]

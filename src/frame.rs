@@ -19,26 +19,29 @@ pub struct LayerFrame {
     /// Convex pieces of solid lit along with the polygon (which stops at
     /// wall faces): the band one tile behind the visible stretches of wall.
     pub lit_shapes: Vec<Vec<[f32; 2]>>,
-    /// This layer's void tiles, as rects `(pos, size)`: where the layer
-    /// below shows through.
-    pub voids: Vec<([f32; 2], [f32; 2])>,
-    /// Rects of things standing on this layer, drawn over any void beneath
-    /// them rather than letting the layer below show through.
-    pub standing: Vec<([f32; 2], [f32; 2])>,
-    /// For a layer below the viewer's, the tiles where it shows through
-    /// (as rects); only those may be remembered as seen. `None` for the
+    /// Where this layer is void, as convex polygons: where the layer below
+    /// shows through.
+    pub voids: Vec<Vec<[f32; 2]>>,
+    /// Sprites of things standing on this layer: wherever they're opaque,
+    /// the layer is drawn over any void beneath them rather than letting
+    /// the layer below show through.
+    pub standing: Canvas,
+    /// For a layer below the viewer's, where it shows through (as convex
+    /// polygons); only there may it be remembered as seen. `None` for the
     /// viewer's own layer.
-    pub shaft: Option<Vec<([f32; 2], [f32; 2])>>,
+    pub shaft: Option<Vec<Vec<[f32; 2]>>>,
 }
 
 pub struct Frame {
+    /// Layers in the level.
+    pub depth: usize,
     /// The viewer's layer.
     pub top: usize,
     /// The viewer's layer and each one below it that shows through, top
     /// first.
     pub layers: Vec<LayerFrame>,
     pub origin: [f32; 2],
-    /// View radius on the viewer's layer, in pixels; `f32::INFINITY` for
+    /// View radius on the viewer's layer, in world units; `f32::INFINITY` for
     /// unlimited.
     pub radius: f32,
     /// How much less far each layer below the viewer's is seen, and the
@@ -47,14 +50,20 @@ pub struct Frame {
     pub radius_min: f32,
     /// Game time in seconds, for animated styles.
     pub time: f32,
-    /// Top-left of the view, in world pixels.
+    /// Top-left of the view, in world units.
     pub camera: [f32; 2],
-    /// Size of the view, in pixels.
+    /// Size of the view, in screen pixels.
     pub view: [f32; 2],
-    /// Size of the level, in pixels.
+    /// Screen pixels per world unit (the art is at its own size at
+    /// [`crate::tileset::ZOOM`]).
+    pub zoom: f32,
+    /// Screen pixels per interface pixel, for `ui`.
+    pub ui_scale: f32,
+    /// Size of the level, in world units.
     pub world: [f32; 2],
     /// Drawn in world space over everything, on the viewer's layer.
     pub overlay: Canvas,
-    /// Drawn in view space over everything: the interface.
+    /// Drawn over everything in interface pixels (`ui_scale` screen
+    /// pixels each): the interface.
     pub ui: Canvas,
 }

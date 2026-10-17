@@ -19,6 +19,9 @@ wasm-bindgen-futures = "0.4.79"
 web-sys = { version = "0.3.106", features = ["HtmlCanvasElement", "console"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "webgpu", "wgsl"] }
 
+[build-dependencies]
+png = "0.18"
+
 [profile.release]
 opt-level = "s"
 lto = true

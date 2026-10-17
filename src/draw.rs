@@ -1,13 +1,22 @@
-//! Display lists: colored triangles in pixel space, built by the game and
-//! drawn by the renderer. No GPU types.
+//! Display lists: triangles in world space, built by the game and drawn
+//! by the renderer. No GPU types. Each triangle shows the tile sheet
+//! (see [`crate::tileset`]) times its color; plain colored shapes show the
+//! sheet's white cell.
 
 use crate::palette::Color;
+use crate::tileset::{CELL, Cell, ZOOM};
 
 /// Mirrors the vertex input of shapes.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub pos: [f32; 2],
+    /// Position in the tile sheet, in pixels. The default, its top-left
+    /// pixel, is in the white cell.
+    pub uv: [f32; 2],
+    /// Top-left of the cell `uv` is in, in pixels, so sampling stays inside
+    /// it.
+    pub cell: [f32; 2],
     pub color: Color,
 }
 
@@ -24,27 +33,79 @@ impl Canvas {
         self.poly(&[[x0, y0], [x1, y0], [x1, y1], [x0, y1]], color);
     }
 
-    /// A 1-pixel rectangle outline.
-    pub fn outline(&mut self, pos: [f32; 2], size: [f32; 2], color: Color) {
+    /// A rectangle outline `width` wide.
+    pub fn outline(&mut self, pos: [f32; 2], size: [f32; 2], width: f32, color: Color) {
         let [x, y] = pos;
         let [w, h] = size;
-        self.rect([x, y], [w, 1.0], color);
-        self.rect([x, y + h - 1.0], [w, 1.0], color);
-        self.rect([x, y], [1.0, h], color);
-        self.rect([x + w - 1.0, y], [1.0, h], color);
+        self.rect([x, y], [w, width], color);
+        self.rect([x, y + h - width], [w, width], color);
+        self.rect([x, y], [width, h], color);
+        self.rect([x + w - width, y], [width, h], color);
     }
 
     /// A convex polygon, as a triangle fan.
     pub fn poly(&mut self, points: &[[f32; 2]], color: Color) {
+        self.fan(points, |_| [0.5, 0.5], [0.0, 0.0], color);
+    }
+
+    /// A convex polygon showing sheet cell `cell` (tinted by `color`), the
+    /// cell's top-left corner at world point `origin`, at [`ZOOM`]: so a
+    /// tile-sized square at a tile's corner shows the whole cell.
+    pub fn textured(&mut self, points: &[[f32; 2]], origin: [f32; 2], cell: Cell, color: Color) {
+        let base = [
+            (cell[0] as u32 * CELL) as f32,
+            (cell[1] as u32 * CELL) as f32,
+        ];
+        let uv = |p: [f32; 2]| {
+            [
+                base[0] + (p[0] - origin[0]) * ZOOM,
+                base[1] + (p[1] - origin[1]) * ZOOM,
+            ]
+        };
+        self.fan(points, uv, base, color);
+    }
+
+    /// Sheet cell `cell` as a square of [`crate::tileset::SPRITE_SIZE`]
+    /// centered on `center`, snapped to whole sheet pixels so it lines up
+    /// with the tiles' pixels.
+    pub fn sprite(&mut self, center: [f32; 2], cell: Cell, color: Color) {
+        let size = crate::tileset::SPRITE_SIZE;
+        let snap = |v: f32| (v * ZOOM).round() / ZOOM;
+        let [x0, y0] = [
+            snap(center[0] - size[0] / 2.0),
+            snap(center[1] - size[1] / 2.0),
+        ];
+        let [x1, y1] = [x0 + size[0], y0 + size[1]];
+        self.textured(
+            &[[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+            [x0, y0],
+            cell,
+            color,
+        );
+    }
+
+    fn fan(
+        &mut self,
+        points: &[[f32; 2]],
+        uv: impl Fn([f32; 2]) -> [f32; 2],
+        cell: [f32; 2],
+        color: Color,
+    ) {
         for i in 1..points.len().saturating_sub(1) {
             for pos in [points[0], points[i], points[i + 1]] {
-                self.vertices.push(Vertex { pos, color });
+                self.vertices.push(Vertex {
+                    pos,
+                    uv: uv(pos),
+                    cell,
+                    color,
+                });
             }
         }
     }
 
-    /// A convex polygon (clockwise on screen) with a 1-pixel bevel: `light`
+    /// A convex polygon (clockwise on screen) with a 1-unit bevel: `light`
     /// on edges facing up or left, `dark` on edges facing down or right.
+    #[cfg(test)]
     pub fn beveled(&mut self, points: &[[f32; 2]], fill: Color, light: Color, dark: Color) {
         let n = points.len();
         if n < 3 {
@@ -54,7 +115,7 @@ impl Canvas {
 
         let normal = |i: usize| inward_normal(points[i], points[(i + 1) % n]);
         let inset: Vec<[f32; 2]> = (0..n)
-            .map(|i| inset_corner(points[i], normal((i + n - 1) % n), normal(i)))
+            .map(|i| inset_corner(points[i], normal((i + n - 1) % n), normal(i), 1.0))
             .collect();
         for i in 0..n {
             let j = (i + 1) % n;
@@ -72,11 +133,12 @@ pub fn inward_normal(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
     [-e[1] / len, e[0] / len]
 }
 
-/// Corner `p` of an outline moved 1px inward, between edges with inward
-/// normals `before` and `after`, along the bisector, so 1px strips along
-/// the two edges meet exactly (at concave and sharp corners too).
-pub fn inset_corner(p: [f32; 2], before: [f32; 2], after: [f32; 2]) -> [f32; 2] {
-    let k = 1.0 / (1.0 + before[0] * after[0] + before[1] * after[1]);
+/// Corner `p` of an outline moved `width` inward, between edges with
+/// inward normals `before` and `after`, along the bisector, so strips that
+/// wide along the two edges meet exactly (at concave and sharp corners
+/// too).
+pub fn inset_corner(p: [f32; 2], before: [f32; 2], after: [f32; 2], width: f32) -> [f32; 2] {
+    let k = width / (1.0 + before[0] * after[0] + before[1] * after[1]);
     [
         p[0] + (before[0] + after[0]) * k,
         p[1] + (before[1] + after[1]) * k,
@@ -138,6 +200,54 @@ mod tests {
         );
         assert_eq!(color_at(&layer, [5.0, 5.0]), Some(RED), "fill");
         assert_eq!(color_at(&layer, [9.0, 9.0]), None, "cut off");
+    }
+
+    #[test]
+    fn sprites_center_on_whole_pixels_and_show_their_cell() {
+        let mut canvas = Canvas::default();
+        canvas.sprite([20.0, 30.0], [1, 3], RED);
+        let size = crate::tileset::SPRITE_SIZE;
+        let xs: Vec<f32> = canvas.vertices.iter().map(|v| v.pos[0]).collect();
+        let ys: Vec<f32> = canvas.vertices.iter().map(|v| v.pos[1]).collect();
+        let (x0, x1) = (
+            xs.iter().copied().fold(f32::MAX, f32::min),
+            xs.iter().copied().fold(f32::MIN, f32::max),
+        );
+        let (y0, y1) = (
+            ys.iter().copied().fold(f32::MAX, f32::min),
+            ys.iter().copied().fold(f32::MIN, f32::max),
+        );
+        assert!((x1 - x0 - size[0]).abs() < 1e-4 && (y1 - y0 - size[1]).abs() < 1e-4);
+        assert!(
+            ((x0 + x1) / 2.0 - 20.0).abs() <= 0.5 / ZOOM,
+            "centered, to a pixel"
+        );
+        assert!(((y0 + y1) / 2.0 - 30.0).abs() <= 0.5 / ZOOM);
+        for v in [x0, y0] {
+            assert!(
+                ((v * ZOOM) - (v * ZOOM).round()).abs() < 1e-3,
+                "{v} on a pixel"
+            );
+        }
+        // The square spans exactly the cell in the sheet.
+        for v in &canvas.vertices {
+            let [u, w] = v.uv;
+            let c = CELL as f32;
+            assert!(
+                (c..=2.0 * c).contains(&u) && (3.0 * c..=4.0 * c).contains(&w),
+                "{u} {w}"
+            );
+            assert_eq!(v.color, RED);
+        }
+        // Plain shapes show the white cell.
+        let mut plain = Canvas::default();
+        plain.rect([0.0, 0.0], [5.0, 5.0], RED);
+        assert!(
+            plain
+                .vertices
+                .iter()
+                .all(|v| v.uv[0] < CELL as f32 && v.uv[1] < CELL as f32)
+        );
     }
 
     #[test]

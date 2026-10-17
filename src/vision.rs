@@ -245,7 +245,7 @@ impl Vision {
                 if !self.in_shaft([x as i32, y as i32]) {
                     continue;
                 }
-                let Some(shape) = own.tile(x as i32, y as i32).shape(x, y) else {
+                let Some(shape) = own.solid(x as i32, y as i32).shape(x, y) else {
                     continue;
                 };
                 let n = shape.len() as f32;
@@ -571,7 +571,7 @@ impl Vision {
                     if !self.in_shaft([x as i32, y as i32]) {
                         continue;
                     }
-                    let Some(solid) = level.tile(x as i32, y as i32).shape(x, y) else {
+                    let Some(solid) = level.solid(x as i32, y as i32).shape(x, y) else {
                         continue;
                     };
                     let clipped = clip_convex(piece, &solid);
@@ -1018,9 +1018,9 @@ mod tests {
     fn deck_sight(below: &Layer, deck: &Layer) -> Layer {
         let tiles = (0..below.rows as i32)
             .flat_map(|y| (0..below.cols as i32).map(move |x| (x, y)))
-            .map(|(x, y)| below.tile(x, y).wall().union(deck.tile(x, y).wall()))
+            .map(|(x, y)| below.solid(x, y).union(deck.solid(x, y)))
             .collect();
-        Layer::from_tiles(below.cols, below.rows, tiles)
+        Layer::from_solids(below.cols, below.rows, tiles)
     }
 
     #[test]

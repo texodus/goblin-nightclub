@@ -12,6 +12,7 @@
     "scripts": {
         "build": "node scripts/build.mjs",
         "build:dev": "node scripts/build.mjs --dev",
+        "tiles": "node scripts/tiles.mjs",
         "dev": "node scripts/dev.mjs",
         "serve": "node scripts/dev.mjs --release",
         "test": "cargo test",

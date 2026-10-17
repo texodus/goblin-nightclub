@@ -9,6 +9,7 @@ use crate::draw::{Canvas, faces_light, inset_corner, inward_normal};
 use crate::palette;
 #[cfg(test)]
 use crate::rng::Rng;
+use crate::tileset;
 
 /// Tile edge length in pixels.
 pub const TILE: f32 = 10.0;
@@ -118,44 +119,84 @@ pub enum Dir {
     Down,
 }
 
+/// Index of a wall type in [`crate::tileset::WALLS`].
+pub type WallId = u8;
+/// Index of a floor type in [`crate::tileset::FLOORS`].
+pub type FloorId = u8;
+
+/// What a part of a tile is made of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tile {
-    /// Open floor.
-    Empty,
-    Full,
-    /// Solid in the right triangle at this corner, with the diagonal face
-    /// running between the two neighboring corners.
-    Slope(Corner),
+pub enum Part {
+    Wall(WallId),
+    Floor(FloorId),
     /// No floor: the layer below shows through.
     Void,
-    /// Open floor leading to the layer above or below.
-    Stairs(Dir),
 }
 
-impl Tile {
-    /// Just the solid part: open tiles (floor, void, stairs) become empty.
-    pub fn wall(self) -> Tile {
+/// The shape of some part of a tile: what rays, collision and outlines run
+/// on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Solid {
+    None,
+    Full,
+    /// The right triangle at this corner, with the diagonal face running
+    /// between the two neighboring corners.
+    Slope(Corner),
+}
+
+/// One grid cell: wholly one part, or split along a diagonal into two.
+/// Tiles are equal when made of the same parts in the same places (a
+/// split can be given from either corner).
+#[derive(Clone, Copy, Debug)]
+pub enum Tile {
+    Whole(Part),
+    /// `corner`'s half is `at`, the other half `rest`. Never the same part
+    /// on both sides (that's `Whole`).
+    Split {
+        corner: Corner,
+        at: Part,
+        rest: Part,
+    },
+    /// Floor leading to the layer above or below.
+    Stairs(Dir, FloorId),
+}
+
+/// The quarters of a tile, the triangles between its diagonals, as bits.
+const N: u8 = 1;
+const E: u8 = 2;
+const S: u8 = 4;
+const W: u8 = 8;
+/// The quarters in bit order.
+const QUARTERS: [u8; 4] = [N, E, S, W];
+
+impl Corner {
+    /// The quarters making up the half of a tile at this corner.
+    fn quarters(self) -> u8 {
         match self {
-            Tile::Full | Tile::Slope(_) => self,
-            _ => Tile::Empty,
+            Corner::NW => N | W,
+            Corner::NE => N | E,
+            Corner::SE => S | E,
+            Corner::SW => S | W,
         }
     }
+}
 
-    /// Does the solid part reach tile corner `c`, even just at a point?
+impl Solid {
+    /// Does it reach tile corner `c`, even just at a point?
     pub fn touches(self, c: Corner) -> bool {
         match self {
-            Tile::Empty | Tile::Void | Tile::Stairs(_) => false,
-            Tile::Full => true,
-            Tile::Slope(s) => c != s.opposite(),
+            Solid::None => false,
+            Solid::Full => true,
+            Solid::Slope(s) => c != s.opposite(),
         }
     }
 
-    /// Does the solid part cover the whole of side `side`?
+    /// Does it cover the whole of side `side`?
     pub fn covers(self, side: Side) -> bool {
         match self {
-            Tile::Empty | Tile::Void | Tile::Stairs(_) => false,
-            Tile::Full => true,
-            Tile::Slope(s) => s.sides().contains(&side),
+            Solid::None => false,
+            Solid::Full => true,
+            Solid::Slope(s) => s.sides().contains(&side),
         }
     }
 
@@ -171,63 +212,56 @@ impl Tile {
         }
     }
 
-    /// The tile as a set of quarters, the triangles between its diagonals:
-    /// a slope is two neighboring quarters, a full tile all four.
-    fn quarters(self) -> u8 {
-        const N: u8 = 1;
-        const E: u8 = 2;
-        const S: u8 = 4;
-        const W: u8 = 8;
+    /// As a set of quarters: a slope is two neighboring quarters, a full
+    /// tile all four.
+    pub fn quarters(self) -> u8 {
         match self {
-            Tile::Empty | Tile::Void | Tile::Stairs(_) => 0,
-            Tile::Full => N | E | S | W,
-            Tile::Slope(Corner::NW) => N | W,
-            Tile::Slope(Corner::NE) => N | E,
-            Tile::Slope(Corner::SE) => S | E,
-            Tile::Slope(Corner::SW) => S | W,
+            Solid::None => 0,
+            Solid::Full => N | E | S | W,
+            Solid::Slope(c) => c.quarters(),
         }
     }
 
-    /// The tile made of quarters `q`; any other combination becomes full
-    /// (`round_up`) or empty.
-    fn from_quarters(q: u8, round_up: bool) -> Tile {
+    /// The shape made of quarters `q`; any other combination becomes full
+    /// (`round_up`) or none.
+    pub fn from_quarters(q: u8, round_up: bool) -> Solid {
         [
-            Tile::Empty,
-            Tile::Full,
-            Tile::Slope(Corner::NW),
-            Tile::Slope(Corner::NE),
-            Tile::Slope(Corner::SE),
-            Tile::Slope(Corner::SW),
+            Solid::None,
+            Solid::Full,
+            Solid::Slope(Corner::NW),
+            Solid::Slope(Corner::NE),
+            Solid::Slope(Corner::SE),
+            Solid::Slope(Corner::SW),
         ]
         .into_iter()
         .find(|t| t.quarters() == q)
-        .unwrap_or(if round_up { Tile::Full } else { Tile::Empty })
+        .unwrap_or(if round_up { Solid::Full } else { Solid::None })
     }
 
-    /// Solid wherever either is, for stamping. A result no tile can
-    /// represent (two slopes at neighboring corners) becomes full, which
-    /// keeps stamping order-independent.
-    pub fn union(self, other: Tile) -> Tile {
-        Tile::from_quarters(self.quarters() | other.quarters(), true)
+    /// Wherever either is. A result no shape can represent (two slopes at
+    /// neighboring corners) becomes full, which keeps unions
+    /// order-independent.
+    pub fn union(self, other: Solid) -> Solid {
+        Solid::from_quarters(self.quarters() | other.quarters(), true)
     }
 
-    /// Solid where `self` is and `other` isn't, for carving: cutting a
-    /// slope out of a full tile leaves the opposite slope. A result no tile
-    /// can represent becomes empty.
-    pub fn carve(self, other: Tile) -> Tile {
-        Tile::from_quarters(self.quarters() & !other.quarters(), false)
+    /// Where `self` is and `other` isn't: cutting a slope out of a full
+    /// tile leaves the opposite slope. A result no shape can represent
+    /// becomes none.
+    pub fn carve(self, other: Solid) -> Solid {
+        Solid::from_quarters(self.quarters() & !other.quarters(), false)
     }
 
-    /// The solid part of tile `(x, y)` as a convex shape in pixels.
+    /// This shape in tile `(x, y)` as a convex polygon in pixels.
     pub fn shape(self, x: usize, y: usize) -> Option<Shape> {
         let point = |c: Corner| {
             let [dx, dy] = c.offset();
             [(x as i32 + dx) as f32 * TILE, (y as i32 + dy) as f32 * TILE]
         };
         match self {
-            Tile::Empty | Tile::Void | Tile::Stairs(_) => None,
-            Tile::Full => Some(Corner::CLOCKWISE.map(point).to_vec()),
-            Tile::Slope(s) => Some(
+            Solid::None => None,
+            Solid::Full => Some(Corner::CLOCKWISE.map(point).to_vec()),
+            Solid::Slope(s) => Some(
                 Corner::CLOCKWISE
                     .into_iter()
                     .filter(|c| *c != s.opposite())
@@ -236,6 +270,207 @@ impl Tile {
             ),
         }
     }
+}
+
+impl PartialEq for Tile {
+    fn eq(&self, other: &Tile) -> bool {
+        self.stairs() == other.stairs() && self.parts() == other.parts()
+    }
+}
+
+impl Eq for Tile {}
+
+impl Tile {
+    /// Plain floor, wall and void, of the first type of each.
+    pub const FLOOR: Tile = Tile::Whole(Part::Floor(0));
+    pub const WALL: Tile = Tile::Whole(Part::Wall(0));
+    pub const VOID: Tile = Tile::Whole(Part::Void);
+
+    /// Wall in `corner`'s half, floor in the rest.
+    pub fn slope(corner: Corner) -> Tile {
+        Tile::split(corner, Part::Wall(0), Part::Floor(0))
+    }
+
+    /// `at` in `corner`'s half and `rest` in the other, or wholly one part
+    /// if they're the same.
+    pub fn split(corner: Corner, at: Part, rest: Part) -> Tile {
+        if at == rest {
+            Tile::Whole(at)
+        } else {
+            Tile::Split { corner, at, rest }
+        }
+    }
+
+    /// The default tile with shape `solid`: wall there, floor elsewhere.
+    pub fn from_solid(solid: Solid) -> Tile {
+        match solid {
+            Solid::None => Tile::FLOOR,
+            Solid::Full => Tile::WALL,
+            Solid::Slope(c) => Tile::slope(c),
+        }
+    }
+
+    /// The part in each quarter, in `N E S W` order. Stairs are floor.
+    fn parts(self) -> [Part; 4] {
+        match self {
+            Tile::Whole(p) => [p; 4],
+            Tile::Stairs(_, f) => [Part::Floor(f); 4],
+            Tile::Split { corner, at, rest } => {
+                QUARTERS.map(|q| if corner.quarters() & q != 0 { at } else { rest })
+            }
+        }
+    }
+
+    /// The tile with these quarters, if one can have them.
+    fn from_parts(parts: [Part; 4]) -> Option<Tile> {
+        if parts.iter().all(|p| *p == parts[0]) {
+            return Some(Tile::Whole(parts[0]));
+        }
+        Corner::CLOCKWISE.into_iter().find_map(|c| {
+            let at = |q: usize| c.quarters() & QUARTERS[q] != 0;
+            let first = |inside: bool| (0..4).find(|&q| at(q) == inside).map(|q| parts[q]);
+            let (a, b) = (first(true)?, first(false)?);
+            (0..4)
+                .all(|q| parts[q] == if at(q) { a } else { b })
+                .then(|| Tile::split(c, a, b))
+        })
+    }
+
+    /// The quarters where `f` holds of the part.
+    fn quarters_where(self, f: impl Fn(Part) -> bool) -> u8 {
+        let parts = self.parts();
+        (0..4)
+            .filter(|&q| f(parts[q]))
+            .fold(0, |m, q| m | QUARTERS[q])
+    }
+
+    /// Where it's wall.
+    pub fn wall(self) -> Solid {
+        Solid::from_quarters(self.quarters_where(|p| matches!(p, Part::Wall(_))), true)
+    }
+
+    /// Where it's void, open to the layer below.
+    pub fn void(self) -> Solid {
+        Solid::from_quarters(self.quarters_where(|p| p == Part::Void), true)
+    }
+
+    /// The quarters that are void, as bits.
+    pub fn void_quarters(self) -> u8 {
+        self.quarters_where(|p| p == Part::Void)
+    }
+
+    /// Its wall type, if any of it is wall.
+    pub fn wall_id(self) -> Option<WallId> {
+        self.parts().into_iter().find_map(|p| match p {
+            Part::Wall(w) => Some(w),
+            _ => None,
+        })
+    }
+
+    /// Its floor type, if any of it is floor.
+    pub fn floor_id(self) -> Option<FloorId> {
+        self.parts().into_iter().find_map(|p| match p {
+            Part::Floor(f) => Some(f),
+            _ => None,
+        })
+    }
+
+    /// The same tile with its wall, if any, of type `wall`.
+    pub fn with_wall(self, wall: WallId) -> Tile {
+        let parts = self.parts().map(|p| match p {
+            Part::Wall(_) => Part::Wall(wall),
+            p => p,
+        });
+        match self {
+            Tile::Stairs(..) => self,
+            _ => Tile::from_parts(parts).unwrap_or(self),
+        }
+    }
+
+    /// Wholly floor (not stairs), of any type.
+    pub fn is_floor(self) -> bool {
+        matches!(self, Tile::Whole(Part::Floor(_)))
+    }
+
+    pub fn stairs(self) -> Option<Dir> {
+        match self {
+            Tile::Stairs(d, _) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The tile with `piece`'s walls stamped on: wherever `piece` is wall,
+    /// that wall; elsewhere unchanged (so a slope stamped over void keeps
+    /// the void beside it). A result no tile can have becomes wholly
+    /// `piece`'s wall, as solid shapes round up.
+    pub fn stamp(self, piece: Tile) -> Tile {
+        let (mine, theirs) = (self.parts(), piece.parts());
+        let Some(wall) = theirs.iter().copied().find(|p| matches!(p, Part::Wall(_))) else {
+            return self;
+        };
+        let parts = [0, 1, 2, 3].map(|q| match theirs[q] {
+            Part::Wall(_) => theirs[q],
+            _ => mine[q],
+        });
+        Tile::from_parts(parts).unwrap_or(Tile::Whole(wall))
+    }
+
+    /// The tile with `cut` replaced by `with` (floor or void). A result no
+    /// tile can have becomes wholly `with`.
+    pub fn carve(self, cut: Solid, with: Part) -> Tile {
+        if cut == Solid::None {
+            return self;
+        }
+        let mine = self.parts();
+        let parts = [0, 1, 2, 3].map(|q| {
+            if cut.quarters() & QUARTERS[q] != 0 {
+                with
+            } else {
+                mine[q]
+            }
+        });
+        Tile::from_parts(parts).unwrap_or(Tile::Whole(with))
+    }
+
+    /// The part each half of the tile is, for drawing: the half at
+    /// `corner` and the rest, or the whole tile.
+    pub fn halves(self) -> Halves {
+        match self {
+            Tile::Whole(p) => Halves::Whole(p),
+            Tile::Stairs(_, f) => Halves::Whole(Part::Floor(f)),
+            Tile::Split { corner, at, rest } => Halves::Split(corner, at, rest),
+        }
+    }
+}
+
+/// Quarters `q` (bits) of tile `(x, y)` as convex polygons in pixels: one
+/// if they make a whole or half tile, else a triangle each.
+pub fn quarter_shapes(x: usize, y: usize, q: u8) -> Vec<Shape> {
+    let solid = Solid::from_quarters(q, false);
+    if solid.quarters() == q {
+        return solid.shape(x, y).into_iter().collect();
+    }
+    let point = |c: Corner| {
+        let [dx, dy] = c.offset();
+        [(x as i32 + dx) as f32 * TILE, (y as i32 + dy) as f32 * TILE]
+    };
+    let center = [(x as f32 + 0.5) * TILE, (y as f32 + 0.5) * TILE];
+    [
+        (N, Corner::NW, Corner::NE),
+        (E, Corner::NE, Corner::SE),
+        (S, Corner::SE, Corner::SW),
+        (W, Corner::SW, Corner::NW),
+    ]
+    .into_iter()
+    .filter(|(bit, _, _)| q & bit != 0)
+    .map(|(_, a, b)| vec![point(a), point(b), center])
+    .collect()
+}
+
+/// How a tile divides into parts, for drawing.
+pub enum Halves {
+    Whole(Part),
+    Split(Corner, Part, Part),
 }
 
 /// Tolerance for slope solidity (tile-local units), matching `raycast`'s
@@ -325,6 +560,8 @@ pub struct Layer {
     pub cols: usize,
     pub rows: usize,
     tiles: Vec<Tile>,
+    /// Where each tile is wall: all the geometry runs on these.
+    solids: Vec<Solid>,
     corners: Vec<[f32; 2]>,
     edges: Vec<Edge>,
     edges_by_line: std::collections::HashMap<Line, Vec<usize>>,
@@ -349,10 +586,12 @@ impl Layer {
     /// A level from its tiles, row by row.
     pub fn from_tiles(cols: usize, rows: usize, tiles: Vec<Tile>) -> Self {
         assert_eq!(tiles.len(), cols * rows);
+        let solids = tiles.iter().map(|t| t.wall()).collect();
         let mut level = Self {
             cols,
             rows,
             tiles,
+            solids,
             corners: Vec::new(),
             edges: Vec::new(),
             edges_by_line: Default::default(),
@@ -371,25 +610,46 @@ impl Layer {
         level
     }
 
-    /// Build a layer from rows of `.` (floor), `#` (solid), `◸ ◹ ◺ ◿`
-    /// (slopes solid in that corner), `~` (void) and `<` `>` (stairs up and
-    /// down), for tests.
+    /// A layer of default tiles with shapes `solids`, row by row: wall
+    /// where solid, floor elsewhere.
+    pub fn from_solids(cols: usize, rows: usize, solids: Vec<Solid>) -> Self {
+        Self::from_tiles(
+            cols,
+            rows,
+            solids.into_iter().map(Tile::from_solid).collect(),
+        )
+    }
+
+    /// Build a layer from rows of `.` (floor), `#` (wall), `◸ ◹ ◺ ◿`
+    /// (wall in that corner, floor in the rest), `◤ ◥ ◣ ◢` (wall in that
+    /// corner over void), `▛ ▜ ▙ ▟` (floor in that corner, void in the
+    /// rest), `~` (void) and `<` `>` (stairs up and down), for tests.
     #[cfg(test)]
     pub fn from_ascii(rows: &[&str]) -> Self {
+        use Corner::*;
         let cols = rows[0].chars().count();
+        let (wall, floor) = (Part::Wall(0), Part::Floor(0));
         let tiles = rows
             .iter()
             .flat_map(|r| r.chars())
             .map(|c| match c {
-                '.' => Tile::Empty,
-                '~' => Tile::Void,
-                '<' => Tile::Stairs(Dir::Up),
-                '>' => Tile::Stairs(Dir::Down),
-                '#' => Tile::Full,
-                '◸' => Tile::Slope(Corner::NW),
-                '◹' => Tile::Slope(Corner::NE),
-                '◺' => Tile::Slope(Corner::SW),
-                '◿' => Tile::Slope(Corner::SE),
+                '.' => Tile::FLOOR,
+                '~' => Tile::VOID,
+                '<' => Tile::Stairs(Dir::Up, 0),
+                '>' => Tile::Stairs(Dir::Down, 0),
+                '#' => Tile::WALL,
+                '◸' => Tile::slope(NW),
+                '◹' => Tile::slope(NE),
+                '◺' => Tile::slope(SW),
+                '◿' => Tile::slope(SE),
+                '◤' => Tile::split(NW, wall, Part::Void),
+                '◥' => Tile::split(NE, wall, Part::Void),
+                '◣' => Tile::split(SW, wall, Part::Void),
+                '◢' => Tile::split(SE, wall, Part::Void),
+                '▛' => Tile::split(NW, floor, Part::Void),
+                '▜' => Tile::split(NE, floor, Part::Void),
+                '▙' => Tile::split(SW, floor, Part::Void),
+                '▟' => Tile::split(SE, floor, Part::Void),
                 _ => panic!("unknown tile {c:?}"),
             })
             .collect();
@@ -403,26 +663,34 @@ impl Layer {
         let mut rng = Rng::new(seed);
         let tiles = (0..cols * rows)
             .map(|_| match rng.unit() {
-                r if r < 0.10 => Tile::Full,
-                r if r < 0.30 => Tile::Slope(Corner::CLOCKWISE[rng.range(0, 3)]),
-                _ => Tile::Empty,
+                r if r < 0.10 => Solid::Full,
+                r if r < 0.30 => Solid::Slope(Corner::CLOCKWISE[rng.range(0, 3)]),
+                _ => Solid::None,
             })
             .collect();
-        Self::from_tiles(cols, rows, tiles)
+        Self::from_solids(cols, rows, tiles)
     }
 
-    /// The tile at `(x, y)`. Out-of-bounds tiles are `Full`, so the level
+    /// The tile at `(x, y)`. Out-of-bounds tiles are wall, so the level
     /// edge is a wall.
     pub fn tile(&self, x: i32, y: i32) -> Tile {
-        if x < 0 || y < 0 || x >= self.cols as i32 || y >= self.rows as i32 {
-            return Tile::Full;
+        if !self.in_bounds([x, y]) {
+            return Tile::WALL;
         }
         self.tiles[y as usize * self.cols + x as usize]
     }
 
+    /// Where tile `(x, y)` is wall; out of bounds, all of it.
+    pub fn solid(&self, x: i32, y: i32) -> Solid {
+        if !self.in_bounds([x, y]) {
+            return Solid::Full;
+        }
+        self.solids[y as usize * self.cols + x as usize]
+    }
+
     /// Is tile `(x, y)` entirely free of solid?
     pub fn is_open(&self, x: i32, y: i32) -> bool {
-        self.tile(x, y).wall() == Tile::Empty
+        self.solid(x, y) == Solid::None
     }
 
     /// Distance from `from` along unit vector `dir` to the first solid
@@ -532,7 +800,7 @@ impl Layer {
         } else {
             (Side::E, Side::W)
         };
-        let tile = |t: [i32; 2]| self.tile(t[0], t[1]);
+        let tile = |t: [i32; 2]| self.solid(t[0], t[1]);
 
         let mut t: f32 = 0.0;
         loop {
@@ -571,11 +839,11 @@ impl Layer {
         t0: f32,
         t1: f32,
     ) -> Option<f32> {
-        match self.tile(tile[0], tile[1]) {
-            Tile::Empty | Tile::Void | Tile::Stairs(_) => None,
-            Tile::Full => Some(t0),
-            Tile::Slope(c) => {
-                let (k, g) = Tile::slope_plane(c);
+        match self.solid(tile[0], tile[1]) {
+            Solid::None => None,
+            Solid::Full => Some(t0),
+            Solid::Slope(c) => {
+                let (k, g) = Solid::slope_plane(c);
                 // Entry point in tile-local units, kept small for precision.
                 let u = (from[0] + dir[0] * t0) / TILE - tile[0] as f32;
                 let v = (from[1] + dir[1] * t0) / TILE - tile[1] as f32;
@@ -612,7 +880,7 @@ impl Layer {
 
     /// Does tile `t` reach grid vertex `vertex` (in tile units)?
     fn touches_vertex(&self, t: [i32; 2], vertex: [i32; 2]) -> bool {
-        self.tile(t[0], t[1])
+        self.solid(t[0], t[1])
             .touches(Corner::at([vertex[0] - t[0], vertex[1] - t[1]]))
     }
 
@@ -640,10 +908,10 @@ impl Layer {
         let mut out = Vec::new();
         for gy in 0..=self.rows as i32 {
             for gx in 0..=self.cols as i32 {
-                let nw = self.tile(gx - 1, gy - 1);
-                let ne = self.tile(gx, gy - 1);
-                let sw = self.tile(gx - 1, gy);
-                let se = self.tile(gx, gy);
+                let nw = self.solid(gx - 1, gy - 1);
+                let ne = self.solid(gx, gy - 1);
+                let sw = self.solid(gx - 1, gy);
+                let se = self.solid(gx, gy);
 
                 // An axis edge is outline where exactly one side covers it.
                 let mut dirs: Vec<[i32; 2]> = [
@@ -663,7 +931,7 @@ impl Layer {
                     (sw, [-1, 1], Corner::NE),
                     (se, [1, 1], Corner::NW),
                 ] {
-                    if let Tile::Slope(s) = tile
+                    if let Solid::Slope(s) = tile
                         && at != s
                         && at != s.opposite()
                     {
@@ -692,11 +960,11 @@ impl Layer {
         let mut out = Vec::new();
         for y in 0..=self.rows as i32 {
             for x in 0..=self.cols as i32 {
-                let here = self.tile(x, y);
+                let here = self.solid(x, y);
                 // Top and left sides of each position (covering the bottom
                 // and right of the level via the extra row and column),
                 // oriented with the solid side on the right.
-                let (above, left) = (self.tile(x, y - 1), self.tile(x - 1, y));
+                let (above, left) = (self.solid(x, y - 1), self.solid(x - 1, y));
                 match (here.covers(Side::N), above.covers(Side::S)) {
                     (true, false) => out.push(Edge {
                         a: px(x, y),
@@ -723,7 +991,7 @@ impl Layer {
                     }),
                     _ => {}
                 }
-                if let Tile::Slope(c) = here
+                if let Solid::Slope(c) = here
                     && x < self.cols as i32
                     && y < self.rows as i32
                 {
@@ -875,7 +1143,7 @@ impl Layer {
     pub fn sight_samples(&self, x: i32, y: i32) -> Vec<[f32; 2]> {
         const INSET: f32 = 0.5;
         const ALONG: [f32; 3] = [0.1, 0.5, 0.9];
-        let tile = self.tile(x, y);
+        let tile = self.solid(x, y);
         let corner = |c: Corner| {
             let [dx, dy] = c.offset();
             [(x + dx) as f32 * TILE, (y + dy) as f32 * TILE]
@@ -883,9 +1151,9 @@ impl Layer {
         let mut out = Vec::new();
 
         let open: Vec<[f32; 2]> = match tile {
-            Tile::Empty | Tile::Void | Tile::Stairs(_) => Corner::CLOCKWISE.map(corner).to_vec(),
-            Tile::Full => Vec::new(),
-            Tile::Slope(c) => Corner::CLOCKWISE
+            Solid::None => Corner::CLOCKWISE.map(corner).to_vec(),
+            Solid::Full => Vec::new(),
+            Solid::Slope(c) => Corner::CLOCKWISE
                 .into_iter()
                 .filter(|k| *k != c)
                 .map(corner)
@@ -908,11 +1176,11 @@ impl Layer {
             .into_iter()
             .filter(|side| {
                 let [dx, dy] = side.offset();
-                tile.covers(*side) && !self.tile(x + dx, y + dy).covers(side.opposite())
+                tile.covers(*side) && !self.solid(x + dx, y + dy).covers(side.opposite())
             })
             .map(Side::ends)
             .collect();
-        if let Tile::Slope(c) = tile {
+        if let Solid::Slope(c) = tile {
             faces.push(c.face_ends());
         }
         for [a, b] in faces.into_iter().map(|f| f.map(corner)) {
@@ -937,16 +1205,16 @@ impl Layer {
     }
 
     fn box_hits_tile(&self, tile: [i32; 2], pos: [f32; 2], size: [f32; 2]) -> bool {
-        match self.tile(tile[0], tile[1]) {
-            Tile::Empty | Tile::Void | Tile::Stairs(_) => false,
-            Tile::Full => true,
-            Tile::Slope(c) => {
+        match self.solid(tile[0], tile[1]) {
+            Solid::None => false,
+            Solid::Full => true,
+            Solid::Slope(c) => {
                 // The box clipped to the tile, in tile-local units; solidity
                 // is linear, so its maximum is at one of the box's corners.
                 let local = |p: f32, a: usize| (p / TILE - tile[a] as f32).clamp(0.0, 1.0);
                 let (u0, u1) = (local(pos[0], 0), local(pos[0] + size[0], 0));
                 let (v0, v1) = (local(pos[1], 1), local(pos[1] + size[1], 1));
-                let (k, g) = Tile::slope_plane(c);
+                let (k, g) = Solid::slope_plane(c);
                 let u = if g[0] > 0.0 { u1 } else { u0 };
                 let v = if g[1] > 0.0 { v1 } else { v0 };
                 k + g[0] * u + g[1] * v > COLLIDE_EPS / TILE
@@ -1000,7 +1268,7 @@ impl Layer {
     /// a box sliding along a wall built of many tiles isn't snagged sideways
     /// at the seams between them. `None` if they don't overlap.
     fn tile_push(&self, t: [i32; 2], pos: [f32; 2], size: [f32; 2]) -> Option<([f32; 2], f32)> {
-        let tile = self.tile(t[0], t[1]);
+        let tile = self.solid(t[0], t[1]);
         let shape = tile.shape(0, 0)?;
         let origin = [t[0] as f32 * TILE, t[1] as f32 * TILE];
         let shape: Vec<[f32; 2]> = shape
@@ -1024,16 +1292,16 @@ impl Layer {
 
         // (direction, whether the face that way is exposed: the neighbor
         // there doesn't cover the side facing this tile).
-        let exposed = |dx: i32, dy: i32, side: Side| !self.tile(t[0] + dx, t[1] + dy).covers(side);
+        let exposed = |dx: i32, dy: i32, side: Side| !self.solid(t[0] + dx, t[1] + dy).covers(side);
         let mut pushes = vec![
             ([1.0, 0.0], exposed(1, 0, Side::W)),
             ([-1.0, 0.0], exposed(-1, 0, Side::E)),
             ([0.0, 1.0], exposed(0, 1, Side::N)),
             ([0.0, -1.0], exposed(0, -1, Side::S)),
         ];
-        if let Tile::Slope(c) = tile {
+        if let Solid::Slope(c) = tile {
             // Away from the solid corner; the face always borders open space.
-            let (_, g) = Tile::slope_plane(c);
+            let (_, g) = Solid::slope_plane(c);
             let r = std::f32::consts::FRAC_1_SQRT_2;
             pushes.push(([-g[0] * r, -g[1] * r], true));
         }
@@ -1058,37 +1326,44 @@ impl Layer {
         best.or(fallback)
     }
 
-    /// Draw the floor, its grid, each tile's solid part, and a 1px bevel
-    /// along the outline edges `bevel(edge index)` picks: yellow on faces
-    /// facing up or left, dark red on faces facing down or right. Strips
-    /// along each loop are mitered at its corners so they meet exactly.
-    pub fn draw(&self, canvas: &mut Canvas, bevel: impl Fn(usize) -> bool) {
-        let w = self.cols as f32 * TILE;
-        let h = self.rows as f32 * TILE;
-        canvas.rect([0.0, 0.0], [w, h], palette::BLACK);
-        for x in 0..self.cols {
-            canvas.rect([x as f32 * TILE, 0.0], [1.0, h], palette::BLUE);
-        }
-        for y in 0..self.rows {
-            canvas.rect([0.0, y as f32 * TILE], [w, 1.0], palette::BLUE);
-        }
+    /// Draw each tile's art from the tile sheet (each part's floor or
+    /// wall, nothing where void, stairs over the whole tile), and a bevel
+    /// `width` wide along the outline edges `bevel(edge index)` picks: the
+    /// wall's light color on faces facing up or left, its dark color on
+    /// faces facing down or right. Strips along each loop are mitered at
+    /// its corners so they meet exactly.
+    pub fn draw(&self, canvas: &mut Canvas, bevel: impl Fn(usize) -> bool, width: f32) {
         for (i, tile) in self.tiles.iter().enumerate() {
             let (x, y) = (i % self.cols, i / self.cols);
-            if let Some(shape) = tile.shape(x, y) {
-                canvas.poly(&shape, palette::BROWN);
-            }
-            // Stairs: three treads, light going up, dark going down.
-            if let Tile::Stairs(dir) = tile {
-                let color = match dir {
-                    Dir::Up => palette::LIGHT_GRAY,
-                    Dir::Down => palette::DARK_GRAY,
+            let origin = [x as f32 * TILE, y as f32 * TILE];
+            let mut part = |shape: Option<Shape>, part: Part| {
+                let cell = match part {
+                    Part::Floor(f) => tileset::variant(tileset::FLOORS[f as usize].cells, x, y),
+                    Part::Wall(w) => tileset::variant(tileset::WALLS[w as usize].cells, x, y),
+                    Part::Void => return,
                 };
-                for k in 0..3 {
-                    let pos = [
-                        x as f32 * TILE + 2.0,
-                        y as f32 * TILE + 2.0 + 3.0 * k as f32,
-                    ];
-                    canvas.rect(pos, [TILE - 3.0, 1.0], color);
+                if let Some(shape) = shape {
+                    canvas.textured(&shape, origin, cell, palette::WHITE);
+                }
+            };
+            if let Some(dir) = tile.stairs() {
+                let cell = match dir {
+                    Dir::Up => tileset::STAIRS_UP,
+                    Dir::Down => tileset::STAIRS_DOWN,
+                };
+                canvas.textured(
+                    &Solid::Full.shape(x, y).unwrap(),
+                    origin,
+                    cell,
+                    palette::WHITE,
+                );
+                continue;
+            }
+            match tile.halves() {
+                Halves::Whole(p) => part(Solid::Full.shape(x, y), p),
+                Halves::Split(c, at, rest) => {
+                    part(Solid::Slope(c).shape(x, y), at);
+                    part(Solid::Slope(c.opposite()).shape(x, y), rest);
                 }
             }
         }
@@ -1099,17 +1374,13 @@ impl Layer {
                 .map(|k| inward_normal(o.points[k], o.points[(k + 1) % n]))
                 .collect();
             let inset: Vec<[f32; 2]> = (0..n)
-                .map(|k| inset_corner(o.points[k], normals[(k + n - 1) % n], normals[k]))
+                .map(|k| inset_corner(o.points[k], normals[(k + n - 1) % n], normals[k], width))
                 .collect();
             for (k, run) in o.runs.iter().enumerate() {
-                let normal = normals[k];
-                let color = if faces_light(normal) {
-                    palette::YELLOW
-                } else {
-                    palette::RED
-                };
+                let normal = [normals[k][0] * width, normals[k][1] * width];
+                let lit = faces_light(normals[k]);
                 let (start, end) = (o.points[k], o.points[(k + 1) % n]);
-                // Inside a run the strip edge is just 1px in; at the run's
+                // Inside a run the strip edge is just `width` in; at the run's
                 // ends it's the mitered corner.
                 let inner = |p: [f32; 2], corner: [f32; 2], mitered: [f32; 2]| {
                     if p == corner {
@@ -1121,6 +1392,9 @@ impl Layer {
                 for &i in run {
                     let e = self.edges[i];
                     if bevel(i) && self.in_bounds(e.solid) {
+                        let wall = self.tile(e.solid[0], e.solid[1]).wall_id().unwrap_or(0);
+                        let wall = &tileset::WALLS[wall as usize];
+                        let color = if lit { wall.light } else { wall.dark };
                         let a = inner(e.a, start, inset[k]);
                         let b = inner(e.b, end, inset[(k + 1) % n]);
                         canvas.poly(&[e.a, e.b, b, a], color);
@@ -1318,10 +1592,10 @@ mod tests {
     }
 
     fn level_with(x: i32, y: i32, w: i32, h: i32) -> Layer {
-        let mut tiles = vec![Tile::Empty; 100];
+        let mut tiles = vec![Tile::FLOOR; 100];
         for ty in y..y + h {
             for tx in x..x + w {
-                tiles[(ty * 10 + tx) as usize] = Tile::Full;
+                tiles[(ty * 10 + tx) as usize] = Tile::WALL;
             }
         }
         Layer::from_tiles(10, 10, tiles)
@@ -1584,9 +1858,9 @@ mod tests {
     /// bevel strips.
     fn bevel_area(level: &Layer, bevel: impl Fn(usize) -> bool) -> f32 {
         let mut base = Canvas::default();
-        level.draw(&mut base, |_| false);
+        level.draw(&mut base, |_| false, 1.0);
         let mut canvas = Canvas::default();
-        level.draw(&mut canvas, bevel);
+        level.draw(&mut canvas, bevel, 1.0);
         canvas.vertices[base.vertices.len()..]
             .chunks(3)
             .map(|t| {
@@ -1633,7 +1907,7 @@ mod tests {
     #[test]
     fn union_and_carve() {
         use Corner::*;
-        use Tile::*;
+        use Solid::*;
         assert_eq!(Slope(NW).union(Slope(SE)), Full, "opposite slopes fill");
         assert_eq!(Slope(NW).union(Slope(NW)), Slope(NW));
         assert_eq!(
@@ -1641,7 +1915,7 @@ mod tests {
             Full,
             "unrepresentable rounds up"
         );
-        assert_eq!(Empty.union(Slope(SW)), Slope(SW));
+        assert_eq!(None.union(Slope(SW)), Slope(SW));
         assert_eq!(
             Full.carve(Slope(NW)),
             Slope(SE),
@@ -1649,22 +1923,93 @@ mod tests {
         );
         assert_eq!(
             Slope(NW).carve(Slope(NE)),
-            Empty,
+            None,
             "unrepresentable rounds down"
         );
         assert_eq!(Slope(NW).carve(Slope(SE)), Slope(NW));
-        assert_eq!(Full.carve(Full), Empty);
+        assert_eq!(Full.carve(Full), None);
+    }
+
+    #[test]
+    fn stamping_and_carving_keep_materials() {
+        use Corner::*;
+        let (brick, stone) = (Part::Wall(1), Part::Wall(2));
+        let (planks, dirt) = (Part::Floor(1), Part::Floor(2));
+        let slope = Tile::split(NW, brick, planks);
+        // The stamped wall where the piece is wall; what was there before
+        // elsewhere, void included. The piece's floor doesn't matter.
+        assert_eq!(Tile::VOID.stamp(slope), Tile::split(NW, brick, Part::Void));
+        assert_eq!(Tile::Whole(dirt).stamp(slope), Tile::split(NW, brick, dirt));
+        let filled = Tile::split(SE, stone, dirt).stamp(slope);
+        assert_eq!(filled, Tile::split(NW, brick, stone));
+        assert_eq!(filled.wall(), Solid::Full);
+        // Halves no tile can have round up to the stamped wall.
+        assert_eq!(
+            Tile::split(NE, stone, dirt).stamp(slope),
+            Tile::Whole(brick)
+        );
+        assert_eq!(Tile::Whole(dirt).stamp(Tile::VOID), Tile::Whole(dirt));
+        assert_eq!(
+            Tile::Stairs(Dir::Up, 1).stamp(Tile::VOID),
+            Tile::Stairs(Dir::Up, 1)
+        );
+
+        assert_eq!(
+            Tile::Whole(brick).carve(Solid::Slope(NW), planks),
+            Tile::split(SE, brick, planks)
+        );
+        assert_eq!(
+            Tile::split(NW, brick, Part::Void).carve(Solid::Slope(NW), planks),
+            Tile::split(NW, planks, Part::Void)
+        );
+        assert_eq!(
+            Tile::Whole(brick).carve(Solid::Full, Part::Void),
+            Tile::VOID
+        );
+        assert_eq!(Tile::split(NE, dirt, dirt), Tile::Whole(dirt), "normalized");
+    }
+
+    #[test]
+    fn tiles_have_wall_and_void_shapes() {
+        use Corner::*;
+        let t = Tile::split(NW, Part::Wall(0), Part::Void);
+        assert_eq!((t.wall(), t.void()), (Solid::Slope(NW), Solid::Slope(SE)));
+        let t = Tile::split(SW, Part::Floor(0), Part::Void);
+        assert_eq!((t.wall(), t.void()), (Solid::None, Solid::Slope(NE)));
+        assert_eq!(Tile::Stairs(Dir::Up, 0).void(), Solid::None);
+        let l = Layer::from_ascii(&["◤▟◿"]);
+        assert_eq!(l.solid(0, 0), Solid::Slope(NW));
+        assert!(l.is_open(1, 0), "floor and void, no wall");
+        assert_eq!(l.solid(2, 0), Solid::Slope(SE));
+    }
+
+    #[test]
+    fn quarter_shapes_cover_their_quarters() {
+        let area = |q: u8| -> f32 {
+            quarter_shapes(1, 1, q)
+                .iter()
+                .map(|s| area2(s).abs() / 2.0)
+                .sum()
+        };
+        assert_eq!(quarter_shapes(1, 1, N | E | S | W).len(), 1);
+        assert_eq!(quarter_shapes(1, 1, S | E).len(), 1, "a half is one shape");
+        assert!((area(N | E | S | W) - 100.0).abs() < 1e-3);
+        assert!((area(S | E) - 50.0).abs() < 1e-3);
+        assert!((area(N) - 25.0).abs() < 1e-3);
+        assert!((area(N | S) - 50.0).abs() < 1e-3);
+        assert!((area(N | E | S) - 75.0).abs() < 1e-3);
+        assert!(quarter_shapes(1, 1, 0).is_empty());
     }
 
     #[test]
     fn stamping_is_order_independent() {
         let all = [
-            Tile::Empty,
-            Tile::Full,
-            Tile::Slope(Corner::NW),
-            Tile::Slope(Corner::NE),
-            Tile::Slope(Corner::SE),
-            Tile::Slope(Corner::SW),
+            Solid::None,
+            Solid::Full,
+            Solid::Slope(Corner::NW),
+            Solid::Slope(Corner::NE),
+            Solid::Slope(Corner::SE),
+            Solid::Slope(Corner::SW),
         ];
         for a in all {
             for b in all {
