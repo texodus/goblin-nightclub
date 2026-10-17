@@ -117,12 +117,18 @@ pub fn sample_points(pos: [f32; 2], size: [f32; 2]) -> [[f32; 2]; 5] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Style;
 
     #[test]
     fn npcs_spawn_clear_and_never_enter_walls() {
         for seed in 0..20 {
             let spawn = [165.0, 105.0];
-            let level = Level::generate(seed, 32, 20, spawn);
+            let style = if seed % 2 == 0 {
+                Style::World
+            } else {
+                Style::Cave
+            };
+            let level = Level::generate(style, seed, 32, 20, spawn);
             let mut rng = Rng::new(seed ^ 0x9E37_79B9);
             let mut npcs = Entity::spawn_npcs(&level, &mut rng, 4, spawn, 40.0);
             assert_eq!(npcs.len(), 4);

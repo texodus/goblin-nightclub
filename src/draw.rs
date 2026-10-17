@@ -52,36 +52,43 @@ impl Layer {
         }
         self.poly(points, fill);
 
-        // Inward normal of edge i (points[i] -> points[i + 1]); clockwise on
-        // screen with y down puts the inside on the right.
-        let normal = |i: usize| {
-            let (a, b) = (points[i], points[(i + 1) % n]);
-            let e = [b[0] - a[0], b[1] - a[1]];
-            let len = e[0].hypot(e[1]);
-            [-e[1] / len, e[0] / len]
-        };
-        // The outline inset by 1px, each corner moved along its bisector, so
-        // the strips between the two tile the border exactly.
+        let normal = |i: usize| inward_normal(points[i], points[(i + 1) % n]);
         let inset: Vec<[f32; 2]> = (0..n)
-            .map(|i| {
-                let (p, q) = (normal((i + n - 1) % n), normal(i));
-                let k = 1.0 / (1.0 + p[0] * q[0] + p[1] * q[1]);
-                [
-                    points[i][0] + (p[0] + q[0]) * k,
-                    points[i][1] + (p[1] + q[1]) * k,
-                ]
-            })
+            .map(|i| inset_corner(points[i], normal((i + n - 1) % n), normal(i)))
             .collect();
         for i in 0..n {
             let j = (i + 1) % n;
-            // Outward normal is the negated inward one.
-            let [nx, ny] = normal(i);
-            let facing = -nx - ny;
-            let lit = facing < -1e-3 || (facing.abs() <= 1e-3 && ny > 0.0);
-            let color = if lit { light } else { dark };
+            let color = if faces_light(normal(i)) { light } else { dark };
             self.poly(&[points[i], points[j], inset[j], inset[i]], color);
         }
     }
+}
+
+/// Unit normal of `a`-`b` pointing to its right, which is the inside of an
+/// outline running clockwise on screen (y down).
+pub fn inward_normal(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    let e = [b[0] - a[0], b[1] - a[1]];
+    let len = e[0].hypot(e[1]);
+    [-e[1] / len, e[0] / len]
+}
+
+/// Corner `p` of an outline moved 1px inward, between edges with inward
+/// normals `before` and `after`, along the bisector, so 1px strips along
+/// the two edges meet exactly (at concave and sharp corners too).
+pub fn inset_corner(p: [f32; 2], before: [f32; 2], after: [f32; 2]) -> [f32; 2] {
+    let k = 1.0 / (1.0 + before[0] * after[0] + before[1] * after[1]);
+    [
+        p[0] + (before[0] + after[0]) * k,
+        p[1] + (before[1] + after[1]) * k,
+    ]
+}
+
+/// Whether a face with inward normal `n` faces up or left (and so is lit):
+/// its outward normal, `-n`, points that way. Faces exactly up-right or
+/// down-left count as lit if they face up.
+pub fn faces_light(n: [f32; 2]) -> bool {
+    let facing = -n[0] - n[1];
+    facing < -1e-3 || (facing.abs() <= 1e-3 && n[1] > 0.0)
 }
 
 #[cfg(test)]

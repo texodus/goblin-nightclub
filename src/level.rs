@@ -1,10 +1,10 @@
 //! Tile grid with randomly placed solid blocks, plus AABB-vs-tile collision.
 //!
-//! The grid answers spatial queries (rays, collision); alongside it the level
-//! keeps the same solid space as a list of convex shapes, for drawing and
-//! lighting.
+//! The grid is the whole truth about solid space: rays, collision, outlines,
+//! drawing and lighting all derive from it. Its outline is computed once,
+//! when the level is built.
 
-use crate::draw::Layer;
+use crate::draw::{Layer, faces_light, inset_corner, inward_normal};
 use crate::palette;
 #[cfg(test)]
 use crate::rng::Rng;
@@ -35,7 +35,7 @@ impl Corner {
     pub const CLOCKWISE: [Corner; 4] = [Corner::NW, Corner::NE, Corner::SE, Corner::SW];
 
     /// Position within the tile, in tiles: 0 or 1 on each axis.
-    fn offset(self) -> [i32; 2] {
+    pub fn offset(self) -> [i32; 2] {
         match self {
             Corner::NW => [0, 0],
             Corner::NE => [1, 0],
@@ -53,7 +53,7 @@ impl Corner {
         }
     }
 
-    fn opposite(self) -> Corner {
+    pub fn opposite(self) -> Corner {
         let [x, y] = self.offset();
         Corner::at([1 - x, 1 - y])
     }
@@ -67,7 +67,7 @@ impl Corner {
     }
 
     /// The two sides meeting at this corner.
-    fn sides(self) -> [Side; 2] {
+    pub fn sides(self) -> [Side; 2] {
         match self {
             Corner::NW => [Side::N, Side::W],
             Corner::NE => [Side::N, Side::E],
@@ -78,9 +78,9 @@ impl Corner {
 }
 
 impl Side {
-    const ALL: [Side; 4] = [Side::N, Side::S, Side::W, Side::E];
+    pub const ALL: [Side; 4] = [Side::N, Side::S, Side::W, Side::E];
 
-    fn opposite(self) -> Side {
+    pub fn opposite(self) -> Side {
         match self {
             Side::N => Side::S,
             Side::S => Side::N,
@@ -90,7 +90,7 @@ impl Side {
     }
 
     /// Offset to the neighboring tile across this side.
-    fn offset(self) -> [i32; 2] {
+    pub fn offset(self) -> [i32; 2] {
         match self {
             Side::N => [0, -1],
             Side::S => [0, 1],
@@ -150,6 +150,53 @@ impl Tile {
         }
     }
 
+    /// The tile as a set of quarters, the triangles between its diagonals:
+    /// a slope is two neighboring quarters, a full tile all four.
+    fn quarters(self) -> u8 {
+        const N: u8 = 1;
+        const E: u8 = 2;
+        const S: u8 = 4;
+        const W: u8 = 8;
+        match self {
+            Tile::Empty => 0,
+            Tile::Full => N | E | S | W,
+            Tile::Slope(Corner::NW) => N | W,
+            Tile::Slope(Corner::NE) => N | E,
+            Tile::Slope(Corner::SE) => S | E,
+            Tile::Slope(Corner::SW) => S | W,
+        }
+    }
+
+    /// The tile made of quarters `q`; any other combination becomes full
+    /// (`round_up`) or empty.
+    fn from_quarters(q: u8, round_up: bool) -> Tile {
+        [
+            Tile::Empty,
+            Tile::Full,
+            Tile::Slope(Corner::NW),
+            Tile::Slope(Corner::NE),
+            Tile::Slope(Corner::SE),
+            Tile::Slope(Corner::SW),
+        ]
+        .into_iter()
+        .find(|t| t.quarters() == q)
+        .unwrap_or(if round_up { Tile::Full } else { Tile::Empty })
+    }
+
+    /// Solid wherever either is, for stamping. A result no tile can
+    /// represent (two slopes at neighboring corners) becomes full, which
+    /// keeps stamping order-independent.
+    pub fn union(self, other: Tile) -> Tile {
+        Tile::from_quarters(self.quarters() | other.quarters(), true)
+    }
+
+    /// Solid where `self` is and `other` isn't, for carving: cutting a
+    /// slope out of a full tile leaves the opposite slope. A result no tile
+    /// can represent becomes empty.
+    pub fn carve(self, other: Tile) -> Tile {
+        Tile::from_quarters(self.quarters() & !other.quarters(), false)
+    }
+
     /// The solid part of tile `(x, y)` as a convex shape in pixels.
     pub fn shape(self, x: usize, y: usize) -> Option<Shape> {
         let point = |c: Corner| {
@@ -188,145 +235,119 @@ const PUSH_ROUNDS: usize = 4;
 /// screen, since y points down).
 pub type Shape = Vec<[f32; 2]>;
 
-/// A solid piece of a level: tiles that together form one convex shape.
-pub struct Piece {
-    pub tiles: Vec<([i32; 2], Tile)>,
+/// A piece of the outline of solid space, oriented with solid on its right
+/// (so outlines run clockwise on screen, since y points down).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Edge {
+    pub a: [f32; 2],
+    pub b: [f32; 2],
+    /// The tile whose solid part this edge bounds; outside the level for
+    /// the level's own boundary.
+    pub solid: [i32; 2],
 }
 
-impl Piece {
-    /// A `w` x `h` block of full tiles at `(x, y)`, with each corner (in
-    /// `Corner::CLOCKWISE` order) optionally cut off by a slope. Corners are
-    /// only cut on blocks at least 2x2.
-    pub fn block(x: i32, y: i32, w: i32, h: i32, cut: [bool; 4]) -> Self {
-        let mut tiles = Vec::new();
-        for ty in y..y + h {
-            for tx in x..x + w {
-                tiles.push(([tx, ty], Tile::Full));
-            }
-        }
-        if w >= 2 && h >= 2 {
-            for (corner, cut) in Corner::CLOCKWISE.into_iter().zip(cut) {
-                if cut {
-                    let [dx, dy] = corner.offset();
-                    let at = [x + dx * (w - 1), y + dy * (h - 1)];
-                    // Keep the half facing into the block.
-                    let tile = Tile::Slope(corner.opposite());
-                    tiles.iter_mut().find(|(t, _)| *t == at).unwrap().1 = tile;
-                }
-            }
-        }
-        Self { tiles }
-    }
+/// A closed loop of outline, with solid on its right: clockwise on screen
+/// around solid, counter-clockwise around holes and the level's boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Outline {
+    /// Where the loop turns, in order; it closes from the last back to the
+    /// first.
+    pub points: Vec<[f32; 2]>,
+    /// For each segment `points[i]` to `points[i + 1]`, the level's outline
+    /// edges (indices into [`Level::outline_edges`]) it's made of, in order.
+    pub runs: Vec<Vec<usize>>,
+}
 
-    /// A 45-degree bar of `len` full tiles starting at `(x, y)` and running
-    /// up-right (`rising`) or down-right, with slopes filling the stair steps
-    /// on both sides so its long faces are straight diagonals.
-    pub fn bar(x: i32, y: i32, len: i32, rising: bool) -> Self {
-        let dy = if rising { -1 } else { 1 };
-        // Slopes in the steps beside and above/below each diagonal neighbor.
-        let (beside, across) = if rising {
-            (Corner::NW, Corner::SE)
-        } else {
-            (Corner::SW, Corner::NE)
+/// A corner where the outline turns away from solid (an inside corner,
+/// seen from open space), with the inward normals of the faces before and
+/// after it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConcaveCorner {
+    pub at: [f32; 2],
+    pub before: [f32; 2],
+    pub after: [f32; 2],
+}
+
+/// A grid line outline edges can lie on, in tiles: horizontal (`y`),
+/// vertical (`x`), or diagonal (`x + y` rising to the right, `x - y`
+/// falling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Line {
+    Horizontal(i32),
+    Vertical(i32),
+    Rising(i32),
+    Falling(i32),
+}
+
+impl Line {
+    /// The grid lines running through both pixel-space points (within
+    /// `tolerance` pixels).
+    pub fn through(p: [f32; 2], q: [f32; 2], tolerance: f32) -> Vec<Line> {
+        let on = |f: fn([f32; 2]) -> f32, make: fn(i32) -> Line| {
+            let (a, b) = (f(p), f(q));
+            let k = (a / TILE).round();
+            ((a - b).abs() < tolerance && (a - k * TILE).abs() < tolerance).then(|| make(k as i32))
         };
-        let mut tiles = Vec::new();
-        for i in 0..len {
-            tiles.push(([x + i, y + dy * i], Tile::Full));
-            if i + 1 < len {
-                tiles.push(([x + i + 1, y + dy * i], Tile::Slope(beside)));
-                tiles.push(([x + i, y + dy * (i + 1)], Tile::Slope(across)));
-            }
-        }
-        Self { tiles }
+        [
+            on(|p| p[1], Line::Horizontal),
+            on(|p| p[0], Line::Vertical),
+            on(|p| p[0] + p[1], Line::Rising),
+            on(|p| p[0] - p[1], Line::Falling),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
-
-    /// The piece's outline: the convex hull of its tiles' solid parts.
-    pub fn shape(&self) -> Shape {
-        let mut points: Vec<[f32; 2]> = self
-            .tiles
-            .iter()
-            .filter_map(|([x, y], tile)| tile.shape(*x as usize, *y as usize))
-            .flatten()
-            .collect();
-        convex_hull(&mut points)
-    }
-}
-
-/// Convex hull (Andrew's monotone chain), in `Shape` order, without
-/// collinear points.
-fn convex_hull(points: &mut Vec<[f32; 2]>) -> Shape {
-    points.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
-    points.dedup();
-    if points.len() < 3 {
-        return points.clone();
-    }
-    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| {
-        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-    };
-    let mut hull: Vec<[f32; 2]> = Vec::new();
-    for pass in [points.clone(), points.iter().rev().copied().collect()] {
-        let start = hull.len();
-        for p in pass {
-            while hull.len() >= start + 2
-                && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
-            {
-                hull.pop();
-            }
-            hull.push(p);
-        }
-        hull.pop();
-    }
-    hull
 }
 
 pub struct Level {
     pub cols: usize,
     pub rows: usize,
     tiles: Vec<Tile>,
-    /// The solid tiles again, as convex shapes.
-    shapes: Vec<Shape>,
+    corners: Vec<[f32; 2]>,
+    edges: Vec<Edge>,
+    edges_by_line: std::collections::HashMap<Line, Vec<usize>>,
+    outlines: Vec<Outline>,
+    concave: Vec<ConcaveCorner>,
 }
 
 impl Level {
-    /// Generate a random level, keeping the area around `spawn` (in pixels)
-    /// clear. See [`crate::generate`].
-    pub fn generate(seed: u32, cols: usize, rows: usize, spawn: [f32; 2]) -> Self {
-        crate::generate::generate(seed, cols, rows, spawn)
+    /// Generate a random level in `style`, keeping the area around `spawn`
+    /// (in pixels) open and all open floor connected to it. See
+    /// [`crate::generate`].
+    pub fn generate(
+        style: crate::generate::Style,
+        seed: u32,
+        cols: usize,
+        rows: usize,
+        spawn: [f32; 2],
+    ) -> Self {
+        crate::generate::generate(style, seed, cols, rows, spawn)
     }
 
-    /// A level made of non-overlapping pieces on open floor.
-    pub fn from_pieces(cols: usize, rows: usize, pieces: &[Piece]) -> Self {
-        let mut tiles = vec![Tile::Empty; cols * rows];
-        for piece in pieces {
-            for ([x, y], tile) in &piece.tiles {
-                tiles[*y as usize * cols + *x as usize] = *tile;
+    /// A level from its tiles, row by row.
+    pub fn from_tiles(cols: usize, rows: usize, tiles: Vec<Tile>) -> Self {
+        assert_eq!(tiles.len(), cols * rows);
+        let mut level = Self {
+            cols,
+            rows,
+            tiles,
+            corners: Vec::new(),
+            edges: Vec::new(),
+            edges_by_line: Default::default(),
+            outlines: Vec::new(),
+            concave: Vec::new(),
+        };
+        level.corners = level.find_corners();
+        level.edges = level.find_edges();
+        for (i, e) in level.edges.iter().enumerate() {
+            for line in Line::through(e.a, e.b, 1e-3) {
+                level.edges_by_line.entry(line).or_default().push(i);
             }
         }
-        Self {
-            cols,
-            rows,
-            tiles,
-            shapes: pieces.iter().map(Piece::shape).collect(),
-        }
-    }
-
-    /// Solid space as convex shapes, for drawing and lighting.
-    pub fn solids(&self) -> &[Shape] {
-        &self.shapes
-    }
-
-    /// A level from explicit tiles, each solid tile its own shape.
-    #[cfg(test)]
-    fn from_tiles(cols: usize, rows: usize, tiles: Vec<Tile>) -> Self {
-        let shapes = (0..tiles.len())
-            .filter_map(|i| tiles[i].shape(i % cols, i / cols))
-            .collect();
-        Self {
-            cols,
-            rows,
-            tiles,
-            shapes,
-        }
+        level.outlines = level.find_outlines();
+        level.concave = level.find_concave_corners();
+        level
     }
 
     /// Build a level from rows of `.` (floor), `#` (solid) and `◸ ◹ ◺ ◿`
@@ -542,10 +563,23 @@ impl Level {
                     // Moving away from the face, or exactly along it.
                     None
                 } else {
-                    // Reaching the face exactly at a tile corner is a vertex
-                    // crossing, which `raycast` handles.
+                    // Reaching the face exactly at the tile corner where the
+                    // ray leaves is a vertex crossing, which `raycast`
+                    // handles. Judge "exactly" by how closely the ray passes
+                    // the face's end: where the ray meets the face along its
+                    // length is ill-conditioned at a shallow angle.
                     let t = t0 + (-f).max(0.0) / df;
-                    (t < t1 - 1e-4).then_some(t)
+                    let at_end = c.face_ends().iter().any(|end| {
+                        let [dx, dy] = end.offset();
+                        let e = [(tile[0] + dx) as f32 * TILE, (tile[1] + dy) as f32 * TILE];
+                        let to_end = [e[0] - from[0], e[1] - from[1]];
+                        let perp = (dir[0] * to_end[1] - dir[1] * to_end[0]).abs();
+                        let along = dir[0] * to_end[0] + dir[1] * to_end[1];
+                        // Only where the ray leaves the tile; entering at the
+                        // face's end heading into solid is a real hit.
+                        perp < 1e-4 && (along - t1).abs() < 0.05 && (along - t).abs() < 0.05
+                    });
+                    (t < t1 - 1e-4 && !at_end).then_some(t)
                 }
             }
         }
@@ -573,7 +607,11 @@ impl Level {
     /// the outline edges meeting at each vertex (4 axis directions plus 4
     /// diagonals from slope faces); it's a corner unless exactly two meet
     /// and they continue straight.
-    pub fn corners(&self) -> Vec<[f32; 2]> {
+    pub fn corners(&self) -> &[[f32; 2]] {
+        &self.corners
+    }
+
+    fn find_corners(&self) -> Vec<[f32; 2]> {
         let mut out = Vec::new();
         for gy in 0..=self.rows as i32 {
             for gx in 0..=self.cols as i32 {
@@ -618,34 +656,189 @@ impl Level {
         out
     }
 
-    /// Every piece of the outline of solid space, as pixel-space segments:
-    /// tile sides with solid on exactly one side, and slope faces.
-    pub fn outline_edges(&self) -> Vec<([f32; 2], [f32; 2])> {
+    /// Every piece of the outline of solid space: tile sides with solid on
+    /// exactly one side, and slope faces, each one tile long.
+    pub fn outline_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+
+    fn find_edges(&self) -> Vec<Edge> {
         let px = |x: i32, y: i32| [x as f32 * TILE, y as f32 * TILE];
         let mut out = Vec::new();
         for y in 0..=self.rows as i32 {
             for x in 0..=self.cols as i32 {
                 let here = self.tile(x, y);
                 // Top and left sides of each position (covering the bottom
-                // and right of the level via the extra row and column).
-                if here.covers(Side::N) != self.tile(x, y - 1).covers(Side::S) {
-                    out.push((px(x, y), px(x + 1, y)));
+                // and right of the level via the extra row and column),
+                // oriented with the solid side on the right.
+                let (above, left) = (self.tile(x, y - 1), self.tile(x - 1, y));
+                match (here.covers(Side::N), above.covers(Side::S)) {
+                    (true, false) => out.push(Edge {
+                        a: px(x, y),
+                        b: px(x + 1, y),
+                        solid: [x, y],
+                    }),
+                    (false, true) => out.push(Edge {
+                        a: px(x + 1, y),
+                        b: px(x, y),
+                        solid: [x, y - 1],
+                    }),
+                    _ => {}
                 }
-                if here.covers(Side::W) != self.tile(x - 1, y).covers(Side::E) {
-                    out.push((px(x, y), px(x, y + 1)));
+                match (here.covers(Side::W), left.covers(Side::E)) {
+                    (true, false) => out.push(Edge {
+                        a: px(x, y + 1),
+                        b: px(x, y),
+                        solid: [x, y],
+                    }),
+                    (false, true) => out.push(Edge {
+                        a: px(x, y),
+                        b: px(x, y + 1),
+                        solid: [x - 1, y],
+                    }),
+                    _ => {}
                 }
                 if let Tile::Slope(c) = here
                     && x < self.cols as i32
                     && y < self.rows as i32
                 {
-                    // The face joins the two corners beside the solid one.
-                    let [c1, c2] = c.face_ends().map(|k| {
+                    // The face joins the two corners beside the solid one;
+                    // orient it so the solid corner is on its right.
+                    let corner = |k: Corner| {
                         let [dx, dy] = k.offset();
                         px(x + dx, y + dy)
+                    };
+                    let [mut a, mut b] = c.face_ends().map(corner);
+                    let s = corner(c);
+                    let (e, to_solid) = ([b[0] - a[0], b[1] - a[1]], [s[0] - a[0], s[1] - a[1]]);
+                    if -e[1] * to_solid[0] + e[0] * to_solid[1] < 0.0 {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    out.push(Edge {
+                        a,
+                        b,
+                        solid: [x, y],
                     });
-                    out.push((c1, c2));
                 }
             }
+        }
+        out
+    }
+
+    /// The outline of solid space as closed loops, straight runs merged.
+    pub fn outlines(&self) -> &[Outline] {
+        &self.outlines
+    }
+
+    /// Indices of the outline edges lying on `line`.
+    pub fn edges_on(&self, line: Line) -> &[usize] {
+        self.edges_by_line.get(&line).map_or(&[], Vec::as_slice)
+    }
+
+    /// Inside corners of the outline.
+    pub fn concave_corners(&self) -> &[ConcaveCorner] {
+        &self.concave
+    }
+
+    /// With solid on the right, a left turn (counter-clockwise on screen)
+    /// bends away from the solid.
+    fn find_concave_corners(&self) -> Vec<ConcaveCorner> {
+        let mut out = Vec::new();
+        for o in &self.outlines {
+            let n = o.points.len();
+            for k in 0..n {
+                let (prev, here, next) = (
+                    o.points[(k + n - 1) % n],
+                    o.points[k],
+                    o.points[(k + 1) % n],
+                );
+                let (d0, d1) = (
+                    [here[0] - prev[0], here[1] - prev[1]],
+                    [next[0] - here[0], next[1] - here[1]],
+                );
+                if d0[0] * d1[1] - d0[1] * d1[0] < 0.0 {
+                    out.push(ConcaveCorner {
+                        at: here,
+                        before: inward_normal(prev, here),
+                        after: inward_normal(here, next),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Chain the outline edges into loops. Each edge's end is the start of
+    /// another; where several start at one vertex (solids touching only at
+    /// a corner), take the sharpest right turn, which keeps the solid on the
+    /// right the same and so keeps each solid's loop to itself.
+    fn find_outlines(&self) -> Vec<Outline> {
+        let key = |p: [f32; 2]| [(p[0] / TILE).round() as i32, (p[1] / TILE).round() as i32];
+        let dir = |e: &Edge| {
+            let [a, b] = [key(e.a), key(e.b)];
+            [b[0] - a[0], b[1] - a[1]]
+        };
+        let mut starting: std::collections::HashMap<[i32; 2], Vec<usize>> = Default::default();
+        for (i, e) in self.edges.iter().enumerate() {
+            starting.entry(key(e.a)).or_default().push(i);
+        }
+
+        let mut used = vec![false; self.edges.len()];
+        let mut out = Vec::new();
+        for first in 0..self.edges.len() {
+            if used[first] {
+                continue;
+            }
+            // Walk the loop edge by edge.
+            let mut chain = vec![first];
+            used[first] = true;
+            loop {
+                let last = *chain.last().unwrap();
+                let d = dir(&self.edges[last]);
+                let next = starting[&key(self.edges[last].b)]
+                    .iter()
+                    .copied()
+                    .filter(|&i| !used[i] || i == first)
+                    .max_by(|&i, &j| {
+                        // Clockwise turn angle (cross > 0 is clockwise on
+                        // screen, with y down).
+                        let turn = |k: usize| {
+                            let n = dir(&self.edges[k]);
+                            let cross = (d[0] * n[1] - d[1] * n[0]) as f32;
+                            let dot = (d[0] * n[0] + d[1] * n[1]) as f32;
+                            cross.atan2(dot)
+                        };
+                        turn(i).total_cmp(&turn(j))
+                    });
+                match next {
+                    Some(i) if i == first => break,
+                    Some(i) => {
+                        used[i] = true;
+                        chain.push(i);
+                    }
+                    None => break, // Can't happen for a closed outline.
+                }
+            }
+
+            // Start at a turn, then merge runs of edges going the same way.
+            let turns_at = |k: usize| {
+                dir(&self.edges[chain[k]])
+                    != dir(&self.edges[chain[(k + chain.len() - 1) % chain.len()]])
+            };
+            let start = (0..chain.len()).find(|&k| turns_at(k)).unwrap_or(0);
+            chain.rotate_left(start);
+            let mut outline = Outline {
+                points: Vec::new(),
+                runs: Vec::new(),
+            };
+            for (k, &i) in chain.iter().enumerate() {
+                if k == 0 || dir(&self.edges[i]) != dir(&self.edges[chain[k - 1]]) {
+                    outline.points.push(self.edges[i].a);
+                    outline.runs.push(Vec::new());
+                }
+                outline.runs.last_mut().unwrap().push(i);
+            }
+            out.push(outline);
         }
         out
     }
@@ -840,8 +1033,11 @@ impl Level {
         best.or(fallback)
     }
 
-    /// Draw the floor, its grid, and every solid shape with a bevel.
-    pub fn draw(&self, layer: &mut Layer) {
+    /// Draw the floor, its grid, each tile's solid part, and a 1px bevel
+    /// along the outline edges `bevel(edge index)` picks: yellow on faces
+    /// facing up or left, dark red on faces facing down or right. Strips
+    /// along each loop are mitered at its corners so they meet exactly.
+    pub fn draw(&self, layer: &mut Layer, bevel: impl Fn(usize) -> bool) {
         let w = self.cols as f32 * TILE;
         let h = self.rows as f32 * TILE;
         layer.rect([0.0, 0.0], [w, h], palette::BLACK);
@@ -851,9 +1047,51 @@ impl Level {
         for y in 0..self.rows {
             layer.rect([0.0, y as f32 * TILE], [w, 1.0], palette::BLUE);
         }
-        for shape in &self.shapes {
-            layer.beveled(shape, palette::BROWN, palette::YELLOW, palette::RED);
+        for (i, tile) in self.tiles.iter().enumerate() {
+            if let Some(shape) = tile.shape(i % self.cols, i / self.cols) {
+                layer.poly(&shape, palette::BROWN);
+            }
         }
+
+        for o in &self.outlines {
+            let n = o.points.len();
+            let normals: Vec<[f32; 2]> = (0..n)
+                .map(|k| inward_normal(o.points[k], o.points[(k + 1) % n]))
+                .collect();
+            let inset: Vec<[f32; 2]> = (0..n)
+                .map(|k| inset_corner(o.points[k], normals[(k + n - 1) % n], normals[k]))
+                .collect();
+            for (k, run) in o.runs.iter().enumerate() {
+                let normal = normals[k];
+                let color = if faces_light(normal) {
+                    palette::YELLOW
+                } else {
+                    palette::RED
+                };
+                let (start, end) = (o.points[k], o.points[(k + 1) % n]);
+                // Inside a run the strip edge is just 1px in; at the run's
+                // ends it's the mitered corner.
+                let inner = |p: [f32; 2], corner: [f32; 2], mitered: [f32; 2]| {
+                    if p == corner {
+                        mitered
+                    } else {
+                        [p[0] + normal[0], p[1] + normal[1]]
+                    }
+                };
+                for &i in run {
+                    let e = self.edges[i];
+                    if bevel(i) && self.in_bounds(e.solid) {
+                        let a = inner(e.a, start, inset[k]);
+                        let b = inner(e.b, end, inset[(k + 1) % n]);
+                        layer.poly(&[e.a, e.b, b, a], color);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn in_bounds(&self, t: [i32; 2]) -> bool {
+        t[0] >= 0 && t[1] >= 0 && t[0] < self.cols as i32 && t[1] < self.rows as i32
     }
 }
 
@@ -888,6 +1126,7 @@ fn smallest_move(constraints: &[([f32; 2], f32)]) -> Option<[f32; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Style;
 
     const SIZE: [f32; 2] = [8.0, 8.0];
 
@@ -1039,7 +1278,13 @@ mod tests {
     }
 
     fn level_with(x: i32, y: i32, w: i32, h: i32) -> Level {
-        Level::from_pieces(10, 10, &[Piece::block(x, y, w, h, [false; 4])])
+        let mut tiles = vec![Tile::Empty; 100];
+        for ty in y..y + h {
+            for tx in x..x + w {
+                tiles[(ty * 10 + tx) as usize] = Tile::Full;
+            }
+        }
+        Level::from_tiles(10, 10, tiles)
     }
 
     #[test]
@@ -1141,7 +1386,7 @@ mod tests {
     fn corners_follow_diagonal_outline() {
         // Solid below the diagonal from (30,0) to (0,30).
         let level = Level::from_ascii(&["..◿", ".◿#", "◿##"]);
-        let mut corners = level.corners();
+        let mut corners = level.corners().to_vec();
         corners.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(corners, vec![[0.0, 0.0], [0.0, 30.0], [30.0, 0.0]]);
 
@@ -1157,13 +1402,242 @@ mod tests {
     #[test]
     fn outline_edges_cover_sides_and_faces() {
         let level = Level::from_ascii(&["◸"]);
-        let edges = level.outline_edges();
-        // The face from (10,0) to (0,10), plus the empty half's two sides
-        // against the out-of-bounds wall: right and bottom.
-        assert!(edges.contains(&([10.0, 0.0], [0.0, 10.0])));
-        assert!(edges.contains(&([10.0, 0.0], [10.0, 10.0])));
-        assert!(edges.contains(&([0.0, 10.0], [10.0, 10.0])));
+        let edges: Vec<_> = level
+            .outline_edges()
+            .iter()
+            .map(|e| (e.a, e.b, e.solid))
+            .collect();
+        // Solid on the right of each: the face (solid toward the NW corner),
+        // and the empty half's right and bottom sides against the
+        // out-of-bounds wall.
+        assert!(
+            edges.contains(&([10.0, 0.0], [0.0, 10.0], [0, 0])),
+            "{edges:?}"
+        );
+        assert!(
+            edges.contains(&([10.0, 10.0], [10.0, 0.0], [1, 0])),
+            "{edges:?}"
+        );
+        assert!(
+            edges.contains(&([0.0, 10.0], [10.0, 10.0], [0, 1])),
+            "{edges:?}"
+        );
         assert_eq!(edges.len(), 3, "{edges:?}");
+    }
+
+    /// Twice the signed area: positive clockwise on screen (around solid).
+    fn area2(points: &[[f32; 2]]) -> f32 {
+        (0..points.len())
+            .map(|i| {
+                let (a, b) = (points[i], points[(i + 1) % points.len()]);
+                a[0] * b[1] - b[0] * a[1]
+            })
+            .sum()
+    }
+
+    /// Each level edge in exactly one run, and each loop closed: every run
+    /// starts where the previous one ended.
+    fn check_outlines(level: &Level) {
+        let mut seen = vec![0; level.outline_edges().len()];
+        for o in level.outlines() {
+            assert_eq!(o.points.len(), o.runs.len());
+            for (k, run) in o.runs.iter().enumerate() {
+                let edges: Vec<_> = run.iter().map(|&i| level.outline_edges()[i]).collect();
+                assert_eq!(edges[0].a, o.points[k]);
+                assert_eq!(edges.last().unwrap().b, o.points[(k + 1) % o.points.len()]);
+                for w in edges.windows(2) {
+                    assert_eq!(w[0].b, w[1].a);
+                }
+                for &i in run {
+                    seen[i] += 1;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&n| n == 1), "{seen:?}");
+    }
+
+    #[test]
+    fn outlines_of_a_block_and_the_boundary() {
+        let level = Level::from_ascii(&["....", ".##.", ".##.", "...."]);
+        check_outlines(&level);
+        let outlines = level.outlines();
+        assert_eq!(outlines.len(), 2);
+        let block = outlines.iter().find(|o| area2(&o.points) > 0.0).unwrap();
+        assert_eq!(block.points.len(), 4);
+        assert!(
+            block.runs.iter().all(|r| r.len() == 2),
+            "straight runs merged"
+        );
+        assert!((area2(&block.points) - 2.0 * 400.0).abs() < 1e-3);
+        let boundary = outlines.iter().find(|o| area2(&o.points) < 0.0).unwrap();
+        assert!((area2(&boundary.points) + 2.0 * 1600.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn hollow_room_has_a_hole_loop() {
+        let level = Level::from_ascii(&[
+            ".....", //
+            ".###.", //
+            ".#.#.", //
+            ".###.", //
+            ".....", //
+        ]);
+        check_outlines(&level);
+        let mut areas: Vec<f32> = level
+            .outlines()
+            .iter()
+            .map(|o| area2(&o.points) / 2.0)
+            .collect();
+        areas.sort_by(f32::total_cmp);
+        // Level boundary, the hole (counter-clockwise), the room's outside.
+        assert_eq!(areas, vec![-2500.0, -100.0, 900.0]);
+    }
+
+    #[test]
+    fn touching_blocks_merge_and_pinches_split() {
+        // An L of two blocks sharing a side: one loop, no internal edges.
+        let l = Level::from_ascii(&["....", ".#..", ".##.", "...."]);
+        check_outlines(&l);
+        let solid: Vec<_> = l
+            .outlines()
+            .iter()
+            .filter(|o| area2(&o.points) > 0.0)
+            .collect();
+        assert_eq!(solid.len(), 1);
+        assert_eq!(solid[0].points.len(), 6);
+
+        // Two blocks touching only at a corner: two loops.
+        let pinch = Level::from_ascii(&["....", ".#..", "..#.", "...."]);
+        check_outlines(&pinch);
+        let solid: Vec<_> = pinch
+            .outlines()
+            .iter()
+            .filter(|o| area2(&o.points) > 0.0)
+            .collect();
+        assert_eq!(solid.len(), 2);
+        assert!(solid.iter().all(|o| o.points.len() == 4));
+    }
+
+    #[test]
+    fn slanted_outlines_merge_diagonal_runs() {
+        // A rising bar: two full tiles with slopes filling both steps.
+        let bar = Level::from_ascii(&[".....", ".◿#..", ".#◸..", "....."]);
+        check_outlines(&bar);
+        let solid: Vec<_> = bar
+            .outlines()
+            .iter()
+            .filter(|o| area2(&o.points) > 0.0)
+            .collect();
+        assert_eq!(solid.len(), 1);
+        // Flat ends and two long diagonal faces: a hexagon.
+        assert_eq!(solid[0].points.len(), 6, "{:?}", solid[0].points);
+
+        for seed in 0..30 {
+            check_outlines(&Level::soup(seed, 32, 20));
+            for style in [Style::World, Style::Cave] {
+                check_outlines(&Level::generate(style, seed, 32, 20, [165.0, 105.0]));
+            }
+        }
+    }
+
+    /// Area of everything drawn after the floor, grid and tile fills: the
+    /// bevel strips.
+    fn bevel_area(level: &Level, bevel: impl Fn(usize) -> bool) -> f32 {
+        let mut base = Layer::default();
+        level.draw(&mut base, |_| false);
+        let mut layer = Layer::default();
+        level.draw(&mut layer, bevel);
+        layer.vertices[base.vertices.len()..]
+            .chunks(3)
+            .map(|t| {
+                let [a, b, c] = [t[0].pos, t[1].pos, t[2].pos];
+                ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0
+            })
+            .sum()
+    }
+
+    #[test]
+    fn bevels_tile_the_border_exactly() {
+        // A 20x20 block: strips cover its border, 400 - 18 * 18.
+        let block = Level::from_ascii(&["....", ".##.", ".##.", "...."]);
+        assert!((bevel_area(&block, |_| true) - 76.0).abs() < 1e-3);
+
+        // An L (concave corner): 300 minus its 1px inset, 18 * 18 - 10 * 10.
+        let l = Level::from_ascii(&["....", ".#..", ".##.", "...."]);
+        assert!((bevel_area(&l, |_| true) - 76.0).abs() < 1e-3);
+
+        // A lone slope with two 45-degree corners: half of 100 minus its
+        // inset triangle, whose legs are 10 - 2 - sqrt(2).
+        let slope = Level::from_ascii(&["...", ".◸.", "..."]);
+        let leg = 10.0 - 2.0 - std::f32::consts::SQRT_2;
+        assert!((bevel_area(&slope, |_| true) - (50.0 - leg * leg / 2.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn bevels_only_where_picked() {
+        let block = Level::from_ascii(&["....", ".##.", ".##.", "...."]);
+        assert_eq!(bevel_area(&block, |_| false), 0.0);
+        // Just the top face's two edges: each 10x1 strip, mitered at the
+        // outer ends (each loses a half-pixel triangle).
+        let top: Vec<usize> = (0..block.outline_edges().len())
+            .filter(|&i| {
+                let e = block.outline_edges()[i];
+                e.a[1] == 10.0 && e.b[1] == 10.0 && block.in_bounds(e.solid)
+            })
+            .collect();
+        assert_eq!(top.len(), 2);
+        let area = bevel_area(&block, |i| top.contains(&i));
+        assert!((area - 19.0).abs() < 1e-3, "{area}");
+    }
+
+    #[test]
+    fn union_and_carve() {
+        use Corner::*;
+        use Tile::*;
+        assert_eq!(Slope(NW).union(Slope(SE)), Full, "opposite slopes fill");
+        assert_eq!(Slope(NW).union(Slope(NW)), Slope(NW));
+        assert_eq!(
+            Slope(NW).union(Slope(NE)),
+            Full,
+            "unrepresentable rounds up"
+        );
+        assert_eq!(Empty.union(Slope(SW)), Slope(SW));
+        assert_eq!(
+            Full.carve(Slope(NW)),
+            Slope(SE),
+            "leaves the opposite slope"
+        );
+        assert_eq!(
+            Slope(NW).carve(Slope(NE)),
+            Empty,
+            "unrepresentable rounds down"
+        );
+        assert_eq!(Slope(NW).carve(Slope(SE)), Slope(NW));
+        assert_eq!(Full.carve(Full), Empty);
+    }
+
+    #[test]
+    fn stamping_is_order_independent() {
+        let all = [
+            Tile::Empty,
+            Tile::Full,
+            Tile::Slope(Corner::NW),
+            Tile::Slope(Corner::NE),
+            Tile::Slope(Corner::SE),
+            Tile::Slope(Corner::SW),
+        ];
+        for a in all {
+            for b in all {
+                for c in all {
+                    assert_eq!(
+                        a.union(b).union(c),
+                        c.union(a).union(b),
+                        "{a:?} {b:?} {c:?}"
+                    );
+                    assert_eq!(a.union(b.union(c)), b.union(c).union(a));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1181,9 +1655,9 @@ mod tests {
     fn generated_blocks_avoid_spawn() {
         for seed in 0..200 {
             let spawn = [161.0, 101.0];
-            let level = Level::generate(seed, 32, 20, spawn);
+            let level = Level::generate(Style::World, seed, 32, 20, spawn);
             assert!(!level.collides(spawn, SIZE), "seed {seed}");
-            assert!(!level.solids().is_empty());
+            assert!((0..32).any(|x| (0..20).any(|y| !level.is_open(x, y))));
         }
     }
 }

@@ -5,7 +5,8 @@
 
 use std::f32::consts::TAU;
 
-use crate::level::{Level, Shape, TILE};
+use crate::draw::inward_normal;
+use crate::level::{Level, Line, Shape, TILE};
 
 /// Minimum angular offset of the extra rays cast to either side of each
 /// corner, sampling the boundary just before and just after it.
@@ -61,6 +62,50 @@ fn angle(from: [f32; 2], to: [f32; 2]) -> f32 {
     (to[1] - from[1]).atan2(to[0] - from[0])
 }
 
+/// The part of convex polygon `subject` inside convex polygon `clip`
+/// (clockwise on screen), by Sutherland-Hodgman.
+fn clip_convex(subject: &[[f32; 2]], clip: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    let mut out = subject.to_vec();
+    for i in 0..clip.len() {
+        if out.is_empty() {
+            break;
+        }
+        let (c0, c1) = (clip[i], clip[(i + 1) % clip.len()]);
+        // Inside is to the right of each clip edge.
+        let side =
+            |p: [f32; 2]| (c1[0] - c0[0]) * (p[1] - c0[1]) - (c1[1] - c0[1]) * (p[0] - c0[0]);
+        let input = std::mem::take(&mut out);
+        for j in 0..input.len() {
+            let (p, q) = (input[j], input[(j + 1) % input.len()]);
+            let (sp, sq) = (side(p), side(q));
+            if sp >= 0.0 {
+                out.push(p);
+            }
+            if (sp >= 0.0) != (sq >= 0.0) {
+                let t = sp / (sp - sq);
+                out.push([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]);
+            }
+        }
+    }
+    out
+}
+
+/// Unsigned area of a polygon, measured from its first point so slivers
+/// far from the origin don't drown in rounding.
+fn area(points: &[[f32; 2]]) -> f32 {
+    let Some(&o) = points.first() else {
+        return 0.0;
+    };
+    (1..points.len().saturating_sub(1))
+        .map(|i| {
+            let (a, b) = (points[i], points[i + 1]);
+            (a[0] - o[0]) * (b[1] - o[1]) - (b[0] - o[0]) * (a[1] - o[1])
+        })
+        .sum::<f32>()
+        .abs()
+        / 2.0
+}
+
 /// Points where segment `a`-`b` crosses the circle of `radius` around `c`.
 fn circle_crossings(c: [f32; 2], radius: f32, a: [f32; 2], b: [f32; 2]) -> Vec<[f32; 2]> {
     // |a + t (b - a) - c|^2 = r^2, a quadratic in t.
@@ -81,18 +126,6 @@ fn circle_crossings(c: [f32; 2], radius: f32, a: [f32; 2], b: [f32; 2]) -> Vec<[
         .collect()
 }
 
-/// Distance from `p` to the segment `a`-`b`.
-fn segment_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
-    let ab = [b[0] - a[0], b[1] - a[1]];
-    let len2 = ab[0] * ab[0] + ab[1] * ab[1];
-    let t = if len2 > 0.0 {
-        (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / len2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    distance(p, [a[0] + ab[0] * t, a[1] + ab[1] * t])
-}
-
 fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
     (b[0] - a[0]).hypot(b[1] - a[1])
 }
@@ -105,8 +138,12 @@ pub struct Vision {
     /// (clockwise on screen, since y points down). Render as a triangle fan
     /// centered on `origin`.
     polygon: Vec<[f32; 2]>,
-    /// Solid shapes with a currently visible face.
-    visible_solids: Vec<Shape>,
+    /// Solid within one tile of the visible stretches of wall, as convex
+    /// pieces.
+    wall_band: Vec<Shape>,
+    /// Per outline edge of the level: visible now, and ever seen.
+    edge_visible: Vec<bool>,
+    edge_seen: Vec<bool>,
     cols: usize,
     explored: Vec<bool>,
 }
@@ -117,7 +154,9 @@ impl Vision {
             origin: [0.0; 2],
             radius,
             polygon: Vec::new(),
-            visible_solids: Vec::new(),
+            wall_band: Vec::new(),
+            edge_visible: vec![false; level.outline_edges().len()],
+            edge_seen: vec![false; level.outline_edges().len()],
             cols: level.cols,
             explored: vec![false; level.cols * level.rows],
         }
@@ -135,17 +174,28 @@ impl Vision {
         &self.polygon
     }
 
-    /// Solid shapes with a currently visible face. The polygon stops at
-    /// wall faces, so these are what's seen of solid space.
-    pub fn visible_solids(&self) -> &[Shape] {
-        &self.visible_solids
+    /// Solid within one tile of the visible stretches of wall, as convex
+    /// pieces: what's seen of solid space, since the polygon itself stops at
+    /// wall faces.
+    pub fn wall_band(&self) -> &[Shape] {
+        &self.wall_band
+    }
+
+    /// For each of the level's outline edges: is any of it visible now?
+    pub fn edge_visible(&self) -> &[bool] {
+        &self.edge_visible
+    }
+
+    /// For each of the level's outline edges: has any of it ever been seen?
+    pub fn edge_seen(&self) -> &[bool] {
+        &self.edge_seen
     }
 
     /// Recompute visibility from `origin` (a pixel-space point in open space).
     pub fn update(&mut self, level: &Level, origin: [f32; 2]) {
         self.origin = origin;
         self.rebuild_polygon(level);
-        self.find_visible_solids(level);
+        self.find_wall_band(level);
         self.mark_explored(level);
     }
 
@@ -166,7 +216,7 @@ impl Vision {
         // Angular zones around each corner (center, half-width) in which a
         // plain ray can't be trusted to land on the right side of it.
         let mut zones: Vec<(f32, f32)> = Vec::new();
-        for c in level.corners() {
+        for &c in level.corners() {
             // Corners outside the radius can't shape the visible region.
             if distance(origin, c) > self.radius {
                 continue;
@@ -188,8 +238,8 @@ impl Vision {
             // corners. So sample either side of every such crossing, or the
             // chord between neighboring rays could cut off visible floor.
             let eps = corner_eps(self.radius);
-            for (a, b) in level.outline_edges() {
-                for p in circle_crossings(origin, self.radius, a, b) {
+            for e in level.outline_edges() {
+                for p in circle_crossings(origin, self.radius, e.a, e.b) {
                     let angle = angle(origin, p);
                     rays.extend([Ray::new(angle - eps, vec![]), Ray::new(angle + eps, vec![])]);
                 }
@@ -202,31 +252,49 @@ impl Vision {
         // and its near side. The corner's own rays cover that angle, so drop
         // plain rays in each corner's zone (which its side rays sit outside).
         zones.sort_by(|x, y| x.0.total_cmp(&y.0));
+        // Zones differ in width, so check every one whose center is within
+        // the widest half-width (looking across the wrap at TAU too).
+        let widest = zones.iter().map(|z| z.1).fold(0.0, f32::max);
         let in_zone = |a: f32| {
-            let i = zones.partition_point(|z| z.0 < a);
-            [i.wrapping_sub(1), i, 0, zones.len().wrapping_sub(1)]
-                .iter()
-                .filter_map(|&j| zones.get(j))
-                .any(|&(center, half)| {
-                    let d = (a - center).rem_euclid(TAU);
-                    d.min(TAU - d) < half
-                })
+            [a - TAU, a, a + TAU].iter().any(|&a| {
+                let first = zones.partition_point(|z| z.0 < a - widest);
+                zones[first..]
+                    .iter()
+                    .take_while(|z| z.0 <= a + widest)
+                    .any(|&(center, half)| (a - center).abs() < half)
+            })
         };
         rays.retain(|r| !r.corners.is_empty() || !in_zone(r.angle));
 
         // Rays closer together than float precision can resolve may sort in
         // an order that disagrees with their actual directions, so merge
         // them (including across the wrap at TAU), pooling their corners.
+        // Likewise a corner's ray passing within `SIDE_OFFSET` of a nearer
+        // corner: too close to trust which side of it the ray lands on, so
+        // the group aims at the nearer one.
+        let band = |r: &Ray| {
+            r.corners
+                .iter()
+                .map(|c| SIDE_OFFSET / distance(origin, *c))
+                .fold(0.0, f32::max)
+        };
+        let close = |a: &Ray, b: &Ray, gap: f32| {
+            gap < MERGE_EPS
+                || (!a.corners.is_empty() && !b.corners.is_empty() && gap < band(a).max(band(b)))
+        };
         rays.dedup_by(|next, prev| {
-            let close = next.angle - prev.angle < MERGE_EPS;
-            if close {
+            let merge = close(prev, next, next.angle - prev.angle);
+            if merge {
                 prev.corners.append(&mut next.corners);
             }
-            close
+            merge
         });
-        if rays.len() > 1 && rays[0].angle + TAU - rays[rays.len() - 1].angle < MERGE_EPS {
-            let mut last = rays.pop().unwrap();
-            rays[0].corners.append(&mut last.corners);
+        if rays.len() > 1 {
+            let gap = rays[0].angle + TAU - rays[rays.len() - 1].angle;
+            if close(&rays[rays.len() - 1], &rays[0], gap) {
+                let mut last = rays.pop().unwrap();
+                rays[0].corners.append(&mut last.corners);
+            }
         }
 
         let cast = |angle: f32| level.raycast(origin, dir(angle), self.radius);
@@ -261,7 +329,10 @@ impl Vision {
             // doesn't see along a zero-width line. The side casts clear the
             // corner by `SIDE_OFFSET`, well past `raycast`'s vertex tolerance.
             let side = (SIDE_OFFSET / len).clamp(MERGE_EPS, corner_eps(len) / 2.0);
-            let (before, after) = (cast(ray.angle - side), cast(ray.angle + side));
+            // Around the aim, not the group's angle, which may be that of a
+            // farther corner merged in.
+            let base = angle(origin, nearest);
+            let (before, after) = (cast(base - side), cast(base + side));
             let reach = level
                 .raycast(origin, aim, self.radius)
                 .min(before.max(after));
@@ -272,8 +343,18 @@ impl Vision {
             // it). The side casts say which: snap each to the nearest. Their
             // own distances aren't used directly, since against a surface
             // seen at a grazing angle they drift fast with angle.
-            let corner_dists: Vec<f32> = ray
+            // Only corners actually on the aim line count: a corner merged
+            // in from a nearer one's zone may lie a little to one side.
+            let on_line: Vec<[f32; 2]> = ray
                 .corners
+                .iter()
+                .copied()
+                .filter(|c| {
+                    let to = [c[0] - origin[0], c[1] - origin[1]];
+                    (aim[0] * to[1] - aim[1] * to[0]).abs() < SIDE_OFFSET
+                })
+                .collect();
+            let corner_dists: Vec<f32> = on_line
                 .iter()
                 .map(|c| distance(origin, *c))
                 .filter(|d| *d <= reach + SAME_POINT)
@@ -290,7 +371,7 @@ impl Vision {
             let leave = snap_dist(after.min(reach));
             // A distance matching a corner is placed exactly on it.
             let snap = |d: f32| {
-                ray.corners
+                on_line
                     .iter()
                     .find(|c| (distance(origin, **c) - d).abs() < SAME_POINT)
                     .copied()
@@ -310,18 +391,96 @@ impl Vision {
         }
     }
 
-    /// Every visible stretch of a solid's face is an edge of the polygon, so
-    /// a solid is visible exactly when a polygon vertex lies on its outline.
-    fn find_visible_solids(&mut self, level: &Level) {
+    /// The visible stretches of wall are exactly the polygon's edges lying
+    /// along outline edges. Mark those outline edges visible, extend each
+    /// stretch one tile into solid, add the wedge behind every inside corner
+    /// a stretch reaches (where the two extensions part), and clip it all to
+    /// the solid parts of the tiles it covers.
+    fn find_wall_band(&mut self, level: &Level) {
         const ON: f32 = 1e-2;
-        let on_outline = |shape: &Shape, p: [f32; 2]| {
-            (0..shape.len())
-                .any(|i| segment_distance(p, shape[i], shape[(i + 1) % shape.len()]) <= ON)
-        };
-        self.visible_solids.clear();
-        for shape in level.solids() {
-            if self.polygon.iter().any(|p| on_outline(shape, *p)) {
-                self.visible_solids.push(shape.clone());
+        self.edge_visible.fill(false);
+        self.wall_band.clear();
+        let mut band: Vec<Shape> = Vec::new();
+        let mut reached: Vec<[f32; 2]> = Vec::new();
+
+        let n = self.polygon.len();
+        for i in 0..n {
+            let (p, q) = (self.polygon[i], self.polygon[(i + 1) % n]);
+            // Even tiny polygon edges count: rays aimed at other corners
+            // can split a face into very short pieces.
+            if distance(p, q) < 1e-6 {
+                continue;
+            }
+            let candidates = Line::through(p, q, ON)
+                .into_iter()
+                .flat_map(|l| level.edges_on(l));
+            for &k in candidates {
+                let e = &level.outline_edges()[k];
+                let len = distance(e.a, e.b);
+                let u = [(e.b[0] - e.a[0]) / len, (e.b[1] - e.a[1]) / len];
+                let along = |x: [f32; 2]| (x[0] - e.a[0]) * u[0] + (x[1] - e.a[1]) * u[1];
+                let off = |x: [f32; 2]| (x[1] - e.a[1]) * u[0] - (x[0] - e.a[0]) * u[1];
+                if off(p).abs() > ON || off(q).abs() > ON {
+                    continue;
+                }
+                let (tp, tq) = (along(p), along(q));
+                let (lo, hi) = (tp.min(tq).max(0.0), tp.max(tq).min(len));
+                if hi - lo <= 1e-6 {
+                    continue;
+                }
+                self.edge_visible[k] = true;
+                self.edge_seen[k] = true;
+                if !level.in_bounds(e.solid) {
+                    continue; // The level's boundary: nothing to light.
+                }
+                let nrm = inward_normal(e.a, e.b);
+                let s0 = [e.a[0] + u[0] * lo, e.a[1] + u[1] * lo];
+                let s1 = [e.a[0] + u[0] * hi, e.a[1] + u[1] * hi];
+                let deep = |x: [f32; 2]| [x[0] + nrm[0] * TILE, x[1] + nrm[1] * TILE];
+                band.push(vec![s0, s1, deep(s1), deep(s0)]);
+                reached.extend([s0, s1]);
+            }
+        }
+
+        for c in level.concave_corners() {
+            if reached.iter().any(|r| distance(*r, c.at) < 1e-3) {
+                let [p, a, b] = [c.at, c.before, c.after];
+                let k = TILE / (1.0 + a[0] * b[0] + a[1] * b[1]);
+                band.push(vec![
+                    p,
+                    [p[0] + a[0] * TILE, p[1] + a[1] * TILE],
+                    [p[0] + (a[0] + b[0]) * k, p[1] + (a[1] + b[1]) * k],
+                    [p[0] + b[0] * TILE, p[1] + b[1] * TILE],
+                ]);
+            }
+        }
+
+        for piece in &band {
+            let (lo, hi) = piece.iter().fold(
+                ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]),
+                |(lo, hi), p| {
+                    (
+                        [lo[0].min(p[0]), lo[1].min(p[1])],
+                        [hi[0].max(p[0]), hi[1].max(p[1])],
+                    )
+                },
+            );
+            let tiles = |a: usize, max: usize| {
+                let first = ((lo[a] / TILE).floor().max(0.0)) as usize;
+                let last = ((hi[a] / TILE).ceil() as usize).min(max);
+                first..last
+            };
+            for y in tiles(1, level.rows) {
+                for x in tiles(0, level.cols) {
+                    let Some(solid) = level.tile(x as i32, y as i32).shape(x, y) else {
+                        continue;
+                    };
+                    let clipped = clip_convex(piece, &solid);
+                    // Clipping at shared corners leaves degenerate slivers.
+                    if area(&clipped) > 1e-3 {
+                        self.wall_band.push(clipped);
+                    }
+                }
             }
         }
     }
@@ -353,6 +512,7 @@ impl Vision {
 mod tests {
     use super::*;
 
+    use crate::generate::Style;
     use crate::rng::Rng;
 
     trait OpenPoint {
@@ -382,7 +542,10 @@ mod tests {
     /// suggested origin (which may be solid in a soup).
     fn levels() -> impl Iterator<Item = (Level, [f32; 2])> {
         let spawn = [165.0, 105.0];
-        let generated = (0..40).map(move |seed| (Level::generate(seed, 32, 20, spawn), spawn));
+        let generated = (0..40).flat_map(move |seed| {
+            [Style::World, Style::Cave]
+                .map(|style| (Level::generate(style, seed, 32, 20, spawn), spawn))
+        });
         let soups = (0..SOUPS).map(move |seed| (Level::soup(seed, 32, 20), spawn));
         generated.chain(soups)
     }
@@ -466,10 +629,13 @@ mod tests {
     fn visible_ish(level: &Level, vision: &Vision, p: [f32; 2]) -> bool {
         let o = vision.origin();
         let (a, d) = (angle(o, p), distance(o, p));
+        // Several sizes: a slit between corners can be narrower than the
+        // largest, and a corner close by needs the largest to clear it.
         vision.can_see(level, p)
-            || [a - 1e-5, a + 1e-5]
+            || [1e-5, 3e-6, 1e-6]
                 .iter()
-                .any(|a| vision.can_see(level, at(o, *a, d)))
+                .flat_map(|r| [a - r, a + r])
+                .any(|a| vision.can_see(level, at(o, a, d)))
     }
 
     /// Visible, and still visible a hair of rotation either way: points
@@ -556,34 +722,110 @@ mod tests {
         assert!(far.can_see(&level, [95.0, 25.0]));
     }
 
+    /// Total lit area, and whether point `p` is lit.
+    fn band_area(v: &Vision) -> f32 {
+        v.wall_band().iter().map(|s| area(s)).sum()
+    }
+
+    fn band_covers(v: &Vision, p: [f32; 2]) -> bool {
+        // Pieces may wind either way.
+        v.wall_band().iter().any(|s| {
+            // Signed distance from each edge's line.
+            let sides: Vec<f32> = (0..s.len())
+                .map(|i| {
+                    let (a, b) = (s[i], s[(i + 1) % s.len()]);
+                    ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / distance(a, b)
+                })
+                .collect();
+            sides.iter().all(|d| *d >= -1e-3) || sides.iter().all(|d| *d <= 1e-3)
+        })
+    }
+
     #[test]
-    fn solids_visible_by_their_faces() {
-        let level = Level::from_ascii(&[
-            "..........", //
-            "..#.#.....", //
-            "..........", //
+    fn band_is_one_tile_behind_visible_faces() {
+        // A 3x3 block; from straight left only its left face (30px) shows.
+        let level = Level::from_ascii(&[".....", ".###.", ".###.", ".###.", "....."]);
+        let mut v = Vision::new(&level, f32::INFINITY);
+        v.update(&level, [5.0, 25.0]);
+        assert!((band_area(&v) - 300.0).abs() < 1e-2, "{}", band_area(&v));
+        assert!(band_covers(&v, [15.0, 25.0]) && !band_covers(&v, [25.0, 25.0]));
+
+        // Out of range: nothing.
+        let mut short = Vision::new(&level, 3.0);
+        short.update(&level, [5.0, 25.0]);
+        assert!(short.wall_band().is_empty());
+    }
+
+    #[test]
+    fn band_fills_inside_corners() {
+        // Walls along the top and left meet at an inside corner at (10,10).
+        let level = Level::from_ascii(&["#####", "#....", "#...."]);
+        let mut v = Vision::new(&level, f32::INFINITY);
+        v.update(&level, [30.0, 20.0]);
+        // Top face 40px + left face 20px, a tile deep, plus the corner tile.
+        assert!((band_area(&v) - 700.0).abs() < 1e-2, "{}", band_area(&v));
+        assert!(band_covers(&v, [5.0, 5.0]), "corner tile lit");
+    }
+
+    #[test]
+    fn block_and_doorless_room_light_the_same() {
+        let block = Level::from_ascii(&[
+            ".......", ".#####.", ".#####.", ".#####.", ".#####.", ".......",
         ]);
-        // Looking down from row 0, the second block's top face shows over
-        // the first.
-        let mut v = Vision::new(&level, f32::INFINITY);
-        v.update(&level, [5.0, 5.0]);
-        let lit: Vec<_> = v.visible_solids().iter().map(|s| s[0]).collect();
-        assert!(lit.contains(&[20.0, 10.0]));
-        assert!(
-            lit.contains(&[40.0, 10.0]),
-            "top face visible over the first"
-        );
+        let room = Level::from_ascii(&[
+            ".......", ".#####.", ".#...#.", ".#...#.", ".#####.", ".......",
+        ]);
+        // The room's inner corners add rays, so the band may be cut into
+        // different pieces; compare what it covers.
+        for origin in [[5.0, 5.0], [35.0, 55.0], [65.0, 30.0]] {
+            let view = |level: &Level| {
+                let mut v = Vision::new(level, f32::INFINITY);
+                v.update(level, origin);
+                v
+            };
+            let (b, r) = (view(&block), view(&room));
+            assert!(
+                (band_area(&b) - band_area(&r)).abs() < 1e-2,
+                "from {origin:?}"
+            );
+            for y in 0..60 {
+                for x in 0..70 {
+                    let p = [x as f32 + 0.5, y as f32 + 0.5];
+                    assert_eq!(
+                        band_covers(&b, p),
+                        band_covers(&r, p),
+                        "from {origin:?} at {p:?}"
+                    );
+                }
+            }
+        }
+    }
 
-        // One row high, so the second block hides behind the first.
-        let level = Level::from_ascii(&["..#.#."]);
-        let mut v = Vision::new(&level, f32::INFINITY);
-        v.update(&level, [5.0, 5.0]);
-        let lit: Vec<_> = v.visible_solids().iter().map(|s| s[0]).collect();
-        assert_eq!(lit, vec![[20.0, 0.0]], "second block fully hidden");
+    #[test]
+    fn band_never_covers_open_floor() {
+        let mut rng = Rng::new(3);
+        for (level, spawn) in levels().take(50) {
+            if !is_open_point(&level, spawn) {
+                continue;
+            }
+            let mut v = Vision::new(&level, 96.0);
+            v.update(&level, spawn);
+            for _ in 0..300 {
+                let p = rng.open_point(&level);
+                assert!(!band_covers(&v, p) || !is_open_point(&level, p), "{p:?}");
+            }
+        }
+    }
 
-        let mut short = Vision::new(&level, 10.0);
-        short.update(&level, [5.0, 5.0]);
-        assert!(short.visible_solids().is_empty(), "beyond the radius");
+    #[test]
+    fn slope_faces_light_their_triangle() {
+        let level = Level::from_ascii(&["....#....", "..◸.#.◿..", "....#...."]);
+        let mut vision = Vision::new(&level, f32::INFINITY);
+        vision.update(&level, [35.0, 25.0]);
+        // Inside the first slope, just behind its face; the second slope is
+        // behind the wall.
+        assert!(band_covers(&vision, [22.0, 12.0]));
+        assert!(!band_covers(&vision, [68.0, 18.0]));
     }
 
     #[test]
@@ -614,16 +856,42 @@ mod tests {
     }
 
     #[test]
-    fn slopes_light_up_as_visible_solids() {
-        let level = Level::from_ascii(&["....#....", "..◸.#.◿..", "....#...."]);
+    fn inner_faces_of_a_room_stay_unseen_from_outside() {
+        // A doorless room with 1-tile walls, viewed from all around it.
+        let level = Level::from_ascii(&[
+            ".......", //
+            ".#####.", //
+            ".#...#.", //
+            ".#...#.", //
+            ".#####.", //
+            ".......", //
+        ]);
+        let inner: Vec<usize> = level
+            .outline_edges()
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                (20.0..=50.0).contains(&e.a[0])
+                    && (20.0..=40.0).contains(&e.a[1])
+                    && (20.0..=50.0).contains(&e.b[0])
+                    && (20.0..=40.0).contains(&e.b[1])
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(inner.len(), 10, "the hole's outline");
         let mut vision = Vision::new(&level, f32::INFINITY);
-        vision.update(&level, [35.0, 25.0]);
-        let lit = vision.visible_solids();
-        let has = |p: [f32; 2]| lit.iter().any(|s| s.contains(&p));
-        // The first slope's triangle (with its corner at (20,10)) is lit;
-        // the second's (corner at (70,20)) is behind the wall.
-        assert!(has([20.0, 10.0]) && has([30.0, 10.0]) && has([20.0, 20.0]));
-        assert!(!has([70.0, 20.0]));
+        for origin in [
+            [5.0, 5.0],
+            [65.0, 5.0],
+            [35.0, 55.0],
+            [5.0, 35.0],
+            [65.0, 35.0],
+        ] {
+            vision.update(&level, origin);
+            assert!(inner.iter().all(|&i| !vision.edge_visible()[i]));
+        }
+        assert!(inner.iter().all(|&i| !vision.edge_seen()[i]));
+        assert!(vision.edge_seen().iter().any(|s| *s), "outer faces seen");
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use crate::draw::Layer;
 use crate::entity::Entity;
 use crate::frame::Frame;
+use crate::generate::Style;
 use crate::level::{Level, TILE};
 use crate::memory::Memory;
 use crate::palette;
@@ -50,6 +51,9 @@ pub struct Game {
 const PLAYER_SIZE: [f32; 2] = [8.0, 8.0];
 const PLAYER_SPEED: f32 = 90.0;
 
+/// Which kind of level to generate.
+const LEVEL_STYLE: Style = Style::Cave;
+
 /// How far the player can see, in pixels. `f32::INFINITY` is unlimited.
 const VIEW_RADIUS: f32 = 96.0;
 
@@ -66,7 +70,7 @@ impl Game {
             (cols / 2) as f32 * TILE + (TILE - PLAYER_SIZE[0]) / 2.0,
             (rows / 2) as f32 * TILE + (TILE - PLAYER_SIZE[1]) / 2.0,
         ];
-        let level = Level::generate(seed, cols, rows, player);
+        let level = Level::generate(LEVEL_STYLE, seed, cols, rows, player);
         let mut rng = Rng::new(seed ^ 0x9E37_79B9);
         let npcs = Entity::spawn_npcs(
             &level,
@@ -117,16 +121,20 @@ impl Game {
     /// renderer shows it only where the matching visibility applies, so live
     /// NPCs go in `visible` and last-seen markers in `remembered`.
     pub fn frame(&self) -> Frame {
-        let mut level = Layer::default();
-        self.level.draw(&mut level);
-
-        let mut visible = level.clone();
+        // Bevels only on faces seen: now for the visible layer, ever for
+        // the remembered one. Otherwise a lit wall would show the bevel of
+        // a face behind it nobody has seen.
+        let mut visible = Layer::default();
+        self.level
+            .draw(&mut visible, |i| self.vision.edge_visible()[i]);
         for npc in &self.npcs {
             visible.rect(npc.pos, npc.size, palette::LIGHT_RED);
         }
         visible.rect(self.player, PLAYER_SIZE, palette::LIGHT_CYAN);
 
-        let mut remembered = level;
+        let mut remembered = Layer::default();
+        self.level
+            .draw(&mut remembered, |i| self.vision.edge_seen()[i]);
         for (_, m) in self.memory.stale() {
             remembered.outline(m.pos, m.size, palette::LIGHT_RED);
         }
@@ -136,7 +144,7 @@ impl Game {
             remembered,
             unknown: Layer::default(),
             polygon: self.vision.polygon().to_vec(),
-            lit_shapes: self.vision.visible_solids().to_vec(),
+            lit_shapes: self.vision.wall_band().to_vec(),
             origin: self.vision.origin(),
             radius: self.vision.radius(),
             time: self.time,
