@@ -161,6 +161,9 @@ pub struct Editor {
     /// Bottom first, each row by row.
     layers: Vec<Vec<Tile>>,
     spawn: Spawn,
+    /// The ground level (kept from the file; see
+    /// [`LevelFile::ground`]).
+    ground: usize,
     /// The layer being edited.
     layer: usize,
     /// Built from `layers` (when `dirty` is clear), for drawing.
@@ -203,12 +206,19 @@ impl Editor {
             layer: depth - 1,
             tile: [(cols / 2) as i32, (rows / 2) as i32],
         };
-        Self::with_layers(cols, rows, layers, spawn, view)
+        Self::with_layers(cols, rows, layers, spawn, 0, view)
     }
 
     /// Edit a saved level.
     pub fn from_file(file: &LevelFile, view: [f32; 2]) -> Self {
-        Self::with_layers(file.cols, file.rows, file.tiles(), file.spawn, view)
+        Self::with_layers(
+            file.cols,
+            file.rows,
+            file.tiles(),
+            file.spawn,
+            file.ground,
+            view,
+        )
     }
 
     fn with_layers(
@@ -216,6 +226,7 @@ impl Editor {
         rows: usize,
         layers: Vec<Vec<Tile>>,
         spawn: Spawn,
+        ground: usize,
         view: [f32; 2],
     ) -> Self {
         let level = build(cols, rows, &layers);
@@ -228,6 +239,7 @@ impl Editor {
             layer: spawn.layer,
             layers,
             spawn,
+            ground,
             level,
             dirty: false,
             tool: Tool::Pencil,
@@ -249,6 +261,7 @@ impl Editor {
 
     pub fn to_file(&self) -> LevelFile {
         LevelFile::new(self.cols, self.rows, &self.layers, self.spawn)
+            .with_ground(self.ground.min(self.layers.len() - 1))
     }
 
     pub fn state(&self) -> State {
@@ -712,11 +725,14 @@ impl Editor {
             radius: f32::INFINITY,
             radius_step: 0.0,
             radius_min: 0.0,
+            radius_underground: 1.0,
             time: 0.0,
             camera: self.camera.pos,
             view: self.camera.view,
             zoom: self.camera.zoom(),
             ui_scale: self.camera.ui_scale(),
+            outdoors: false,
+            ground: 0,
             world: self.world(),
             overlay: self.overlay(),
             ui: Canvas::default(),

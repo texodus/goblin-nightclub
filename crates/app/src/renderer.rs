@@ -21,7 +21,7 @@ use web_sys::HtmlCanvasElement;
 use goblin_nightclub_core::draw::Vertex;
 use goblin_nightclub_core::frame::Frame;
 use goblin_nightclub_core::level::MAX_LAYERS;
-use goblin_nightclub_core::tileset::CELL;
+use goblin_nightclub_core::tileset::{CELL, ZOOM};
 
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
@@ -29,8 +29,27 @@ const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// 1 gives hard pixel edges.
 const MASK_SAMPLES: u32 = 4;
 
-/// Scale of each layer relative to the one above it.
+/// Scale of each layer relative to the one above it, at the default
+/// zoom. See [`parallax`] for other zooms.
 const PARALLAX: f32 = 0.95;
+
+/// How much the parallax is normalized against zooming out, 0 to 1. At 1
+/// its strength shrinks in step with the zoom, so a layer's shift at the
+/// edge of the screen stays the same distance in the world as at the
+/// default zoom. At 0 the strength is [`PARALLAX`] at every zoom, so the
+/// shift at the edge grows as the view widens. Zooming in never changes
+/// it.
+const PARALLAX_NORMALIZATION: f32 = 0.5;
+
+/// The scale of each layer relative to the one above it at `zoom` screen
+/// pixels a world unit, where `default_zoom` is the zoom the art is drawn
+/// at its own size (see [`goblin_nightclub_core::tileset::ZOOM`] and the interface
+/// scale).
+fn parallax(zoom: f32, default_zoom: f32) -> f32 {
+    let normalized = (zoom / default_zoom).min(1.0);
+    let strength = 1.0 - PARALLAX_NORMALIZATION.clamp(0.0, 1.0) * (1.0 - normalized);
+    1.0 - (1.0 - PARALLAX) * strength
+}
 
 /// Mirrors `Globals` in shapes.wgsl: how world positions land on a target.
 #[repr(C)]
@@ -62,7 +81,12 @@ struct CompositeParams {
     radius_min: f32,
     zoom: f32,
     seen_zoom: f32,
-    _pad: [f32; 3],
+    /// 1 when the viewer is outdoors (lower layers fog rather than dim).
+    outdoors: f32,
+    /// The ground level: layers below it darken even outdoors.
+    ground: u32,
+    /// Layers below `ground` are seen this fraction as far.
+    radius_underground: f32,
 }
 
 /// A vertex buffer that grows (to the next power of two) as needed.
@@ -825,12 +849,13 @@ impl Renderer {
         // Transforms: each layer onto the view, smaller the deeper it is;
         // the whole level onto world-sized targets; the interface as is.
         let center = [frame.view[0] / 2.0, frame.view[1] / 2.0];
+        let parallax = parallax(zoom, ZOOM * frame.ui_scale);
         for l in &frame.layers {
             let t = Transform {
                 screen: frame.view,
                 camera,
                 center,
-                scale: PARALLAX.powi((frame.top - l.index) as i32),
+                scale: parallax.powi((frame.top - l.index) as i32),
                 zoom,
                 cell: CELL as f32,
                 _pad: [0.0; 3],
@@ -872,13 +897,15 @@ impl Renderer {
             time: frame.time,
             top: frame.top as u32,
             present,
-            scale: PARALLAX,
+            scale: parallax,
             radius_step: frame.radius_step,
             camera,
             radius_min: frame.radius_min,
             zoom,
             seen_zoom,
-            _pad: [0.0; 3],
+            outdoors: if frame.outdoors { 1.0 } else { 0.0 },
+            ground: frame.ground as u32,
+            radius_underground: frame.radius_underground,
         };
         self.queue
             .write_buffer(&self.composite_params, 0, bytemuck::bytes_of(&params));

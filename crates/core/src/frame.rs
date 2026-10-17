@@ -51,6 +51,9 @@ pub struct Frame {
     /// least any is.
     pub radius_step: f32,
     pub radius_min: f32,
+    /// Layers below `ground` are seen this fraction as far (1 for no
+    /// change), applied after the step per layer.
+    pub radius_underground: f32,
     /// Game time in seconds, for animated styles.
     pub time: f32,
     /// Top-left of the view, in world units.
@@ -62,6 +65,12 @@ pub struct Frame {
     pub zoom: f32,
     /// Screen pixels per interface pixel, for `ui`.
     pub ui_scale: f32,
+    /// Is the viewer under the open sky? Then layers below fade into fog
+    /// instead of darkening.
+    pub outdoors: bool,
+    /// The ground level: the lowest layer under the open sky. Looking down
+    /// from outdoors, layers at or above it fog; those below darken.
+    pub ground: usize,
     /// Size of the level, in world units.
     pub world: [f32; 2],
     /// Drawn in world space over everything, on the viewer's layer.

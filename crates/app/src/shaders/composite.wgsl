@@ -26,9 +26,14 @@ struct Params {
     radius_min: f32,
     zoom: f32,
     seen_zoom: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    // 1 when the viewer is under the open sky: lower layers fade into fog
+    // instead of darkening.
+    outdoors: f32,
+    // The ground level: looking down from outdoors, layers at or above it
+    // fade into fog, those below darken.
+    ground: u32,
+    // Layers below `ground` are seen this fraction as far.
+    radius_underground: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -51,8 +56,29 @@ const RADIUS_FADE: f32 = 12.0;
 // and column of the 4x4 pattern has.
 const REMEMBERED_MIN: f32 = 0.15;
 
-// Brightness of each layer relative to the one above it.
+// Indoors, brightness of each layer relative to the one above it.
 const LOWER_BRIGHTNESS: f32 = 0.55;
+
+// Outdoors, each layer down fades this much of the way toward fog.
+const FOG_PER_LAYER: f32 = 0.4;
+const FOG_COLOR: vec3<f32> = vec3(0.67, 0.67, 0.67);
+
+// Color `c` (premultiplied by `alpha`) of layer `a`, below the viewer's,
+// as seen from there: one step for each layer looked down through, in
+// order, so the effects compound. A step down into a layer above ground,
+// from outdoors, fades toward fog; any other step darkens.
+fn at_depth(c: vec3<f32>, a: u32, alpha: f32) -> vec3<f32> {
+    var out = c;
+    for (var j = params.top; j > a; j--) {
+        let into = j - 1u;
+        if params.outdoors > 0.5 && into >= params.ground {
+            out = mix(out, FOG_COLOR * alpha, FOG_PER_LAYER);
+        } else {
+            out *= LOWER_BRIGHTNESS;
+        }
+    }
+    return out;
+}
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
@@ -77,11 +103,17 @@ fn bayer(p: vec2<u32>) -> f32 {
 }
 
 // View radius `d` layers below the viewer's (0 for unlimited).
-fn radius_at(d: u32) -> f32 {
+// View radius on layer `a`, `d` layers below the viewer's (0 for
+// unlimited): a step less per layer, and a fraction of that below ground.
+fn radius_at(a: u32, d: u32) -> f32 {
     if params.radius <= 0.0 {
         return 0.0;
     }
-    return max(params.radius - params.radius_step * f32(d), params.radius_min);
+    var r = max(params.radius - params.radius_step * f32(d), params.radius_min);
+    if a < params.ground {
+        r = max(r * params.radius_underground, params.radius_min);
+    }
+    return r;
 }
 
 // Full color, dimming slightly toward the edge of a finite view `radius`.
@@ -171,19 +203,19 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         if mask > 0.25 {
             if mask < 0.75 {
                 // Water: its styled (premultiplied) color over what's below.
-                let dim = pow(LOWER_BRIGHTNESS, f32(d));
                 let below = select(0.0, through, d > 0u);
                 let alpha = textureLoad(canvases, px, 3u * a, 0).a;
-                color += shade(a, px, world, radius_at(d), below) * dim * remaining;
+                let styled = shade(a, px, world, radius_at(a, d), below);
+                color += at_depth(styled, a, alpha) * remaining;
                 remaining *= 1.0 - alpha;
             }
             through = min(through, seen_at(a, world));
             scale *= params.scale;
             continue;
         }
-        let dim = pow(LOWER_BRIGHTNESS, f32(d));
         let below = select(0.0, through, d > 0u);
-        color += shade(a, px, world, radius_at(d), below) * dim * remaining;
+        let styled = shade(a, px, world, radius_at(a, d), below);
+        color += at_depth(styled, a, 1.0) * remaining;
         return vec4(color, 1.0);
     }
     return vec4(color, 1.0);

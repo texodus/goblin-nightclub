@@ -3,15 +3,20 @@
 //!
 //! - **The underworld**, [`Params::underworld_layers`] layers of caves and
 //!   dungeon rooms carved out of solid rock, joined by stairs, with pools
-//!   of water in the caves. Enclosed on every side.
+//!   of water and holes down to the cave below. Enclosed on every side.
 //! - **The overworld**, [`Params::overworld_layers`] layers of terrain from
 //!   a heightmap: each column is rock up to its height, floor at it, and
 //!   void above, so from above you look down onto plains, hills and
 //!   mountains, and a step in height is a cliff. Cliffs are climbed by
 //!   ramps (a staircase in the cliff face), placed along them every so
 //!   often if [`Params::ramp_spacing`] allows. Lakes fill the lowest
-//!   ground and rivers run down to them, both water over a sandy bed, with
-//!   fords where a river would otherwise cut the land in two.
+//!   ground and rivers run down to them, with fords where a river would
+//!   otherwise cut the land in two. Holes and canyons open onto a stony
+//!   floor one layer down.
+//!
+//! Water rests on solid ground: under every water tile, the tile below and
+//! its eight neighbors are wall or water, never floor or void (see
+//! [`World::rests`]). That holds for lakes, rivers and pools alike.
 //!
 //! The two meet at entrances: a cellar under the plains with a staircase
 //! down from the surface and another down into the top cave.
@@ -19,8 +24,9 @@
 //! Everything the player can walk to from the spawn is kept; floor in the
 //! underworld that can't be reached is filled with rock (ground in the
 //! overworld stays, reachable or not: whether every hilltop has a ramp is
-//! up to the parameters). Water never blocks the way between two pieces of
-//! land that nothing else joins.
+//! up to the parameters). Water and holes never block the way between two
+//! pieces of land that nothing else joins: fords cross water, and bridges
+//! a tile wide cross holes. Holes keep a tile clear of water.
 //!
 //! The materials are named in the tile sheet (see [`goblin_nightclub_core::tileset`]).
 
@@ -36,7 +42,7 @@ use goblin_nightclub_core::tileset;
 pub struct Params {
     /// Layers of terrain. Heights run from 1 (plains) to this minus 1, so
     /// 2 gives flat plains only, 3 adds hills, 4 adds mountains, and more
-    /// stack higher peaks. The lowest layer holds the lake beds.
+    /// stack higher peaks. The lowest layer is rock under the lakes.
     pub overworld_layers: usize,
     /// Layers of caves and dungeons below the terrain.
     pub underworld_layers: usize,
@@ -65,6 +71,22 @@ pub struct Params {
     pub stairs: usize,
     /// Share of each cave's open floor under pools of water, 0 to 1.
     pub pool_share: f32,
+    /// Holes (round pits) and canyons (long winding rifts) opened in the
+    /// plains and in each cave, as void. Land they cut off is joined up
+    /// again by bridges a tile wide.
+    pub holes: usize,
+    pub canyons: usize,
+    /// A hole's radius in tiles, and a canyon's width and length, each
+    /// chosen between the two bounds (inclusive) for every hole or canyon.
+    pub hole_radius: [usize; 2],
+    pub canyon_width: [usize; 2],
+    pub canyon_length: [usize; 2],
+    /// How many layers down a hole or canyon goes, chosen between the
+    /// bounds for each: 1 opens onto the layer below, 2 through it onto
+    /// the next, and so on. It stops short where the layer below has
+    /// something other than rock or cave floor (a room, stairs), or water
+    /// within a tile.
+    pub hole_depth: [usize; 2],
 }
 
 impl Default for Params {
@@ -83,6 +105,12 @@ impl Default for Params {
             rooms: 3,
             stairs: 2,
             pool_share: 0.06,
+            holes: 3,
+            canyons: 1,
+            hole_radius: [1, 2],
+            canyon_width: [1, 2],
+            canyon_length: [10, 24],
+            hole_depth: [1, 1],
         }
     }
 }
@@ -101,11 +129,15 @@ const SPAWN_CLEARANCE: i32 = 2;
 const PLAINS: &str = "grass";
 const HILLS: &str = "dirt";
 const MOUNTAINS: &str = "stone";
+/// Fords across water.
 const BED: &str = "sand";
 const ROCK: &str = "rock";
 const CAVE_FLOOR: &str = "dirt";
 const ROOM_FLOOR: &str = "planks";
 const ROOM_WALL: &str = "brick";
+const BRIDGE: &str = "planks";
+/// The floor of a canyon, under a hole in the plains.
+const CANYON_FLOOR: &str = "stone";
 
 /// Generate a level from `seed`, `cols` x `rows` tiles a layer, the player
 /// starting on the plains at `spawn` (pixels).
@@ -123,6 +155,12 @@ pub fn generate_level(
 /// The spawn's layer: the plains, the second overworld layer up.
 pub fn spawn_layer(params: &Params) -> usize {
     params.underworld_layers.max(1) + 1
+}
+
+/// The ground level: the plains, the layer the player starts on. The
+/// canyon floors and cellars below it count as underground.
+pub fn ground_layer(params: &Params) -> usize {
+    spawn_layer(params)
 }
 
 struct World {
@@ -149,6 +187,8 @@ struct Floors {
     bed: FloorId,
     cave: FloorId,
     room: FloorId,
+    bridge: FloorId,
+    canyon: FloorId,
 }
 
 impl World {
@@ -181,6 +221,8 @@ impl World {
                 bed: tileset::floor(BED),
                 cave: tileset::floor(CAVE_FLOOR),
                 room: tileset::floor(ROOM_FLOOR),
+                bridge: tileset::floor(BRIDGE),
+                canyon: tileset::floor(CANYON_FLOOR),
             },
         }
     }
@@ -190,6 +232,7 @@ impl World {
         self.lakes();
         self.rivers();
         self.raise_terrain();
+        self.plains_holes();
         self.ramps();
         self.underworld();
         self.entrances();
@@ -323,20 +366,19 @@ impl World {
         }
     }
 
-    /// Lakes where the noise is lowest: water on the plains' layer over a
-    /// sandy bed on the layer below. Not at the spawn, and not where the
+    /// Lakes where the noise is lowest: water on the plains' layer, over
+    /// the rock of the layer below. Not at the spawn, and not where the
     /// relaxed terrain is still high.
     fn lakes(&mut self) {
         let mut sorted = self.noise.clone();
         sorted.sort_by(f32::total_cmp);
         let share = self.params.water_share.clamp(0.0, 0.9);
         let level = sorted[(share * (sorted.len() - 1) as f32) as usize];
-        let (bed, plains) = (self.over(0), self.over(1));
+        let plains = self.over(1);
         for t in self.tiles() {
             let i = self.index(t);
             let low = share > 0.0 && self.noise[i] <= level && self.height[i] == 1;
-            if low && self.interior(t) && !self.near_spawn(t, 2) {
-                self.layers[bed][i] = Tile::Whole(Part::Floor(self.floors.bed));
+            if low && self.interior(t) && !self.near_spawn(t, 2) && self.rests(plains, t) {
                 self.layers[plains][i] = Tile::WATER;
             }
         }
@@ -348,8 +390,7 @@ impl World {
     /// is left as land.
     fn rivers(&mut self) {
         let plains = self.over(1);
-        let bed = self.over(0);
-        let water = |w: &World, t: [i32; 2]| w.layers[plains][w.index(t)] == Tile::WATER;
+        let water =|w: &World, t: [i32; 2]| w.layers[plains][w.index(t)] == Tile::WATER;
         for _ in 0..self.params.rivers {
             let highs: Vec<[i32; 2]> = self
                 .tiles()
@@ -399,8 +440,7 @@ impl World {
                 self.height[i] = 1;
                 let ford = self.params.ford_spacing > 0
                     && n % self.params.ford_spacing == self.params.ford_spacing / 2;
-                if !ford {
-                    self.layers[bed][i] = Tile::Whole(Part::Floor(self.floors.bed));
+                if !ford && self.rests(plains, t) {
                     self.layers[plains][i] = Tile::WATER;
                 }
             }
@@ -432,8 +472,7 @@ impl World {
                 let [dx, dy] = side.offset();
                 water(self, [t[0] + dx, t[1] + dy])
             });
-            if landlocked && self.height[i] == 1 {
-                self.layers[bed][i] = Tile::Whole(Part::Floor(self.floors.bed));
+            if landlocked && self.height[i] == 1 && self.rests(plains, t) {
                 self.layers[plains][i] = Tile::WATER;
             }
         }
@@ -441,7 +480,7 @@ impl World {
 
     /// Write the terrain into the overworld layers: for each column, rock
     /// below its height, floor at it, void above. Water placed already is
-    /// kept. The lowest layer is the lake beds and rock.
+    /// kept. The lowest layer is all rock.
     fn raise_terrain(&mut self) {
         let n = self.params.overworld_layers;
         for t in self.tiles() {
@@ -454,9 +493,7 @@ impl World {
             };
             for k in 0..n {
                 let layer = self.over(k);
-                if self.layers[layer][i] == Tile::WATER
-                    || self.layers[layer][i].floor_id() == Some(self.floors.bed)
-                {
+                if self.layers[layer][i] == Tile::WATER {
                     continue;
                 }
                 self.layers[layer][i] = if k < h {
@@ -473,6 +510,148 @@ impl World {
                     let layer = self.over(k);
                     self.layers[layer][i] = Tile::Whole(self.rock);
                 }
+            }
+        }
+    }
+
+    /// Holes and canyons in the plains, opening onto a stony canyon floor
+    /// below. Never on or beside water, and not at the spawn.
+    fn plains_holes(&mut self) {
+        let plains = self.over(1);
+        let plains_floor = self.floors.plains;
+        let allowed = move |w: &World, t: [i32; 2]| {
+            w.interior(t)
+                && !w.near_spawn(t, 2)
+                && w.height[w.index(t)] == 1
+                && w.layers[plains][w.index(t)].floor_id() == Some(plains_floor)
+                && !w.beside_water(plains, t)
+        };
+        self.carve_voids(plains, &allowed);
+    }
+
+    /// Is any tile within one of `t` (itself included) water, on layer `k`?
+    fn beside_water(&self, k: usize, t: [i32; 2]) -> bool {
+        (-1..=1).any(|dy| {
+            (-1..=1).any(|dx| {
+                let n = [t[0] + dx, t[1] + dy];
+                self.in_bounds(n) && self.layers[k][self.index(n)] == Tile::WATER
+            })
+        })
+    }
+
+    /// Would water on layer `k` at `t` rest on solid ground? The tile under
+    /// it and that tile's eight neighbors, on the layer below, must all be
+    /// wall or water: nothing open beneath. Below the lowest layer is
+    /// bedrock, and so is anything off the edge. Every water tile is
+    /// placed only where this holds, and nothing is dug under water
+    /// afterward (holes, cellars and stairs keep a tile clear of it).
+    fn rests(&self, k: usize, t: [i32; 2]) -> bool {
+        let Some(below) = k.checked_sub(1) else {
+            return true;
+        };
+        (-1..=1).all(|dy| {
+            (-1..=1).all(|dx| {
+                let n = [t[0] + dx, t[1] + dy];
+                if !self.in_bounds(n) {
+                    return true;
+                }
+                let tile = self.layers[below][self.index(n)];
+                tile.wall() == Solid::Full || tile == Tile::WATER
+            })
+        })
+    }
+
+    /// Open [`Params::holes`] holes and [`Params::canyons`] canyons as void
+    /// on layer `k`, only where `allowed`: holes are rough discs of
+    /// [`Params::hole_radius`], canyons winding rifts of
+    /// [`Params::canyon_width`] and [`Params::canyon_length`]. Each goes
+    /// [`Params::hole_depth`] layers down (see [`World::deepen`]).
+    fn carve_voids(&mut self, k: usize, allowed: &dyn Fn(&World, [i32; 2]) -> bool) {
+        let p = self.params.clone();
+        let between = |w: &mut World, [lo, hi]: [usize; 2]| w.rng.range(lo.min(hi), lo.max(hi));
+        let spots: Vec<[i32; 2]> = self.tiles().filter(|&t| allowed(self, t)).collect();
+        if spots.is_empty() {
+            return;
+        }
+        let mut features: Vec<(Vec<[i32; 2]>, usize)> = Vec::new();
+        for _ in 0..p.holes {
+            let c = spots[self.rng.range(0, spots.len() - 1)];
+            let r = between(self, p.hole_radius) as i32;
+            let mut tiles = Vec::new();
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    // A rough disc: the corners of the square left out.
+                    if dx * dx + dy * dy <= r * r + 1 {
+                        tiles.push([c[0] + dx, c[1] + dy]);
+                    }
+                }
+            }
+            let depth = between(self, p.hole_depth);
+            features.push((tiles, depth));
+        }
+        for _ in 0..p.canyons {
+            let mut at = spots[self.rng.range(0, spots.len() - 1)];
+            let mut angle = self.rng.unit() * std::f32::consts::TAU;
+            let length = between(self, p.canyon_length);
+            let (mut fx, mut fy) = (at[0] as f32 + 0.5, at[1] as f32 + 0.5);
+            let mut tiles = Vec::new();
+            for _ in 0..length {
+                // Widened across the direction of travel.
+                let width = between(self, p.canyon_width) as i32;
+                let side = if angle.cos().abs() > angle.sin().abs() {
+                    [0, 1]
+                } else {
+                    [1, 0]
+                };
+                for i in 0..width {
+                    tiles.push([at[0] + side[0] * i, at[1] + side[1] * i]);
+                }
+                angle += (self.rng.unit() - 0.5) * 0.8;
+                fx += angle.cos();
+                fy += angle.sin();
+                at = [fx.floor() as i32, fy.floor() as i32];
+                if !self.in_bounds(at) || !allowed(self, at) {
+                    break;
+                }
+            }
+            let depth = between(self, p.hole_depth);
+            features.push((tiles, depth));
+        }
+        for (tiles, depth) in features {
+            let opened: Vec<[i32; 2]> = tiles.into_iter().filter(|&t| allowed(self, t)).collect();
+            for &t in &opened {
+                let i = self.index(t);
+                self.layers[k][i] = Tile::VOID;
+            }
+            self.deepen(k, &opened, depth);
+        }
+    }
+
+    /// Take a hole on layer `k` at `tiles` down `depth` layers: the layers
+    /// below become void too, as far as they're rock or cave floor with no
+    /// water within a tile (a room, stairs or a pool stops it), and the
+    /// layer under the last gets a stony floor where it was rock.
+    fn deepen(&mut self, k: usize, tiles: &[[i32; 2]], depth: usize) {
+        let cave = self.floors.cave;
+        for &t in tiles {
+            let i = self.index(t);
+            let mut bottom = k;
+            for j in 1..depth {
+                let Some(layer) = k.checked_sub(j) else {
+                    break;
+                };
+                let tile = self.layers[layer][i];
+                let soft = tile == Tile::Whole(self.rock) || tile.floor_id() == Some(cave);
+                if !soft || self.beside_water(layer, t) {
+                    break;
+                }
+                self.layers[layer][i] = Tile::VOID;
+                bottom = layer;
+            }
+            if let Some(floor) = bottom.checked_sub(1)
+                && self.layers[floor][i] == Tile::Whole(self.rock)
+            {
+                self.layers[floor][i] = Tile::Whole(Part::Floor(self.floors.canyon));
             }
         }
     }
@@ -560,6 +739,7 @@ impl World {
             );
             self.rooms(k);
             self.pools(k);
+            self.cave_holes(k);
         }
         // Stairs between each underworld layer and the one below, where
         // both have floor all around; cleared if there's no such spot.
@@ -580,10 +760,15 @@ impl World {
                 .filter(|&t| clear(self, upper, t) && clear(self, upper - 1, t))
                 .collect();
             if candidates.is_empty() {
+                // (Clear of water above, so the pocket below undermines
+                // none.)
                 let pool: Vec<[i32; 2]> = interior
                     .iter()
                     .copied()
-                    .filter(|&t| self.layers[upper][self.index(t)].is_floor())
+                    .filter(|&t| {
+                        self.layers[upper][self.index(t)].is_floor()
+                            && !self.beside_water(upper, t)
+                    })
                     .collect();
                 if let Some(&at) = pool.get(self.rng.range(0, pool.len().max(1) - 1)) {
                     for k in [upper - 1, upper] {
@@ -686,7 +871,8 @@ impl World {
     }
 
     /// Pools: the lowest-noise cave floor, where all its neighbors are
-    /// floor too (so nothing narrow is blocked), up to `pool_share` of the
+    /// floor too (so nothing narrow is blocked) and the cave below is
+    /// solid underneath (see [`World::rests`]), up to `pool_share` of the
     /// floor.
     fn pools(&mut self, k: usize) {
         let share = self.params.pool_share.clamp(0.0, 0.5);
@@ -694,10 +880,14 @@ impl World {
             return;
         }
         let seed = self.rng.range(0, u16::MAX as usize) as u32;
+        let cave = self.floors.cave;
+        let floor = self.layers[k]
+            .iter()
+            .filter(|t| t.floor_id() == Some(cave))
+            .count();
         let mut open: Vec<([i32; 2], f32)> = self
             .tiles()
             .filter(|&t| {
-                let cave = self.floors.cave;
                 self.layers[k][self.index(t)].floor_id() == Some(cave)
                     && (-1..=1).all(|dy| {
                         (-1..=1).all(|dx| {
@@ -705,15 +895,28 @@ impl World {
                             self.in_bounds(n) && self.layers[k][self.index(n)].is_floor()
                         })
                     })
+                    && self.rests(k, t)
             })
             .map(|t| (t, fbm(seed, t[0] as f32 / 6.0, t[1] as f32 / 6.0)))
             .collect();
         open.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let count = (open.len() as f32 * share) as usize;
+        let count = ((floor as f32 * share) as usize).min(open.len());
         for (t, _) in open.into_iter().take(count) {
             let i = self.index(t);
             self.layers[k][i] = Tile::WATER;
         }
+    }
+
+    /// Holes and canyons in cave layer `k`, down to the cave below (or
+    /// into the dark, on the lowest). Only in cave floor, clear of pools.
+    fn cave_holes(&mut self, k: usize) {
+        let cave_floor = self.floors.cave;
+        let allowed = move |w: &World, t: [i32; 2]| {
+            w.interior(t)
+                && w.layers[k][w.index(t)].floor_id() == Some(cave_floor)
+                && !w.beside_water(k, t)
+        };
+        self.carve_voids(k, &allowed);
     }
 
     /// Entrances: a cellar in the lowest overworld layer under a plains
@@ -727,7 +930,8 @@ impl World {
                 .tiles()
                 .filter(|&t| {
                     // The cellar's footprint: plains all over it, rock
-                    // under all of it.
+                    // under all of it, and no water on the plains within a
+                    // tile of it (water needs solid ground beneath).
                     t[0] >= 3
                         && t[1] >= 3
                         && (t[0] as usize) + 4 < self.cols
@@ -738,6 +942,12 @@ impl World {
                                 let i = self.index([t[0] + dx, t[1] + dy]);
                                 self.layers[plains][i].floor_id() == Some(plains_floor)
                                     && self.layers[cellar][i] == Tile::Whole(self.rock)
+                            })
+                        })
+                        && (-2..=2).all(|dy| {
+                            (-2..=3).all(|dx| {
+                                let i = self.index([t[0] + dx, t[1] + dy]);
+                                self.layers[plains][i] != Tile::WATER
                             })
                         })
                 })
@@ -806,9 +1016,22 @@ impl World {
         }
     }
 
-    /// The connected piece of plains floor `start` is on (across sides).
-    fn plains_region(&self, start: [i32; 2]) -> Vec<[i32; 2]> {
-        let plains = self.over(1);
+    /// Lay `path` on layer `k`: water becomes a ford (a sandy floor), void
+    /// a bridge (planks, over whatever's below).
+    fn lay_crossing(&mut self, k: usize, path: Vec<[i32; 2]>) {
+        for t in path {
+            let i = self.index(t);
+            if self.layers[k][i] == Tile::WATER {
+                self.layers[k][i] = Tile::Whole(Part::Floor(self.floors.bed));
+            } else {
+                self.layers[k][i] = Tile::Whole(Part::Floor(self.floors.bridge));
+            }
+        }
+    }
+
+    /// The connected piece of floor on layer `k` that `start` is on
+    /// (across sides).
+    fn region(&self, k: usize, start: [i32; 2]) -> Vec<[i32; 2]> {
         let mut seen = vec![false; self.cols * self.rows];
         let mut stack = vec![start];
         let mut out = Vec::new();
@@ -820,7 +1043,7 @@ impl World {
                 let n = [t[0] + dx, t[1] + dy];
                 if self.in_bounds(n)
                     && !seen[self.index(n)]
-                    && self.layers[plains][self.index(n)].is_floor()
+                    && self.layers[k][self.index(n)].is_floor()
                 {
                     seen[self.index(n)] = true;
                     stack.push(n);
@@ -830,10 +1053,17 @@ impl World {
         out
     }
 
-    /// The water tiles of the shortest way from `start` (cut-off land)
-    /// across water to land that's `reached`, within `reach` tiles.
-    fn ford_path(&self, start: [i32; 2], reached: &[bool], reach: usize) -> Option<Vec<[i32; 2]>> {
-        let plains = self.over(1);
+    /// The water and void tiles of the shortest way on layer `k` from
+    /// `start` (cut-off land) to land that's `reached`, within `reach`
+    /// tiles: a ford across water, a bridge across a hole, or both. Water
+    /// with water resting on it (on the layer above) can't be forded.
+    fn crossing(
+        &self,
+        k: usize,
+        start: [i32; 2],
+        reached: &[bool],
+        reach: usize,
+    ) -> Option<Vec<[i32; 2]>> {
         let mut from: Vec<Option<[i32; 2]>> = vec![None; self.cols * self.rows];
         let mut seen = vec![false; self.cols * self.rows];
         let mut frontier = vec![start];
@@ -847,11 +1077,11 @@ impl World {
                     if !self.in_bounds(n) || seen[self.index(n)] {
                         continue;
                     }
-                    let tile = self.layers[plains][self.index(n)];
+                    let tile = self.layers[k][self.index(n)];
                     seen[self.index(n)] = true;
                     from[self.index(n)] = Some(t);
                     if tile.is_floor() && reached[self.index(n)] {
-                        // Walk back, collecting the water crossed.
+                        // Walk back, collecting what was crossed.
                         let mut path = Vec::new();
                         let mut at = t;
                         while at != start {
@@ -860,7 +1090,11 @@ impl World {
                         }
                         return Some(path);
                     }
-                    if tile == Tile::WATER {
+                    // Water can be forded unless water on the layer above
+                    // rests on it (a ford is floor: open ground beneath).
+                    let fordable = tile == Tile::WATER
+                        && (k + 1 >= self.layers.len() || !self.beside_water(k + 1, n));
+                    if fordable || tile == Tile::VOID {
                         next.push(n);
                     }
                 }
@@ -882,7 +1116,6 @@ impl World {
         const ISLET: usize = 16;
         let m = self.params.underworld_layers;
         let plains = self.over(1);
-        let bed = self.over(0);
         // Tiles given up on, per layer: nothing could join them.
         let mut skipped = vec![vec![false; self.cols * self.rows]; self.layers.len()];
         for _ in 0..256 {
@@ -902,28 +1135,35 @@ impl World {
             });
             if let Some(start) = cut_off {
                 let far = self.cols + self.rows;
-                let region = self.plains_region(start);
-                let path = self.ford_path(start, &reached[plains], 8).or_else(|| {
-                    (region.len() > ISLET)
-                        .then(|| self.ford_path(start, &reached[plains], far))
-                        .flatten()
+                let region = self.region(plains, start);
+                let path = self
+                    .crossing(plains, start, &reached[plains], 8)
+                    .or_else(|| {
+                        (region.len() > ISLET)
+                            .then(|| self.crossing(plains, start, &reached[plains], far))
+                            .flatten()
+                    });
+                // An islet sinks only into water: never next to a hole,
+                // which must stay clear of water, and only where the
+                // water would rest on solid ground (not over a cellar or
+                // canyon floor).
+                let in_water = region.iter().all(|&t| {
+                    self.interior(t)
+                        && !self.near_spawn(t, 2)
+                        && self.rests(plains, t)
+                        && Side::ALL.into_iter().all(|side| {
+                            let [dx, dy] = side.offset();
+                            let n = [t[0] + dx, t[1] + dy];
+                            self.layers[plains][self.index(n)] != Tile::VOID
+                        })
                 });
                 if let Some(path) = path {
-                    for t in path {
-                        let i = self.index(t);
-                        self.layers[plains][i] = Tile::Whole(Part::Floor(self.floors.bed));
-                        self.layers[bed][i] = Tile::Whole(self.rock);
-                    }
+                    self.lay_crossing(plains, path);
                     changed = true;
-                } else if region.len() <= ISLET
-                    && region
-                        .iter()
-                        .all(|t| self.interior(*t) && !self.near_spawn(*t, 2))
-                {
+                } else if region.len() <= ISLET && in_water {
                     for t in region {
                         let i = self.index(t);
                         self.layers[plains][i] = Tile::WATER;
-                        self.layers[bed][i] = Tile::Whole(Part::Floor(self.floors.bed));
                     }
                     changed = true;
                 } else {
@@ -997,19 +1237,38 @@ impl World {
                 });
                 if let Some((t, n)) = shore {
                     let far = self.cols + self.rows;
-                    match self.ford_path(n, &reached[plains], far) {
+                    match self.crossing(plains, n, &reached[plains], far) {
                         Some(path) => {
-                            for t in path.into_iter().chain([n]) {
-                                let i = self.index(t);
-                                self.layers[plains][i] = Tile::Whole(Part::Floor(self.floors.bed));
-                                self.layers[bed][i] = Tile::Whole(self.rock);
-                            }
+                            self.lay_crossing(plains, path.into_iter().chain([n]).collect());
                         }
                         None => {
                             skipped[hills][self.index(t)] = true;
                         }
                     }
                     changed = true;
+                }
+            }
+            // Bridges in the caves: cut-off cave floor joined across a
+            // hole (or pool) to floor that's reached, if it's near.
+            if !changed {
+                for k in 0..m {
+                    let cut_off = self.tiles().find(|&t| {
+                        let i = self.index(t);
+                        self.layers[k][i].is_floor() && !reached[k][i] && !skipped[k][i]
+                    });
+                    let Some(start) = cut_off else {
+                        continue;
+                    };
+                    match self.crossing(k, start, &reached[k], 8) {
+                        Some(path) => self.lay_crossing(k, path),
+                        None => {
+                            for t in self.region(k, start) {
+                                skipped[k][self.index(t)] = true;
+                            }
+                        }
+                    }
+                    changed = true;
+                    break;
                 }
             }
             if !changed {
@@ -1269,8 +1528,7 @@ mod tests {
     }
 
     /// Each overworld column is rock, then one floor (or water on the
-    /// plains, with a bed beneath), then void; and the underworld is
-    /// enclosed.
+    /// plains), then void; and the underworld is enclosed.
     #[test]
     fn columns_follow_the_heightmap() {
         let p = Params::default();
@@ -1285,9 +1543,7 @@ mod tests {
                         .collect();
                     // Ramps (stairs in a cliff) and entrance cellars (floor
                     // under the plains) are the exceptions to the rule.
-                    let cellar = column[0]
-                        .floor_id()
-                        .is_some_and(|f| f != tileset::floor(BED));
+                    let cellar = column[0].floor_id().is_some();
                     if column.iter().any(|t| t.stairs().is_some()) || cellar {
                         continue;
                     }
@@ -1309,10 +1565,8 @@ mod tests {
                                 assert!(ok, "seed {seed} ({x}, {y}): {t:?} at the surface");
                             }
                             std::cmp::Ordering::Greater => {
-                                // Above the surface: void, or the bed's water.
-                                let ok = *t == Tile::VOID
-                                    || *t == Tile::WATER
-                                    || (t.void_quarters() != 0);
+                                // Above the surface: void.
+                                let ok = *t == Tile::VOID || (t.void_quarters() != 0);
                                 assert!(
                                     ok,
                                     "seed {seed} ({x}, {y}) layer {k}: {t:?} above the surface"
@@ -1354,9 +1608,10 @@ mod tests {
                 for i in 0..COLS * ROWS {
                     let (x, y) = ((i % COLS) as i32, (i / COLS) as i32);
                     let open = m.solid(x, y) != Solid::Full;
-                    // A lake bed is floor, but under water: nobody walks there.
-                    let bed = k + 1 < level.depth() && level.layer(k + 1).tile(x, y) == Tile::WATER;
-                    if !open || bed {
+                    // A canyon floor (the layer under the plains) is floor,
+                    // but under a hole: nobody walks there.
+                    let covered = k + 1 == top && level.layer(top).tile(x, y).void_quarters() != 0;
+                    if !open || covered {
                         continue;
                     }
                     if k < p.underworld_layers {
@@ -1403,29 +1658,169 @@ mod tests {
         assert!(cut_off > 0, "some hilltop should be unreachable");
     }
 
+    /// Under every water tile (lake, river or pool), the tile below and
+    /// its eight neighbors are wall or water.
     #[test]
-    fn water_lies_on_the_plains_over_sand_and_never_at_the_spawn() {
+    fn water_rests_on_solid_ground_and_never_at_the_spawn() {
         let p = Params::default();
-        let (bed, plains) = (p.underworld_layers, p.underworld_layers + 1);
-        let mut water = 0;
+        let plains = p.underworld_layers + 1;
+        let (mut lakes, mut pools) = (0, 0);
         for seed in 0..20 {
             let level = world(seed);
-            for y in 0..ROWS as i32 {
-                for x in 0..COLS as i32 {
-                    if level.layer(plains).tile(x, y) == Tile::WATER {
-                        water += 1;
-                        assert_eq!(
-                            level.layer(bed).tile(x, y).floor_id(),
-                            Some(tileset::floor(BED)),
-                            "seed {seed}"
-                        );
-                        let s = spawn_tile();
-                        assert!((x - s[0]).abs().max((y - s[1]).abs()) > SPAWN_CLEARANCE);
+            for k in 0..level.depth() {
+                for y in 0..ROWS as i32 {
+                    for x in 0..COLS as i32 {
+                        if level.layer(k).tile(x, y) != Tile::WATER {
+                            continue;
+                        }
+                        if k == plains {
+                            lakes += 1;
+                            let s = spawn_tile();
+                            assert!((x - s[0]).abs().max((y - s[1]).abs()) > SPAWN_CLEARANCE);
+                        } else {
+                            assert!(k < p.underworld_layers, "seed {seed}: water on layer {k}");
+                            pools += 1;
+                        }
+                        let Some(below) = k.checked_sub(1) else {
+                            continue;
+                        };
+                        for dy in -1..=1 {
+                            for dx in -1..=1 {
+                                let under = level.layer(below).tile(x + dx, y + dy);
+                                assert!(
+                                    under.wall() == Solid::Full || under == Tile::WATER,
+                                    "seed {seed}: water at ({x}, {y}) on layer {k} over {under:?} at ({}, {})",
+                                    x + dx,
+                                    y + dy
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
-        assert!(water > 20 * 100, "{water} water tiles in 20 levels");
+        assert!(lakes > 20 * 100, "{lakes} lake tiles in 20 levels");
+        assert!(pools > 20 * 10, "{pools} pool tiles in 20 levels");
+    }
+
+    #[test]
+    fn holes_open_onto_the_layer_below_and_keep_clear_of_water() {
+        let p = Params::default();
+        let plains = p.underworld_layers + 1;
+        let (mut plains_holes, mut cave_holes, mut bridges) = (0, 0, 0);
+        for seed in 0..20 {
+            let level = world(seed);
+            for k in 0..level.depth() {
+                for y in 1..ROWS as i32 - 1 {
+                    for x in 1..COLS as i32 - 1 {
+                        let t = level.layer(k).tile(x, y);
+                        if k == plains && t.floor_id() == Some(tileset::floor(BRIDGE)) {
+                            bridges += 1;
+                        }
+                        if t != Tile::VOID || k > plains {
+                            continue;
+                        }
+                        // A hole: on the plains over a canyon floor; in a
+                        // cave over whatever's below. Never beside water.
+                        if k == plains {
+                            plains_holes += 1;
+                            // (Smoothing may bevel the canyon floor's corners.)
+                            let under = level.layer(k - 1).tile(x, y);
+                            assert!(
+                                under.floor_id().is_some() || under.stairs().is_some(),
+                                "seed {seed} ({x}, {y}): {under:?}"
+                            );
+                        } else if k < p.underworld_layers {
+                            cave_holes += 1;
+                        }
+                        for dy in -1..=1 {
+                            for dx in -1..=1 {
+                                let n = level.layer(k).tile(x + dx, y + dy);
+                                assert_eq!(
+                                    n.water_quarters(),
+                                    0,
+                                    "seed {seed}: hole at ({x}, {y}) beside water"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            plains_holes > 20 * 10,
+            "{plains_holes} plains holes in 20 levels"
+        );
+        assert!(cave_holes > 20 * 10, "{cave_holes} cave holes in 20 levels");
+        assert!(bridges > 0, "no bridges in 20 levels");
+    }
+
+    #[test]
+    fn hole_sizes_and_depth_follow_the_parameters() {
+        // On flat, dry plains, so the holes aren't trimmed by hills or water.
+        let flat = Params {
+            hill_share: 0.0,
+            water_share: 0.0,
+            rivers: 0,
+            ..Params::default()
+        };
+        let p = Params {
+            holes: 2,
+            canyons: 1,
+            hole_radius: [3, 3],
+            canyon_width: [3, 3],
+            canyon_length: [30, 30],
+            hole_depth: [2, 2],
+            ..flat.clone()
+        };
+        let plains = p.underworld_layers + 1;
+        // Hole tiles on the plains over `seeds`, with `params`.
+        let count = |params: &Params| {
+            (0..10u32)
+                .map(|seed| {
+                    let level = generate_level(seed, COLS, ROWS, SPAWN, params);
+                    (1..ROWS as i32 - 1)
+                        .flat_map(|y| (1..COLS as i32 - 1).map(move |x| (x, y)))
+                        .filter(|&(x, y)| level.layer(plains).tile(x, y) == Tile::VOID)
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        let (big, usual) = (count(&p), count(&flat));
+        assert!(
+            big > 2 * usual,
+            "{big} hole tiles with big holes, {usual} with the defaults"
+        );
+        // Two deep: through the layer below too, onto a floor in the top
+        // cave where that was rock.
+        let (mut deep, mut floors_below) = (0, 0);
+        for seed in 0..10 {
+            let level = generate_level(seed, COLS, ROWS, SPAWN, &p);
+            for y in 1..ROWS as i32 - 1 {
+                for x in 1..COLS as i32 - 1 {
+                    if level.layer(plains).tile(x, y) == Tile::VOID
+                        && level.layer(plains - 1).tile(x, y) == Tile::VOID
+                    {
+                        deep += 1;
+                        floors_below +=
+                            level.layer(plains - 2).tile(x, y).floor_id().is_some() as usize;
+                    }
+                }
+            }
+        }
+        assert!(deep * 2 > big, "{deep} of {big} go two deep");
+        assert!(floors_below > 0);
+        // Depth 1: nothing opened on the layer below.
+        let shallow = Params {
+            hole_depth: [1, 1],
+            ..p
+        };
+        let level = generate_level(1, COLS, ROWS, SPAWN, &shallow);
+        for y in 1..ROWS as i32 - 1 {
+            for x in 1..COLS as i32 - 1 {
+                assert_ne!(level.layer(plains - 1).tile(x, y), Tile::VOID);
+            }
+        }
     }
 
     #[test]

@@ -24,6 +24,11 @@ pub struct LevelFile {
     pub cols: usize,
     pub rows: usize,
     pub spawn: Spawn,
+    /// The ground level: the lowest layer under the open sky. Layers below
+    /// it are underground, and darken rather than fog when looked down to
+    /// from outdoors. 0 (the default) puts the whole level above ground.
+    #[serde(default)]
+    pub ground: usize,
     /// Bottom first; each a list of rows, each a list of tiles.
     pub layers: Vec<Vec<Vec<Tile>>>,
 }
@@ -44,6 +49,7 @@ impl LevelFile {
             cols,
             rows,
             spawn,
+            ground: 0,
             layers: layers
                 .iter()
                 .map(|tiles| tiles.chunks(cols).map(<[Tile]>::to_vec).collect())
@@ -52,6 +58,12 @@ impl LevelFile {
     }
 
     /// As JSON: pretty, but with each row of tiles on a line of its own.
+    /// The same level with `ground` as its ground level.
+    pub fn with_ground(mut self, ground: usize) -> Self {
+        self.ground = ground;
+        self
+    }
+
     pub fn to_json(&self) -> String {
         let layers: Vec<String> = self
             .layers
@@ -65,11 +77,12 @@ impl LevelFile {
             })
             .collect();
         format!(
-            "{{\n  \"format\": {},\n  \"cols\": {},\n  \"rows\": {},\n  \"spawn\": {},\n  \"layers\": [\n{}\n  ]\n}}\n",
+            "{{\n  \"format\": {},\n  \"cols\": {},\n  \"rows\": {},\n  \"spawn\": {},\n  \"ground\": {},\n  \"layers\": [\n{}\n  ]\n}}\n",
             self.format,
             self.cols,
             self.rows,
             compact(&self.spawn),
+            self.ground,
             layers.join(",\n")
         )
     }
@@ -98,6 +111,9 @@ impl LevelFile {
         let in_bounds = x >= 0 && y >= 0 && (x as usize) < file.cols && (y as usize) < file.rows;
         if file.spawn.layer >= file.layers.len() || !in_bounds {
             return Err("the spawn is outside the level".into());
+        }
+        if file.ground >= file.layers.len() {
+            return Err("the ground level is above the level's top".into());
         }
         Ok(file)
     }
@@ -282,9 +298,13 @@ mod tests {
             layer: level.depth() - 1,
             tile: [2, 2],
         };
-        let file = LevelFile::new(cols as usize, rows as usize, &layers, spawn);
+        let file = LevelFile::new(cols as usize, rows as usize, &layers, spawn).with_ground(1);
         let back = LevelFile::from_json(&file.to_json()).unwrap();
         assert_eq!(back, file);
+        assert_eq!(back.ground, 1);
+        // Files from before the ground level have it at 0.
+        let old = file.to_json().replace("  \"ground\": 1,\n", "");
+        assert_eq!(LevelFile::from_json(&old).unwrap().ground, 0);
         assert_eq!(back.tiles(), layers);
         let loaded = back.level();
         assert_eq!(loaded.depth(), level.depth());

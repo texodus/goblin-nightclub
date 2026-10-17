@@ -21,6 +21,9 @@ pub struct Game {
     level: Level,
     /// The player's layer.
     top: usize,
+    /// The ground level: the lowest layer under the open sky (see
+    /// [`goblin_nightclub_core::level_file::LevelFile::ground`]).
+    ground: usize,
     /// Per layer: what's visible of it and remembered about it.
     visions: Vec<Vision>,
     memories: Vec<Memory>,
@@ -59,16 +62,31 @@ const AUTO_PAUSE: bool = true;
 const LEVEL_COLS: usize = 96;
 const LEVEL_ROWS: usize = 60;
 
-/// How far the player can see, in pixels. `f32::INFINITY` is unlimited.
-const VIEW_RADIUS: f32 = 296.0;
+/// How far the player can see, in pixels, indoors: under a floor or wall
+/// of some layer above. `f32::INFINITY` is unlimited.
+const VIEW_RADIUS: f32 = 96.0;
+/// How far outdoors: on the top layer, or with nothing but void (or
+/// water) directly above on every layer up to it.
+const VIEW_RADIUS_OUTDOORS: f32 = 5.0 * VIEW_RADIUS;
 /// Looking down, each layer below the player's is seen this much less far,
 /// down to `VIEW_RADIUS_MIN`.
 const VIEW_RADIUS_STEP: f32 = 16.0;
 const VIEW_RADIUS_MIN: f32 = 2.0 * TILE;
 
-/// View distance for a layer `depth` layers below the player's.
-fn view_radius(depth: usize) -> f32 {
-    (VIEW_RADIUS - VIEW_RADIUS_STEP * depth as f32).max(VIEW_RADIUS_MIN)
+/// From outdoors, layers below the ground level are seen only this
+/// fraction as far (after the step per layer).
+const UNDERGROUND_FROM_ABOVE: f32 = 1.0 / 5.0;
+
+/// View distance for a layer `depth` layers below the player's, from a
+/// `base` radius (indoors or out), `underground` if the layer is below
+/// the ground level while the player is above it.
+fn view_radius(base: f32, depth: usize, underground: bool) -> f32 {
+    let radius = (base - VIEW_RADIUS_STEP * depth as f32).max(VIEW_RADIUS_MIN);
+    if underground {
+        (radius * UNDERGROUND_FROM_ABOVE).max(VIEW_RADIUS_MIN)
+    } else {
+        radius
+    }
 }
 
 /// NPCs per layer per 640 tiles of level.
@@ -92,7 +110,9 @@ impl Game {
         ];
         let level = goblin_nightclub_generate::generate_level(seed, cols, rows, player, params);
         let top = goblin_nightclub_generate::spawn_layer(params).min(level.depth() - 1);
-        Self::with_level_at(level, top, player, [width, height], seed)
+        let mut game = Self::with_level_at(level, top, player, [width, height], seed);
+        game.ground = goblin_nightclub_generate::ground_layer(params).min(game.level.depth() - 1);
+        game
     }
 
     /// A game on a saved level, the player at its spawn.
@@ -102,7 +122,9 @@ impl Game {
             x as f32 * TILE + (TILE - PLAYER_SIZE[0]) / 2.0,
             y as f32 * TILE + (TILE - PLAYER_SIZE[1]) / 2.0,
         ];
-        Self::with_level_at(file.level(), file.spawn.layer, player, view, seed)
+        let mut game = Self::with_level_at(file.level(), file.spawn.layer, player, view, seed);
+        game.ground = file.ground.min(game.level.depth() - 1);
+        game
     }
 
     /// A game on `level`, the player at `player` (top-left, pixels) on the
@@ -146,6 +168,7 @@ impl Game {
             memories: (0..level.depth()).map(|_| Memory::default()).collect(),
             level,
             top,
+            ground: 0,
             player,
             npcs,
             rng,
@@ -455,10 +478,26 @@ impl Game {
         canvas
     }
 
+    /// Is the player under the open sky: on a layer at or above the ground
+    /// level, and on the top layer or under void (or water) on every layer
+    /// above theirs? Underground, even a shaft of daylight from above
+    /// doesn't count.
+    pub fn outdoors(&self) -> bool {
+        let c = center(self.player, PLAYER_SIZE);
+        self.top >= self.ground
+            && (self.top + 1..self.level.depth()).all(|k| self.level.layer(k).is_void_at(c))
+    }
+
     /// Recompute what the player sees and remembers, on their layer and on
-    /// every layer showing through below it.
+    /// every layer showing through below it. The view radius depends on
+    /// being outdoors or in, and shrinks for each layer looked down to.
     fn observe(&mut self) {
         let origin = center(self.player, PLAYER_SIZE);
+        let base = if self.outdoors() {
+            VIEW_RADIUS_OUTDOORS
+        } else {
+            VIEW_RADIUS
+        };
         let visible = self.level.visible_layers(self.top);
         for k in 0..self.level.depth() {
             if !visible.contains(&k) {
@@ -470,7 +509,8 @@ impl Game {
             // its floors and wall tops show alike.
             let view = self.level.view(self.top, k);
             let above = (k < self.top).then_some(view);
-            self.visions[k].set_radius(view_radius(self.top - k));
+            let underground = self.outdoors() && k < self.ground;
+            self.visions[k].set_radius(view_radius(base, self.top - k, underground));
             self.visions[k].update_through(view, self.level.layer(k), shaft, above, origin);
             let here = self.npcs.iter().filter(|n| n.layer == k);
             self.memories[k].update(view, &self.visions[k], here, self.time);
@@ -578,11 +618,18 @@ impl Game {
             radius: vision.radius(),
             radius_step: VIEW_RADIUS_STEP,
             radius_min: VIEW_RADIUS_MIN,
+            radius_underground: if self.outdoors() {
+                UNDERGROUND_FROM_ABOVE
+            } else {
+                1.0
+            },
             time: self.time,
             camera: self.camera.pos,
             view: self.camera.view,
             zoom: self.zoom(),
             ui_scale: self.ui_scale(),
+            outdoors: self.outdoors(),
+            ground: self.ground,
             world: self.world(),
             overlay: self.overlay(),
             ui: self.ui(),
@@ -609,6 +656,8 @@ fn tile_of(p: [f32; 2]) -> [i32; 2] {
 mod tests {
     use super::*;
     use goblin_nightclub_core::layer::Layer;
+    use goblin_nightclub_core::layer::Tile;
+    use goblin_nightclub_core::level_file::Spawn;
 
     const VIEW: [f32; 2] = [320.0, 200.0];
 
@@ -619,8 +668,14 @@ mod tests {
     /// A game on `level` with no NPCs, the player's box centered in tile
     /// `at`.
     fn game(level: Level, at: [i32; 2]) -> Game {
+        let top = level.depth() - 1;
+        game_on(level, top, at)
+    }
+
+    /// The same, on layer `k`.
+    fn game_on(level: Level, k: usize, at: [i32; 2]) -> Game {
         let c = path::center(at);
-        let mut game = Game::with_level(level, [c[0] - 4.0, c[1] - 4.0], VIEW, 1);
+        let mut game = Game::with_level_at(level, k, [c[0] - 4.0, c[1] - 4.0], VIEW, 1);
         game.npcs.clear();
         game
     }
@@ -683,20 +738,16 @@ mod tests {
     #[test]
     fn stops_when_the_route_runs_into_something_revealed() {
         // A long corridor, blocked far ahead, beyond the view radius.
-        let l = level(&[&[
-            "################################",
-            "...........................#....",
-            "################################",
-        ]]);
+        let wall = "#".repeat(64);
+        let mut open = ".".repeat(64);
+        open.replace_range(55..56, "#");
+        let l = level(&[&[wall.as_str(), open.as_str(), wall.as_str()]]);
         let mut game = game(l, [0, 1]);
-        assert!(
-            !game.visions[1 - 1].is_explored(27, 1),
-            "the block is unseen"
-        );
-        click_and_run(&mut game, [30, 1], 2000);
+        assert!(!game.visions[0].is_explored(55, 1), "the block is unseen");
+        click_and_run(&mut game, [62, 1], 4000);
         assert!(game.paused, "stopped");
         assert!(game.route.is_none());
-        assert!(player_tile(&game)[0] < 27, "before reaching the block");
+        assert!(player_tile(&game)[0] < 55, "before reaching the block");
     }
 
     #[test]
@@ -842,15 +893,17 @@ mod tests {
 
     #[test]
     fn lower_layers_are_seen_less_far() {
-        // Open below, all void above: the player looks straight down.
+        // Open below, all void above: the player looks straight down, from
+        // under the open sky.
+        let (floor, void) = (".".repeat(50), "~".repeat(50));
         let l = level(&[
-            &["................", "................"],
-            &["~~~~~~~~~~~~~~~~", "~~~~~~~~~~~~~~~~"],
+            &[floor.as_str(), floor.as_str()],
+            &[void.as_str(), void.as_str()],
         ]);
         let mut game = game(l, [0, 0]);
         // From the player's center (5, 5): one NPC well inside the reduced
         // radius below, one inside the full radius but beyond the reduced.
-        let near_r = VIEW_RADIUS - VIEW_RADIUS_STEP;
+        let near_r = VIEW_RADIUS_OUTDOORS - VIEW_RADIUS_STEP;
         let mut near = Entity::npc(1, [5.0 + near_r - 20.0, 2.0]);
         let mut far = Entity::npc(2, [5.0 + near_r + 6.0, 2.0]);
         near.layer = 0;
@@ -863,20 +916,92 @@ mod tests {
             "beyond the lower layer's radius"
         );
         assert_eq!(game.visions[0].radius(), near_r);
-        assert_eq!(view_radius(10), VIEW_RADIUS_MIN);
+        assert_eq!(
+            view_radius(VIEW_RADIUS, 1000, false),
+            VIEW_RADIUS_MIN,
+            "clamped"
+        );
+    }
+
+    #[test]
+    fn indoors_sees_less_far_than_outdoors() {
+        // Three layers: the player on the middle one, under a roof with a
+        // hole in it. The top layer is all void over the hole only.
+        let l = level(&[
+            &["................"],
+            &["................"],
+            &["....~~~~........"],
+        ]);
+        let mut inside = game_on(l, 1, [1, 0]);
+        assert!(!inside.outdoors(), "under the roof");
+        assert_eq!(inside.visions[1].radius(), VIEW_RADIUS);
+        // Step under the hole: outdoors, and the radius grows.
+        click_and_run(&mut inside, [5, 0], 600);
+        assert_eq!(player_tile(&inside), [5, 0]);
+        assert!(inside.outdoors());
+        assert_eq!(inside.visions[1].radius(), VIEW_RADIUS_OUTDOORS);
+        // On the top layer, always outdoors.
+        let top = game(level(&[&["...."], &["...."]]), [1, 0]);
+        assert!(top.outdoors());
+        assert_eq!(top.visions[1].radius(), VIEW_RADIUS_OUTDOORS);
+        // From outdoors, what's below ground is seen a fifth as far: the
+        // player on the plains (ground level) looking down a hole.
+        let pit = level(&[&["...."], &["~~~~"]]);
+        let mut above = game_on(pit, 1, [1, 0]);
+        above.ground = 1;
+        above.observe();
+        assert!(above.outdoors());
+        let expected = ((VIEW_RADIUS_OUTDOORS - VIEW_RADIUS_STEP) * UNDERGROUND_FROM_ABOVE)
+            .max(VIEW_RADIUS_MIN);
+        assert_eq!(above.visions[0].radius(), expected);
+        assert_eq!(above.frame().radius_underground, UNDERGROUND_FROM_ABOVE);
+        // Underground, a shaft open to the sky is still underground.
+        let shaft = level(&[&["...."], &["~~~~"], &["~~~~"]]);
+        let mut below_ground = game_on(shaft, 0, [1, 0]);
+        assert!(
+            below_ground.outdoors(),
+            "ground level 0: the bottom is outdoors"
+        );
+        below_ground.ground = 1;
+        below_ground.observe();
+        assert!(!below_ground.outdoors());
+        assert_eq!(below_ground.visions[0].radius(), VIEW_RADIUS);
+        // The renderer is told, so it can fog the layers below, down to the
+        // ground level.
+        assert!(top.frame().outdoors);
+        assert_eq!(
+            top.frame().ground,
+            0,
+            "a level with no file: all above ground"
+        );
+        let file = LevelFile::new(
+            4,
+            1,
+            &vec![vec![Tile::FLOOR; 4]; 3],
+            Spawn {
+                layer: 2,
+                tile: [1, 0],
+            },
+        )
+        .with_ground(1);
+        assert_eq!(Game::from_file(&file, VIEW, 1).frame().ground, 1);
+        assert!(
+            !game_on(level(&[&["..."], &["..."]]), 0, [1, 0])
+                .frame()
+                .outdoors
+        );
     }
 
     #[test]
     fn only_characters_drawn_cover_the_void() {
-        let l = level(&[
-            &["....................", "...................."],
-            &["....................", "~~~~~~~~~~~~~~~~~~~~"],
-        ]);
+        let (floor, void) = (".".repeat(60), "~".repeat(60));
+        let l = level(&[&[&floor, &floor], &[&floor, &void]]);
         let mut game = game(l, [0, 0]);
-        // Along the edge of the void: one NPC in view, one beyond the view
-        // radius.
+        // Along the edge of the void: one NPC in view, one beyond the
+        // (outdoor) view radius.
         game.npcs.push(Entity::npc(1, [32.0, 2.0]));
-        game.npcs.push(Entity::npc(2, [182.0, 2.0]));
+        game.npcs
+            .push(Entity::npc(2, [VIEW_RADIUS_OUTDOORS + 60.0, 2.0]));
         for n in &mut game.npcs {
             n.layer = 1;
         }
@@ -885,7 +1010,7 @@ mod tests {
         let top = &frame.layers[0];
         // Player and the visible NPC: a square each.
         assert_eq!(top.standing.vertices.len(), 2 * 6);
-        assert!(top.voids.len() == 20, "a whole void tile each");
+        assert!(top.voids.len() == 60, "a whole void tile each");
     }
 
     #[test]

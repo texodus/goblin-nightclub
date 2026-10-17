@@ -687,6 +687,27 @@ impl Layer {
         self.solids[y as usize * self.cols + x as usize]
     }
 
+    /// Is point `p` (pixels) over void (or water): in a void quarter of
+    /// its tile? Outside the layer, no.
+    pub fn is_void_at(&self, p: [f32; 2]) -> bool {
+        let [x, y] = [(p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32];
+        if !self.in_bounds([x, y]) {
+            return false;
+        }
+        let (u, v) = (p[0] / TILE - x as f32, p[1] / TILE - y as f32);
+        // The quarter it's in, between the tile's diagonals.
+        let quarter = if v < u.min(1.0 - u) {
+            N
+        } else if v > u.max(1.0 - u) {
+            S
+        } else if u < 0.5 {
+            W
+        } else {
+            E
+        };
+        self.tile(x, y).void_quarters() & quarter != 0
+    }
+
     /// Is tile `(x, y)` entirely free of solid?
     pub fn is_open(&self, x: i32, y: i32) -> bool {
         self.solid(x, y) == Solid::None
@@ -1993,6 +2014,19 @@ mod tests {
         let half = Tile::split(Corner::NW, Part::Floor(0), Part::Water);
         assert_eq!(half.void(), Solid::Slope(Corner::SE));
         assert_eq!(half.water_quarters(), half.void_quarters());
+    }
+
+    #[test]
+    fn points_over_void_by_quarter() {
+        let l = Layer::from_ascii(&["▛~.", "≈#."]);
+        // Floor in the NW half, void in the SE: the diagonal decides.
+        assert!(!l.is_void_at([2.0, 3.0]));
+        assert!(l.is_void_at([8.0, 7.0]));
+        assert!(l.is_void_at([15.0, 5.0]), "void");
+        assert!(l.is_void_at([5.0, 15.0]), "water counts");
+        assert!(!l.is_void_at([25.0, 5.0]), "floor");
+        assert!(!l.is_void_at([15.0, 15.0]), "wall");
+        assert!(!l.is_void_at([-1.0, 5.0]), "outside");
     }
 
     #[test]
