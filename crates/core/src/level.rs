@@ -9,11 +9,15 @@
 //!   through a shaft, where every layer above it up to `top` is void. On
 //!   `top` itself, its walls block sight as usual.
 //!
+//! The renderer draws each layer below the viewer's a little smaller than
+//! the one above (parallax), and so shows a little of the layer beside
+//! each hole, not just under it: the hole's sides. Those are never in the
+//! shaft; the renderer remembers them with the hole they're seen down.
+//!
 //! All of these are ordinary [`Layer`]s, so rays, collision, outlines and
 //! visibility work on them unchanged.
 
-use crate::generate::Style;
-use crate::layer::{Layer, Solid, TILE};
+use crate::layer::{Layer, Solid};
 
 /// Layers a level may have (the renderer keeps textures for each).
 pub const MAX_LAYERS: usize = 8;
@@ -25,12 +29,11 @@ pub const MAX_TILES: usize = 128 * 128;
 pub struct Level {
     layers: Vec<Layer>,
     movement: Vec<Layer>,
-    /// `sight[top][k]` for `k <= top`.
-    sight: Vec<Vec<Layer>>,
-    /// `shafts[top][k][tile]`: the quarters of each tile (as bits) open
-    /// from layer `k` up to `top`, and whether any are.
-    shafts: Vec<Vec<Vec<u8>>>,
-    shafts_any: Vec<Vec<Vec<bool>>>,
+    /// `views[top][k]` for `k <= top`; see [`Level::view`].
+    views: Vec<Vec<Layer>>,
+    /// `shafts[top][k][tile]`: whether any of the tile is open from layer
+    /// `k` up to `top`.
+    shafts: Vec<Vec<Vec<bool>>>,
 }
 
 impl Level {
@@ -61,15 +64,24 @@ impl Level {
             })
             .collect();
 
-        let sight = (0..layers.len())
+        // What blocks the view of layer `k` from `top`: `top`'s walls, and
+        // the walls of each layer in between where every layer above them
+        // is void. Elsewhere a wall in between is under a floor, which hides
+        // it, so it can't be in the way of anything seen through a hole.
+        let views = (0..layers.len())
             .map(|top| {
                 (0..=top)
                     .map(|k| {
                         let solids = (0..n)
                             .map(|t| {
-                                layers[k..=top]
-                                    .iter()
-                                    .fold(Solid::None, |acc, l| acc.union(solid(l, t)))
+                                let mut q = solid(&layers[top], t).quarters();
+                                for j in k + 1..top {
+                                    let open = layers[j + 1..=top]
+                                        .iter()
+                                        .fold(0b1111, |m, l| m & void(l, t));
+                                    q |= solid(&layers[j], t).quarters() & open;
+                                }
+                                Solid::from_quarters(q, true)
                             })
                             .collect();
                         Layer::from_solids(cols, rows, solids)
@@ -78,7 +90,7 @@ impl Level {
             })
             .collect();
 
-        let shafts: Vec<Vec<Vec<u8>>> = (0..layers.len())
+        let shafts: Vec<Vec<Vec<bool>>> = (0..layers.len())
             .map(|top| {
                 (0..=top)
                     .map(|k| {
@@ -87,34 +99,19 @@ impl Level {
                                 layers[k + 1..=top]
                                     .iter()
                                     .fold(0b1111, |q, l| q & void(l, t))
+                                    != 0
                             })
                             .collect()
                     })
                     .collect()
             })
             .collect();
-        let shafts_any = shafts
-            .iter()
-            .map(|by_k| {
-                by_k.iter()
-                    .map(|qs| qs.iter().map(|q| *q != 0).collect())
-                    .collect()
-            })
-            .collect();
-
         Self {
             layers,
             movement,
-            sight,
+            views,
             shafts,
-            shafts_any,
         }
-    }
-
-    /// Generate a random level in `style`, the player starting on the top
-    /// layer at `spawn` (pixels).
-    pub fn generate(style: Style, seed: u32, cols: usize, rows: usize, spawn: [f32; 2]) -> Self {
-        crate::generate::generate_level(style, seed, cols, rows, spawn)
     }
 
     pub fn depth(&self) -> usize {
@@ -138,39 +135,18 @@ impl Level {
         &self.movement[i]
     }
 
-    /// What blocks sight from layer `top` down to layer `k`: the walls of
-    /// every layer in between.
-    pub fn sight(&self, top: usize, k: usize) -> &Layer {
-        &self.sight[top][k]
-    }
-
-    /// What blocks the view of layer `k` from layer `top`: on `top`
-    /// itself its walls; looking down at a lower layer, only the walls of
-    /// the layers above it, since you see over its own.
+    /// What blocks the view of layer `k` from layer `top`: `top`'s walls,
+    /// and the walls of the layers in between, but only inside holes
+    /// (where every layer above them is void). Not `k`'s own walls, below
+    /// `top`: looking down, you see over them, onto their tops.
     pub fn view(&self, top: usize, k: usize) -> &Layer {
-        &self.sight[top][(k + 1).min(top)]
+        &self.views[top][k]
     }
 
     /// For each tile, whether layer `k` shows through to layer `top`
-    /// anywhere in it.
+    /// anywhere in it: there's void all the way up.
     pub fn shaft(&self, top: usize, k: usize) -> &[bool] {
-        &self.shafts_any[top][k]
-    }
-
-    /// For each tile, the quarters (as bits, see [`crate::layer::quarter_shapes`]) where
-    /// layer `k` shows through to layer `top`.
-    pub fn shaft_quarters(&self, top: usize, k: usize) -> &[u8] {
         &self.shafts[top][k]
-    }
-
-    /// Does layer `k` show through to layer `top` at pixel `p`?
-    pub fn in_shaft(&self, top: usize, k: usize, p: [f32; 2]) -> bool {
-        let [x, y] = [(p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32];
-        x >= 0
-            && y >= 0
-            && (x as usize) < self.cols()
-            && (y as usize) < self.rows()
-            && self.shafts_any[top][k][y as usize * self.cols() + x as usize]
     }
 
     /// The layers seen from `top`: itself, and each below it showing
@@ -178,7 +154,7 @@ impl Level {
     pub fn visible_layers(&self, top: usize) -> Vec<usize> {
         (0..=top)
             .rev()
-            .filter(|&k| self.shafts_any[top][k].iter().any(|s| *s))
+            .filter(|&k| self.shafts[top][k].iter().any(|s| *s))
             .collect()
     }
 }
@@ -223,33 +199,44 @@ mod tests {
     }
 
     #[test]
-    fn shafts_follow_void_quarters() {
+    fn shafts_need_void_all_the_way_up() {
         let l = level(&[
-            &["..."], //
-            &["▛▟~"],
-            &["~▛▛"],
+            &["........"], //
+            &["...~~..."],
+            &["..~~...."],
         ]);
-        // Bits N = 1, E = 2, S = 4, W = 8: the SE half is 6, the NW half 9.
-        assert_eq!(l.shaft_quarters(2, 0), &[6, 0, 6]);
-        assert_eq!(l.shaft(2, 0), &[true, false, true]);
-        assert_eq!(l.shaft_quarters(2, 1), &[15, 6, 6]);
-        assert_eq!(l.layer(1).tile(1, 0).void(), Solid::Slope(Corner::NW));
+        let t = true;
+        let f = false;
+        // Two down, the hole through both is tile 3.
+        assert_eq!(l.shaft(2, 0), &[f, f, f, t, f, f, f, f]);
+        // One down, the top's void.
+        assert_eq!(l.shaft(2, 1), &[f, f, t, t, f, f, f, f]);
+        assert!(l.shaft(2, 2).iter().all(|s| *s), "own layer: everywhere");
+        // Half a tile of void counts.
+        let half = level(&[&["..."], &[".▛."]]);
+        assert_eq!(half.shaft(1, 0), &[f, t, f]);
     }
 
     #[test]
-    fn sight_combines_walls_from_viewer_down() {
+    fn walls_in_between_block_only_inside_holes() {
         let l = level(&[
-            &["#...", "...."], //
-            &["~~.#", "~~.."],
+            &["....."], //
+            &["#.##◸"],
+            &["~~..~"],
         ]);
-        // Looking at layer 0 from layer 1: walls of both.
-        let s = l.sight(1, 0);
-        assert_eq!(s.solid(0, 0), Solid::Full);
-        assert_eq!(s.solid(3, 0), Solid::Full);
-        assert_eq!(s.solid(1, 0), Solid::None);
-        // Layer 1 on its own: just its wall.
-        assert_eq!(l.sight(1, 1).solid(0, 0), Solid::None);
-        assert_eq!(l.sight(1, 1).solid(3, 0), Solid::Full);
+        // Layer 0 from layer 2: layer 1's walls under layer 2's void block
+        // (whole, or the part of a slope the void is over); those under its
+        // floor don't.
+        let v = l.view(2, 0);
+        assert_eq!(v.solid(0, 0), Solid::Full, "in the hole");
+        assert_eq!(v.solid(2, 0), Solid::None, "under the floor");
+        assert_eq!(v.solid(3, 0), Solid::None, "under the floor");
+        assert_eq!(v.solid(4, 0), Solid::Slope(Corner::NW), "in the hole");
+        // Layer 1 from layer 2: only layer 2's walls (none).
+        assert!((0..5).all(|x| l.view(2, 1).solid(x, 0) == Solid::None));
+        // A half-void tile above: only the part under the void blocks.
+        let half = level(&[&["."], &["#"], &["▛"]]);
+        assert_eq!(half.view(2, 0).solid(0, 0), Solid::Slope(Corner::SE));
     }
 
     #[test]
@@ -266,17 +253,13 @@ mod tests {
     }
 
     #[test]
-    fn shafts_need_void_all_the_way_up() {
-        let l = level(&[
-            &["...."], //
-            &["~~.~"],
-            &["~.~~"],
-        ]);
-        let shaft = l.shaft(2, 0);
-        assert_eq!(shaft, &[true, false, false, true]);
-        assert_eq!(l.shaft(2, 1), &[true, false, true, true]);
-        assert!(l.shaft(2, 2).iter().all(|s| *s), "own layer: everywhere");
+    fn layers_below_are_drawn_only_with_void_all_the_way_up() {
+        let l = level(&[&["...."], &["~~.~"], &["~.~~"]]);
         assert_eq!(l.visible_layers(2), vec![2, 1, 0]);
         assert_eq!(level(&[&["."], &["."]]).visible_layers(1), vec![1]);
+        assert_eq!(
+            level(&[&["~"], &["."], &["~"]]).visible_layers(2),
+            vec![2, 1]
+        );
     }
 }

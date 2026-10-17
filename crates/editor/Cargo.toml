@@ -1,0 +1,13 @@
+[package]
+name = "goblin-nightclub-editor"
+description = "The level editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+goblin-nightclub-core.workspace = true
+serde.workspace = true

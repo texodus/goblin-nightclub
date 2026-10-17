@@ -1,0 +1,28 @@
+[package]
+name = "goblin_nightclub"
+description = "A 2D WebAssembly + WebGPU game: the browser entry point and renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+goblin-nightclub-core.workspace = true
+goblin-nightclub-generate.workspace = true
+goblin-nightclub-game.workspace = true
+goblin-nightclub-editor.workspace = true
+bytemuck.workspace = true
+console_error_panic_hook.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys.workspace = true
+wgpu.workspace = true
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Os"]

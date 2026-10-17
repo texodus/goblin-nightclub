@@ -1,4 +1,5 @@
-// Builds the wasm package with wasm-pack and assembles a static site in dist/.
+// Builds the wasm package (the `goblin_nightclub` crate in crates/app) with wasm-pack
+// and assembles a static site in dist/.
 //
 //   node scripts/build.mjs          # release build
 //   node scripts/build.mjs --dev    # fast, unoptimized debug build
@@ -11,6 +12,8 @@ import { fileURLToPath } from "node:url";
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const DIST = path.join(ROOT, "dist");
 const WWW = path.join(ROOT, "www");
+export const APP = path.join(ROOT, "crates", "app");
+export const ASSETS = path.join(ROOT, "crates", "core", "assets");
 
 function run(cmd, args) {
     return new Promise((resolve, reject) => {
@@ -25,6 +28,7 @@ function run(cmd, args) {
 export async function buildWasm({ dev = false } = {}) {
     await run("wasm-pack", [
         "build",
+        APP,
         "--target", "web",
         "--out-dir", path.join(DIST, "pkg"),
         "--no-pack",
@@ -37,7 +41,7 @@ export async function copyStatic() {
     await mkdir(DIST, { recursive: true });
     await cp(WWW, DIST, { recursive: true });
     // The tile sheet, for the editor's palette.
-    await cp(path.join(ROOT, "assets"), path.join(DIST, "assets"), { recursive: true });
+    await cp(ASSETS, path.join(DIST, "assets"), { recursive: true });
 }
 
 export async function build({ dev = false } = {}) {

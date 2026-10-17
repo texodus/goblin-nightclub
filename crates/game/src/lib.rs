@@ -1,20 +1,20 @@
 //! Platform-independent game state. Nothing here touches the browser or GPU.
 
-use crate::camera::Camera;
-use crate::draw::Canvas;
-use crate::entity::{Entity, EntityId, Kind};
-use crate::frame::{Frame, LayerFrame};
-use crate::generate::Style;
-pub use crate::input::Input;
-use crate::layer::{Dir, Shape, Solid, TILE, quarter_shapes};
-use crate::level::Level;
-use crate::level_file::LevelFile;
-use crate::memory::Memory;
-use crate::palette;
-use crate::path;
-use crate::rng::Rng;
-use crate::tileset::{self, Cell, ZOOM};
-use crate::vision::Vision;
+use goblin_nightclub_core::camera::Camera;
+use goblin_nightclub_core::draw::Canvas;
+use goblin_nightclub_core::entity::{Entity, EntityId, Kind};
+use goblin_nightclub_core::frame::{Frame, LayerFrame};
+pub use goblin_nightclub_core::input::Input;
+use goblin_nightclub_core::layer::{Dir, Shape, Solid, TILE, quarter_shapes};
+use goblin_nightclub_core::level::Level;
+use goblin_nightclub_core::level_file::LevelFile;
+use goblin_nightclub_core::memory::Memory;
+use goblin_nightclub_core::palette;
+use goblin_nightclub_core::path;
+use goblin_nightclub_core::rng::Rng;
+use goblin_nightclub_core::tileset::{self, Cell, ZOOM};
+use goblin_nightclub_core::vision::Vision;
+use goblin_nightclub_generate::Style;
 
 pub struct Game {
     pub input: Input,
@@ -91,7 +91,7 @@ impl Game {
             (cols / 2) as f32 * TILE + (TILE - PLAYER_SIZE[0]) / 2.0,
             (rows / 2) as f32 * TILE + (TILE - PLAYER_SIZE[1]) / 2.0,
         ];
-        let level = Level::generate(LEVEL_STYLE, seed, cols, rows, player);
+        let level = goblin_nightclub_generate::generate_level(LEVEL_STYLE, seed, cols, rows, player);
         Self::with_level(level, player, [width, height], seed)
     }
 
@@ -533,8 +533,8 @@ impl Game {
                     layer.tile(x, y).void_quarters()
                 });
                 let shaft = (k < self.top).then(|| {
-                    let shaft = self.level.shaft_quarters(self.top, k);
-                    parts(&|i| shaft[i])
+                    let shaft = self.level.shaft(self.top, k);
+                    parts(&|i| if shaft[i] { 0b1111 } else { 0 })
                 });
                 // Characters drawn on this layer cover any void their
                 // sprites overhang: the player, NPCs in view and last
@@ -608,7 +608,7 @@ fn tile_of(p: [f32; 2]) -> [i32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layer::Layer;
+    use goblin_nightclub_core::layer::Layer;
 
     const VIEW: [f32; 2] = [320.0, 200.0];
 
@@ -755,7 +755,7 @@ mod tests {
         }
         // Ten seconds of panning: well past the level's edge.
         let panned = game.camera.pos[0] - (325.0 - view[0] / 2.0);
-        let expected = 10.0 * crate::camera::PAN_SPEED / ZOOM;
+        let expected = 10.0 * goblin_nightclub_core::camera::PAN_SPEED / ZOOM;
         assert!((panned - expected).abs() < 1.0, "{panned}");
         assert!(game.camera.pos[0] > 640.0, "no boundary");
         assert_eq!(game.player, game.player, "player didn't move");
@@ -777,7 +777,7 @@ mod tests {
         let pointer = [100.0, 60.0];
         let anchor = game.to_world(pointer);
         game.zoom_by(1, pointer);
-        assert_eq!(game.zoom(), crate::camera::ZOOM_STEP * ZOOM);
+        assert_eq!(game.zoom(), goblin_nightclub_core::camera::ZOOM_STEP * ZOOM);
         let after = game.to_world(pointer);
         assert!((after[0] - anchor[0]).abs() < 1e-3 && (after[1] - anchor[1]).abs() < 1e-3);
         // Clicks map through the zoom too.
@@ -789,7 +789,7 @@ mod tests {
         // Zoom stops at either end: at 320 x 200, the default already
         // shows a pixel of the art per pixel of the screen.
         game.zoom_by(100, pointer);
-        assert_eq!(game.zoom(), crate::camera::ZOOM_MAX * ZOOM);
+        assert_eq!(game.zoom(), goblin_nightclub_core::camera::ZOOM_MAX * ZOOM);
         game.zoom_by(-100, pointer);
         assert_eq!(game.zoom(), ZOOM);
         assert_eq!(game.frame().zoom, game.zoom());
@@ -885,6 +885,50 @@ mod tests {
         // Player and the visible NPC: a square each.
         assert_eq!(top.standing.vertices.len(), 2 * 6);
         assert!(top.voids.len() == 20, "a whole void tile each");
+    }
+
+    #[test]
+    fn standing_over_stacked_walls_still_sees_to_the_bottom() {
+        // The player stands on floor over a wall over a wall, beside a hole
+        // down through both upper layers.
+        let l = level(&[
+            &["#.....", "#....."], //
+            &["#~~~~~", "#~~~~~"],
+            &[".~~~~~", ".~~~~~"],
+        ]);
+        let game = game(l, [0, 0]);
+        // The wall under the wall under the player shows at the hole's
+        // edge, and so does the floor at the bottom of the hole.
+        assert!(game.visions[0].is_explored(0, 0));
+        assert!(game.visions[0].is_explored(4, 1));
+        assert!(game.visions[1].is_explored(0, 0));
+    }
+
+    #[test]
+    fn floors_above_hide_what_is_under_them() {
+        // Two down, a hole at x 4..5; beside it, under the middle layer's
+        // floor, a wall at x 3 and floor at x 1..2 (the roof of a room).
+        let l = level(&[
+            &["...#.#..", "...#.#..", "...#.#.."],
+            &["....~~..", "....~~..", "....~~.."],
+            &["~~~~~~~~", "~~~~~~~~", "~~~~~~~~"],
+        ]);
+        let game = game(l, [6, 1]);
+        assert!(game.visions[0].is_explored(4, 1), "the bottom of the hole");
+        assert!(game.visions[0].is_explored(5, 1), "a wall in the hole");
+        assert!(
+            game.visions[0].is_explored(3, 1),
+            "a wall at the hole's edge"
+        );
+        assert!(!game.visions[0].is_explored(2, 1), "under the floor");
+        assert!(!game.visions[0].is_explored(1, 1), "under the floor");
+        // An NPC under that floor isn't seen.
+        let mut game = game;
+        let mut hidden = Entity::npc(9, [12.0, 12.0]);
+        hidden.layer = 0;
+        game.npcs.push(hidden);
+        game.observe();
+        assert!(!game.memories[0].is_visible(9));
     }
 
     #[test]

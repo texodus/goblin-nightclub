@@ -112,24 +112,33 @@ fn style_unknown(c: vec3<f32>) -> vec3<f32> {
     return c;
 }
 
-// Layer `a` at view pixel `px` and world point `world`, styled by its
-// masks, with view `radius` (0 for unlimited).
-fn shade(a: u32, px: vec2<i32>, world: vec2<f32>, radius: f32) -> vec3<f32> {
-    let dist = distance(world, params.origin);
+// Layer `a`'s `seen` at world point `world` (0 outside the level).
+fn seen_at(a: u32, world: vec2<f32>) -> f32 {
     let level = world * params.seen_zoom;
-    var now = textureLoad(mask_now, px, a, 0).r;
     let size = vec2<f32>(textureDimensions(mask_seen));
-    var seen = 0.0;
     if all(level >= vec2(0.0)) && all(level < size) {
-        seen = textureLoad(mask_seen, vec2<i32>(level), a, 0).r;
+        return textureLoad(mask_seen, vec2<i32>(level), a, 0).r;
     }
+    return 0.0;
+}
+
+// Layer `a` at view pixel `px` and world point `world`, styled by its
+// masks, with view `radius` (0 for unlimited). `through` is how much the
+// hole this pixel looks down has been seen: a lower layer is remembered
+// where it has been seen itself, or where the hole showing it has (the
+// hole's sides, which parallax brings into view beside it, are seen with
+// the hole, but lie under the layers above, so never in its own `seen`).
+fn shade(a: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec3<f32> {
+    let dist = distance(world, params.origin);
+    var now = textureLoad(mask_now, px, a, 0).r;
+    let seen = max(seen_at(a, world), through);
     if radius > 0.0 {
         now *= 1.0 - smoothstep(radius - RADIUS_FADE, radius, dist);
     }
     let visible = style_visible(textureLoad(canvases, px, 3u * a, 0).rgb, dist, radius);
     // Pixel of the art, wrapped to the dither pattern (it can be negative
     // beyond the level's edge on lower layers).
-    let dots = vec2<i32>(floor(level));
+    let dots = vec2<i32>(floor(world * params.seen_zoom));
     let cell = vec2<u32>(((dots % 4) + 4) % 4);
     let remembered = style_remembered(textureLoad(canvases, px, 3u * a + 1u, 0).rgb, cell);
     let unknown = style_unknown(textureLoad(canvases, px, 3u * a + 2u, 0).rgb);
@@ -143,18 +152,23 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // Down from the viewer's layer through void; each layer was drawn a
     // little smaller about the view's center (parallax).
     var scale = 1.0;
+    // How much the hole looked down has been seen: the least `seen` of the
+    // void passed through, on the way down.
+    var through = 1.0;
     for (var d = 0u; d <= params.top; d++) {
         let a = params.top - d;
         if ((params.present >> a) & 1u) == 0u {
             break;
         }
+        let world = params.camera + (center + (frag.xy - center) / scale) / params.zoom;
         if textureLoad(voids, px, a, 0).r > 0.5 {
+            through = min(through, seen_at(a, world));
             scale *= params.scale;
             continue;
         }
-        let world = params.camera + (center + (frag.xy - center) / scale) / params.zoom;
         let dim = pow(LOWER_BRIGHTNESS, f32(d));
-        return vec4(shade(a, px, world, radius_at(d)) * dim, 1.0);
+        let below = select(0.0, through, d > 0u);
+        return vec4(shade(a, px, world, radius_at(d), below) * dim, 1.0);
     }
     return vec4(0.0, 0.0, 0.0, 1.0);
 }

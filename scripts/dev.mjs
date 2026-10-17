@@ -108,9 +108,9 @@ await build({ dev });
 
 const onRust = debounce(() => rebuild("wasm"), 100);
 const onStatic = debounce(() => rebuild("static"), 50);
-watch(path.join(ROOT, "src"), { recursive: true }, onRust);
+// Every crate: sources, manifests, and the tile sheet in crates/core/assets.
+watch(path.join(ROOT, "crates"), { recursive: true }, onRust);
 watch(path.join(ROOT, "Cargo.toml"), onRust);
-watch(path.join(ROOT, "assets"), { recursive: true }, onRust);
 watch(path.join(ROOT, "www"), { recursive: true }, onStatic);
 
 server.listen(PORT, () => {

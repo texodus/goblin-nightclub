@@ -1,4 +1,4 @@
-//! Random level generators, writing tiles:
+//! Random level generators for the engine in `goblin_nightclub_core`, writing tiles:
 //!
 //! - [`Style::World`]: open floor with solid pieces stamped onto it,
 //!   rectangular blocks (some with corners cut at 45 degrees) and diagonal
@@ -11,13 +11,13 @@
 //! Either way the area around the spawn is open, the level edge is solid
 //! or open floor, and any open space not connected to the spawn is filled
 //! in. Each style builds with its own materials, named in the tile sheet
-//! (see [`crate::tileset`]).
+//! (see [`goblin_nightclub_core::tileset`]).
 
-use crate::layer::{Corner, Dir, Layer, Part, Side, Solid, TILE, Tile};
-use crate::layer::{FloorId, WallId};
-use crate::level::Level;
-use crate::rng::Rng;
-use crate::tileset;
+use goblin_nightclub_core::layer::{Corner, Dir, Layer, Part, Side, Solid, TILE, Tile};
+use goblin_nightclub_core::layer::{FloorId, WallId};
+use goblin_nightclub_core::level::Level;
+use goblin_nightclub_core::rng::Rng;
+use goblin_nightclub_core::tileset;
 
 /// A solid piece to stamp into a level: tiles that together form one
 /// convex shape.
@@ -99,7 +99,7 @@ pub enum Style {
 
 /// Layers in a layered level: a cave, and decks above it.
 pub const LAYERS: usize = 5;
-const _: () = assert!(LAYERS <= crate::level::MAX_LAYERS);
+const _: () = assert!(LAYERS <= goblin_nightclub_core::level::MAX_LAYERS);
 
 /// Void openings in the top deck of a layered level, and how many more
 /// (or, if negative, fewer) in each deck below it.

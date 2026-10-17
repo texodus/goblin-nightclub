@@ -181,13 +181,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "goblin-nightclub-core"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "png",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "goblin-nightclub-editor"
+version = "0.1.0"
+dependencies = [
+ "goblin-nightclub-core",
+ "serde",
+]
+
+[[package]]
+name = "goblin-nightclub-game"
+version = "0.1.0"
+dependencies = [
+ "goblin-nightclub-core",
+ "goblin-nightclub-generate",
+]
+
+[[package]]
+name = "goblin-nightclub-generate"
+version = "0.1.0"
+dependencies = [
+ "goblin-nightclub-core",
+]
+
+[[package]]
 name = "goblin_nightclub"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
  "console_error_panic_hook",
- "png",
- "serde",
+ "goblin-nightclub-core",
+ "goblin-nightclub-editor",
+ "goblin-nightclub-game",
+ "goblin-nightclub-generate",
  "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",

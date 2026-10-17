@@ -6,7 +6,7 @@
 use std::f32::consts::TAU;
 
 use crate::draw::inward_normal;
-use crate::layer::{Layer, Line, Shape, Solid, TILE};
+use crate::layer::{Layer, Line, Shape, TILE};
 
 /// Minimum angular offset of the extra rays cast to either side of each
 /// corner, sampling the boundary just before and just after it.
@@ -238,11 +238,11 @@ impl Vision {
     /// in) not hidden by `above`. Its faces count as seen, and the tile as
     /// explored.
     ///
-    /// A wall tile under a wall of a layer above (so not in the shaft)
-    /// lights up too if it borders void in view: a neighbor in the shaft
-    /// whose side next to it is in view. Exactly covered, it couldn't be
-    /// seen; but lower layers are drawn a little smaller (parallax), which
-    /// brings the edge of such a wall into view at the side of the hole.
+    /// A wall tile beside the shaft (so under a wall or floor of a layer
+    /// above) lights up too if it borders the shaft where that's in view.
+    /// Exactly covered, it couldn't be seen; but lower layers are drawn a
+    /// little smaller (parallax), which brings the edge of such a wall
+    /// into view at the side of the hole.
     fn find_wall_tops(&mut self, own: &Layer, above: &Layer) {
         let mut lit = vec![false; own.cols * own.rows];
         self.wall_band.clear();
@@ -268,8 +268,7 @@ impl Vision {
                         }))
                         .any(visible)
                 } else {
-                    above.solid(x as i32, y as i32) != Solid::None
-                        && self.borders_void_in_view(x as i32, y as i32, &visible)
+                    self.borders_void_in_view(x as i32, y as i32, &visible)
                 };
                 if seen {
                     lit[y * own.cols + x] = true;
@@ -286,10 +285,9 @@ impl Vision {
         }
     }
 
-    /// Does a neighbor of tile `(x, y)` (across a side or a corner) show
-    /// through to the viewer, with the point of it next to `(x, y)` (the
-    /// middle of the shared side, or the shared corner, pulled slightly in)
-    /// `visible`?
+    /// Is a neighbor of tile `(x, y)` (across a side or a corner) in the
+    /// shaft, with the point of it next to `(x, y)` (the middle of the
+    /// shared side, or the shared corner, pulled slightly in) `visible`?
     fn borders_void_in_view(&self, x: i32, y: i32, visible: &impl Fn([f32; 2]) -> bool) -> bool {
         const INSET: f32 = 0.5;
         (-1..=1).any(|dy: i32| {
@@ -635,14 +633,13 @@ impl Vision {
     }
 }
 
-#[cfg(test)]
-mod tests {
+/// Invariant checks and helpers for tests, here and in other crates.
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing {
     use super::*;
-
-    use crate::generate::Style;
     use crate::rng::Rng;
 
-    trait OpenPoint {
+    pub trait OpenPoint {
         fn open_point(&mut self, level: &Layer) -> [f32; 2];
     }
 
@@ -662,29 +659,14 @@ mod tests {
         }
     }
 
-    /// Tile soups are dense, so far slower to check than generated levels.
-    const SOUPS: u32 = 12;
-
-    /// Generated levels, then tile soups full of slopes, each with a
-    /// suggested origin (which may be solid in a soup).
-    fn levels() -> impl Iterator<Item = (Layer, [f32; 2])> {
-        let spawn = [165.0, 105.0];
-        let generated = (0..40).flat_map(move |seed| {
-            [Style::World, Style::Cave]
-                .map(|style| (Layer::generate(style, seed, 32, 20, spawn), spawn))
-        });
-        let soups = (0..SOUPS).map(move |seed| (Layer::soup(seed, 32, 20), spawn));
-        generated.chain(soups)
-    }
-
     /// Clear of solid space in every direction (unlike a zero-size
     /// `collides` check, which never fires exactly on a grid vertex).
-    fn is_open_point(level: &Layer, p: [f32; 2]) -> bool {
+    pub fn is_open_point(level: &Layer, p: [f32; 2]) -> bool {
         !level.collides([p[0] - 0.01, p[1] - 0.01], [0.02, 0.02])
     }
 
     /// Crossing-number point-in-polygon test.
-    fn inside(poly: &[[f32; 2]], p: [f32; 2]) -> bool {
+    pub fn inside(poly: &[[f32; 2]], p: [f32; 2]) -> bool {
         let mut inside = false;
         for i in 0..poly.len() {
             let [ax, ay] = poly[i];
@@ -694,6 +676,124 @@ mod tests {
             }
         }
         inside
+    }
+
+    /// Visible, allowing a hair of rotation: points on a line that exactly
+    /// grazes a corner are visible or not only up to rounding.
+    pub fn visible_ish(level: &Layer, vision: &Vision, p: [f32; 2]) -> bool {
+        let o = vision.origin();
+        let (a, d) = (angle(o, p), distance(o, p));
+        // Several sizes: a slit between corners can be narrower than the
+        // largest, and a corner close by needs the largest to clear it.
+        vision.can_see(level, p)
+            || [1e-5, 3e-6, 1e-6]
+                .iter()
+                .flat_map(|r| [a - r, a + r])
+                .any(|a| vision.can_see(level, at(o, a, d)))
+    }
+
+    /// Visible, and still visible a hair of rotation either way: points
+    /// seen only within rounding of a grazing line needn't be in the polygon.
+    pub fn visible_with_margin(level: &Layer, vision: &Vision, p: [f32; 2]) -> bool {
+        let o = vision.origin();
+        let (a, d) = (angle(o, p), distance(o, p));
+        vision.can_see(level, p)
+            && [a - 1e-5, a + 1e-5]
+                .iter()
+                .all(|a| vision.can_see(level, at(o, *a, d)))
+    }
+
+    pub fn check_polygon(level: &Layer, vision: &Vision, rng: &mut Rng) {
+        let origin = vision.origin();
+        let poly = vision.polygon();
+        let ctx = format!("origin {origin:?} radius {}", vision.radius());
+
+        // Vertices are visible, and so is everything inside each fan
+        // triangle (sampled slightly inward to avoid edge rounding).
+        for (i, v) in poly.iter().enumerate() {
+            // Nudged inward, since vertices on the radius circle round
+            // either way.
+            let v_in = [
+                origin[0] + 0.9999 * (v[0] - origin[0]),
+                origin[1] + 0.9999 * (v[1] - origin[1]),
+            ];
+            assert!(visible_ish(level, vision, v_in), "vertex {v:?}, {ctx}");
+            let w = poly[(i + 1) % poly.len()];
+            // Slivers thinner than f32 can place a sample in (e.g. the
+            // 1e-6 rad wedge just past a corner) can't be tested this way.
+            let (dv, dw) = (
+                [v[0] - origin[0], v[1] - origin[1]],
+                [w[0] - origin[0], w[1] - origin[1]],
+            );
+            let sin = (dv[0] * dw[1] - dv[1] * dw[0]) / (dv[0].hypot(dv[1]) * dw[0].hypot(dw[1]));
+            if sin.abs() < 1e-5 {
+                continue;
+            }
+            for _ in 0..4 {
+                let (mut s, mut t) = (rng.unit(), rng.unit());
+                if s + t > 1.0 {
+                    (s, t) = (1.0 - s, 1.0 - t);
+                }
+                let k = 0.99;
+                let p = [
+                    origin[0] + k * (s * (v[0] - origin[0]) + t * (w[0] - origin[0])),
+                    origin[1] + k * (s * (v[1] - origin[1]) + t * (w[1] - origin[1])),
+                ];
+                assert!(visible_ish(level, vision, p), "fan point {p:?}, {ctx}");
+            }
+        }
+
+        // Conversely, visible points lie inside the polygon. With a finite
+        // radius the arc is approximated by chords, so stay clear of it.
+        let limit = vision.radius() * 0.99;
+        for _ in 0..200 {
+            let p = rng.open_point(level);
+            let d = (p[0] - origin[0]).hypot(p[1] - origin[1]);
+            if d < limit && visible_with_margin(level, vision, p) {
+                let q = [
+                    origin[0] + 0.995 * (p[0] - origin[0]),
+                    origin[1] + 0.995 * (p[1] - origin[1]),
+                ];
+                assert!(inside(poly, q), "visible {p:?} outside polygon, {ctx}");
+            }
+        }
+    }
+
+    /// Total lit area, and whether point `p` is lit.
+    pub fn band_area(v: &Vision) -> f32 {
+        v.wall_band().iter().map(|s| area(s)).sum()
+    }
+
+    pub fn band_covers(v: &Vision, p: [f32; 2]) -> bool {
+        // Pieces may wind either way.
+        v.wall_band().iter().any(|s| {
+            // Signed distance from each edge's line.
+            let sides: Vec<f32> = (0..s.len())
+                .map(|i| {
+                    let (a, b) = (s[i], s[(i + 1) % s.len()]);
+                    ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / distance(a, b)
+                })
+                .collect();
+            sides.iter().all(|d| *d >= -1e-3) || sides.iter().all(|d| *d <= 1e-3)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use crate::rng::Rng;
+
+    /// Tile soups are dense with slopes in every arrangement: the hardest
+    /// case. (Generated levels are checked the same way in the
+    /// `goblin-nightclub-generate` crate's tests.)
+    const SOUPS: u32 = 16;
+
+    /// Tile soups, each with a suggested origin (which may be solid).
+    fn levels() -> impl Iterator<Item = (Layer, [f32; 2])> {
+        let spawn = [165.0, 105.0];
+        (0..SOUPS).map(move |seed| (Layer::soup(seed, 32, 20), spawn))
     }
 
     #[test]
@@ -751,87 +851,6 @@ mod tests {
         }
     }
 
-    /// Visible, allowing a hair of rotation: points on a line that exactly
-    /// grazes a corner are visible or not only up to rounding.
-    fn visible_ish(level: &Layer, vision: &Vision, p: [f32; 2]) -> bool {
-        let o = vision.origin();
-        let (a, d) = (angle(o, p), distance(o, p));
-        // Several sizes: a slit between corners can be narrower than the
-        // largest, and a corner close by needs the largest to clear it.
-        vision.can_see(level, p)
-            || [1e-5, 3e-6, 1e-6]
-                .iter()
-                .flat_map(|r| [a - r, a + r])
-                .any(|a| vision.can_see(level, at(o, a, d)))
-    }
-
-    /// Visible, and still visible a hair of rotation either way: points
-    /// seen only within rounding of a grazing line needn't be in the polygon.
-    fn visible_with_margin(level: &Layer, vision: &Vision, p: [f32; 2]) -> bool {
-        let o = vision.origin();
-        let (a, d) = (angle(o, p), distance(o, p));
-        vision.can_see(level, p)
-            && [a - 1e-5, a + 1e-5]
-                .iter()
-                .all(|a| vision.can_see(level, at(o, *a, d)))
-    }
-
-    fn check_polygon(level: &Layer, vision: &Vision, rng: &mut Rng) {
-        let origin = vision.origin();
-        let poly = vision.polygon();
-        let ctx = format!("origin {origin:?} radius {}", vision.radius());
-
-        // Vertices are visible, and so is everything inside each fan
-        // triangle (sampled slightly inward to avoid edge rounding).
-        for (i, v) in poly.iter().enumerate() {
-            // Nudged inward, since vertices on the radius circle round
-            // either way.
-            let v_in = [
-                origin[0] + 0.9999 * (v[0] - origin[0]),
-                origin[1] + 0.9999 * (v[1] - origin[1]),
-            ];
-            assert!(visible_ish(level, vision, v_in), "vertex {v:?}, {ctx}");
-            let w = poly[(i + 1) % poly.len()];
-            // Slivers thinner than f32 can place a sample in (e.g. the
-            // 1e-6 rad wedge just past a corner) can't be tested this way.
-            let (dv, dw) = (
-                [v[0] - origin[0], v[1] - origin[1]],
-                [w[0] - origin[0], w[1] - origin[1]],
-            );
-            let sin = (dv[0] * dw[1] - dv[1] * dw[0]) / (dv[0].hypot(dv[1]) * dw[0].hypot(dw[1]));
-            if sin.abs() < 1e-5 {
-                continue;
-            }
-            for _ in 0..4 {
-                let (mut s, mut t) = (rng.unit(), rng.unit());
-                if s + t > 1.0 {
-                    (s, t) = (1.0 - s, 1.0 - t);
-                }
-                let k = 0.99;
-                let p = [
-                    origin[0] + k * (s * (v[0] - origin[0]) + t * (w[0] - origin[0])),
-                    origin[1] + k * (s * (v[1] - origin[1]) + t * (w[1] - origin[1])),
-                ];
-                assert!(visible_ish(level, vision, p), "fan point {p:?}, {ctx}");
-            }
-        }
-
-        // Conversely, visible points lie inside the polygon. With a finite
-        // radius the arc is approximated by chords, so stay clear of it.
-        let limit = vision.radius() * 0.99;
-        for _ in 0..200 {
-            let p = rng.open_point(level);
-            let d = (p[0] - origin[0]).hypot(p[1] - origin[1]);
-            if d < limit && visible_with_margin(level, vision, p) {
-                let q = [
-                    origin[0] + 0.995 * (p[0] - origin[0]),
-                    origin[1] + 0.995 * (p[1] - origin[1]),
-                ];
-                assert!(inside(poly, q), "visible {p:?} outside polygon, {ctx}");
-            }
-        }
-    }
-
     #[test]
     fn radius_limits_sight() {
         let level = Layer::from_ascii(&["..........", "..........", ".........."]);
@@ -847,25 +866,6 @@ mod tests {
         let mut far = Vision::new(&level, f32::INFINITY);
         far.update(&level, origin);
         assert!(far.can_see(&level, [95.0, 25.0]));
-    }
-
-    /// Total lit area, and whether point `p` is lit.
-    fn band_area(v: &Vision) -> f32 {
-        v.wall_band().iter().map(|s| area(s)).sum()
-    }
-
-    fn band_covers(v: &Vision, p: [f32; 2]) -> bool {
-        // Pieces may wind either way.
-        v.wall_band().iter().any(|s| {
-            // Signed distance from each edge's line.
-            let sides: Vec<f32> = (0..s.len())
-                .map(|i| {
-                    let (a, b) = (s[i], s[(i + 1) % s.len()]);
-                    ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / distance(a, b)
-                })
-                .collect();
-            sides.iter().all(|d| *d >= -1e-3) || sides.iter().all(|d| *d <= 1e-3)
-        })
     }
 
     #[test]

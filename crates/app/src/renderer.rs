@@ -18,10 +18,10 @@
 use wasm_bindgen::JsError;
 use web_sys::HtmlCanvasElement;
 
-use crate::draw::Vertex;
-use crate::frame::Frame;
-use crate::level::MAX_LAYERS;
-use crate::tileset::CELL;
+use goblin_nightclub_core::draw::Vertex;
+use goblin_nightclub_core::frame::Frame;
+use goblin_nightclub_core::level::MAX_LAYERS;
+use goblin_nightclub_core::tileset::CELL;
 
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
@@ -221,7 +221,7 @@ impl Msaa {
 /// The tile sheet as a texture, for `textureLoad` in shapes.wgsl. Not
 /// sRGB, so its colors reach the screen as is, like vertex colors.
 fn upload_sheet(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
-    let sheet = crate::tileset::sheet();
+    let sheet = goblin_nightclub_core::tileset::sheet();
     let size = wgpu::Extent3d {
         width: sheet.size[0],
         height: sheet.size[1],
@@ -742,7 +742,7 @@ impl Renderer {
         // sized to the level is at the art's own size, whatever the view's
         // zoom, so zooming keeps what's been seen.
         let zoom = frame.zoom;
-        let seen_zoom = crate::tileset::ZOOM;
+        let seen_zoom = goblin_nightclub_core::tileset::ZOOM;
         let world_px = frame.world.map(|w| (w * seen_zoom).ceil());
         self.ensure_world(world_px.map(|w| w as u32), frame.depth);
         self.ensure_screen(frame.depth);

@@ -16,15 +16,15 @@
 
 use serde::Serialize;
 
-use crate::camera::Camera;
-use crate::draw::Canvas;
-use crate::frame::{Frame, LayerFrame};
-use crate::input::Input;
-use crate::layer::{Corner, Dir, Layer, Part, Shape, TILE, Tile, quarter_shapes};
-use crate::level::{Level, MAX_LAYERS, MAX_TILES};
-use crate::level_file::{LevelFile, Spawn};
-use crate::palette::{self, Color};
-use crate::tileset::{self, ZOOM};
+use goblin_nightclub_core::camera::Camera;
+use goblin_nightclub_core::draw::Canvas;
+use goblin_nightclub_core::frame::{Frame, LayerFrame};
+use goblin_nightclub_core::input::Input;
+use goblin_nightclub_core::layer::{Corner, Dir, Layer, Part, Shape, TILE, Tile, quarter_shapes};
+use goblin_nightclub_core::level::{Level, MAX_LAYERS, MAX_TILES};
+use goblin_nightclub_core::level_file::{LevelFile, Spawn};
+use goblin_nightclub_core::palette::{self, Color};
+use goblin_nightclub_core::tileset::{self, ZOOM};
 
 /// A size for new levels.
 pub const NEW_COLS: usize = 64;
@@ -81,6 +81,10 @@ pub struct State {
     pub rows: usize,
     pub can_undo: bool,
     pub can_redo: bool,
+    /// Whether a layer can be added (under [`MAX_LAYERS`]) or the current
+    /// one removed (not the last).
+    pub can_add_layer: bool,
+    pub can_remove_layer: bool,
 }
 
 /// Every brush, in palette order: floors, walls, void, stairs.
@@ -260,6 +264,8 @@ impl Editor {
             rows: self.rows,
             can_undo: !self.undo.is_empty(),
             can_redo: !self.redo.is_empty(),
+            can_add_layer: self.layers.len() < MAX_LAYERS,
+            can_remove_layer: self.layers.len() > 1,
         }
     }
 
@@ -284,6 +290,43 @@ impl Editor {
 
     pub fn set_layer(&mut self, layer: usize) {
         self.layer = layer.min(self.layers.len() - 1);
+    }
+
+    /// Add a layer of plain floor just above (or below) the current one
+    /// and switch to it. The spawn stays on its layer.
+    pub fn add_layer(&mut self, above: bool) {
+        if self.layers.len() >= MAX_LAYERS {
+            return;
+        }
+        self.checkpoint();
+        let at = if above { self.layer + 1 } else { self.layer };
+        let floor = self.layers[self.layer]
+            .iter()
+            .find_map(|t| t.floor_id())
+            .unwrap_or(0);
+        let tiles = vec![Tile::Whole(Part::Floor(floor)); self.cols * self.rows];
+        self.layers.insert(at, tiles);
+        if self.spawn.layer >= at {
+            self.spawn.layer += 1;
+        }
+        self.layer = at;
+        self.dirty = true;
+    }
+
+    /// Remove the current layer (never the last one). A spawn on it moves
+    /// to the layer that takes its place.
+    pub fn remove_layer(&mut self) {
+        if self.layers.len() <= 1 {
+            return;
+        }
+        self.checkpoint();
+        self.layers.remove(self.layer);
+        if self.spawn.layer > self.layer {
+            self.spawn.layer -= 1;
+        }
+        self.spawn.layer = self.spawn.layer.min(self.layers.len() - 1);
+        self.layer = self.layer.min(self.layers.len() - 1);
+        self.dirty = true;
     }
 
     pub fn zoom_by(&mut self, steps: i32, p: [f32; 2]) {
@@ -312,6 +355,7 @@ impl Editor {
     fn restore(&mut self, s: Snapshot) {
         self.layers = s.layers;
         self.spawn = s.spawn;
+        self.layer = self.layer.min(self.layers.len() - 1);
         self.dirty = true;
     }
 
@@ -637,8 +681,8 @@ impl Editor {
                 };
                 let voids = parts(&|i| self.layers[k][i].void_quarters());
                 let shaft = (k < top).then(|| {
-                    let shaft = self.level.shaft_quarters(top, k);
-                    parts(&|i| shaft[i])
+                    let shaft = self.level.shaft(top, k);
+                    parts(&|i| if shaft[i] { 0b1111 } else { 0 })
                 });
                 LayerFrame {
                     index: k,
@@ -835,6 +879,48 @@ mod tests {
         let loaded = Editor::from_file(&file, VIEW);
         assert_eq!(loaded.layers, e.layers);
         assert_eq!(loaded.state().layer, 0, "opens on the spawn's layer");
+    }
+
+    #[test]
+    fn layers_can_be_added_and_removed() {
+        let mut e = editor();
+        assert_eq!(e.state().depth, 2);
+        e.set_layer(0);
+        click(&mut e, [1, 1], 0);
+        // A new layer above the bottom one, between the two: the spawn (on
+        // the old top) moves up with it, and the wall stays below.
+        e.add_layer(true);
+        let s = e.state();
+        assert_eq!((s.depth, s.layer), (3, 1));
+        assert_eq!(e.spawn.layer, 2);
+        assert_eq!(e.layers[0][e.index([1, 1])], Tile::WALL);
+        assert!(e.layers[1].iter().all(|t| t.is_floor()), "plain floor");
+        // Below the current one: the spawn moves again.
+        e.add_layer(false);
+        assert_eq!((e.state().depth, e.state().layer), (4, 1));
+        assert_eq!(e.spawn.layer, 3);
+        // Undo both.
+        e.undo();
+        e.undo();
+        assert_eq!((e.state().depth, e.spawn.layer), (2, 1));
+        // Remove the spawn's layer: the spawn drops to the one below.
+        e.set_layer(1);
+        e.remove_layer();
+        assert_eq!((e.state().depth, e.state().layer, e.spawn.layer), (1, 0, 0));
+        assert!(!e.state().can_remove_layer);
+        e.remove_layer();
+        assert_eq!(e.state().depth, 1, "never the last");
+        e.redo();
+        e.undo();
+        assert_eq!(e.state().depth, 2);
+        // Up to the most a level may have.
+        for _ in 0..MAX_LAYERS {
+            e.add_layer(true);
+        }
+        assert_eq!(e.state().depth, MAX_LAYERS);
+        assert!(!e.state().can_add_layer);
+        let file = LevelFile::from_json(&e.to_file().to_json()).unwrap();
+        assert_eq!(file.layers.len(), MAX_LAYERS);
     }
 
     #[test]

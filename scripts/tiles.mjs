@@ -1,4 +1,5 @@
-// Draws the placeholder tile sheet, assets/tiles.png, in the EGA palette.
+// Draws the placeholder tile sheet, crates/core/assets/tiles.png, in the EGA
+// palette.
 // Cells are CELL pixels square, laid out as src/tileset.rs expects:
 //
 //   row 0  white (for plain colored shapes), stairs up, stairs down
@@ -14,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const OUT = path.join(ROOT, "assets", "tiles.png");
+const OUT = path.join(ROOT, "crates", "core", "assets", "tiles.png");
 
 const CELL = 16;
 const COLS = 8;

@@ -259,32 +259,32 @@ mod tests {
 
     #[test]
     fn levels_round_trip_as_json() {
-        let level = crate::generate::generate_level(
-            crate::generate::Style::Layered,
-            4,
-            32,
-            20,
-            [165.0, 105.0],
-        );
+        // Every kind of tile: wall, floor, void, splits over floor and
+        // void, and stairs.
+        let level = Level::new(vec![
+            Layer::from_ascii(&["#..◸", "..>.", "###."]),
+            Layer::from_ascii(&["~~◤▟", "~.<.", "...."]),
+        ]);
+        let (cols, rows) = (4, 3);
         let layers: Vec<Vec<Tile>> = (0..level.depth())
             .map(|k| {
-                (0..20)
-                    .flat_map(|y| (0..32).map(move |x| (x, y)))
+                (0..rows)
+                    .flat_map(|y| (0..cols).map(move |x| (x, y)))
                     .map(|(x, y)| level.layer(k).tile(x, y))
                     .collect()
             })
             .collect();
         let spawn = Spawn {
             layer: level.depth() - 1,
-            tile: [16, 10],
+            tile: [2, 2],
         };
-        let file = LevelFile::new(32, 20, &layers, spawn);
+        let file = LevelFile::new(cols as usize, rows as usize, &layers, spawn);
         let back = LevelFile::from_json(&file.to_json()).unwrap();
         assert_eq!(back, file);
         assert_eq!(back.tiles(), layers);
         let loaded = back.level();
         assert_eq!(loaded.depth(), level.depth());
-        assert_eq!(loaded.layer(1).tile(5, 5), level.layer(1).tile(5, 5));
+        assert_eq!(loaded.layer(1).tile(3, 0), level.layer(1).tile(3, 0));
     }
 
     #[test]

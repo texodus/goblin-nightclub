@@ -5,12 +5,12 @@
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-use crate::editor::{self, BrushShape, Editor, Tool};
-use crate::game::Game;
-use crate::layer::Corner;
-use crate::level_file::LevelFile;
 use crate::renderer::Renderer;
-use crate::{HEIGHT, WIDTH};
+use goblin_nightclub_core::layer::Corner;
+use goblin_nightclub_core::level_file::LevelFile;
+use goblin_nightclub_core::{HEIGHT, WIDTH};
+use goblin_nightclub_editor::{self as editor, BrushShape, Editor, Tool};
+use goblin_nightclub_game::Game;
 
 #[wasm_bindgen(start)]
 fn init() {
@@ -185,6 +185,20 @@ impl App {
     pub fn editor_layer(&mut self, layer: usize) {
         if let Some(e) = self.edit() {
             e.set_layer(layer);
+        }
+    }
+
+    /// Add a layer of floor above (or below) the one being edited.
+    pub fn editor_add_layer(&mut self, above: bool) {
+        if let Some(e) = self.edit() {
+            e.add_layer(above);
+        }
+    }
+
+    /// Remove the layer being edited.
+    pub fn editor_remove_layer(&mut self) {
+        if let Some(e) = self.edit() {
+            e.remove_layer();
         }
     }
 

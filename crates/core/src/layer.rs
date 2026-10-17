@@ -7,7 +7,7 @@
 
 use crate::draw::{Canvas, faces_light, inset_corner, inward_normal};
 use crate::palette;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 use crate::rng::Rng;
 use crate::tileset;
 
@@ -570,19 +570,6 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// Generate a random level in `style`, keeping the area around `spawn`
-    /// (in pixels) open and all open floor connected to it. See
-    /// [`crate::generate`].
-    pub fn generate(
-        style: crate::generate::Style,
-        seed: u32,
-        cols: usize,
-        rows: usize,
-        spawn: [f32; 2],
-    ) -> Self {
-        crate::generate::generate(style, seed, cols, rows, spawn)
-    }
-
     /// A level from its tiles, row by row.
     pub fn from_tiles(cols: usize, rows: usize, tiles: Vec<Tile>) -> Self {
         assert_eq!(tiles.len(), cols * rows);
@@ -624,7 +611,7 @@ impl Layer {
     /// (wall in that corner, floor in the rest), `◤ ◥ ◣ ◢` (wall in that
     /// corner over void), `▛ ▜ ▙ ▟` (floor in that corner, void in the
     /// rest), `~` (void) and `<` `>` (stairs up and down), for tests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn from_ascii(rows: &[&str]) -> Self {
         use Corner::*;
         let cols = rows[0].chars().count();
@@ -658,7 +645,7 @@ impl Layer {
 
     /// Random tiles with plenty of slopes in every arrangement, for
     /// stress-testing queries.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn soup(seed: u32, cols: usize, rows: usize) -> Self {
         let mut rng = Rng::new(seed);
         let tiles = (0..cols * rows)
@@ -1437,10 +1424,37 @@ fn smallest_move(constraints: &[([f32; 2], f32)]) -> Option<[f32; 2]> {
         .min_by(|x, y| x[0].hypot(x[1]).total_cmp(&y[0].hypot(y[1])))
 }
 
+/// Invariant checks for tests, here and in other crates.
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing {
+    use super::Layer;
+
+    /// Each outline edge is in exactly one run, and each loop is closed:
+    /// every run starts where the previous one ended.
+    pub fn check_outlines(level: &Layer) {
+        let mut seen = vec![0; level.outline_edges().len()];
+        for o in level.outlines() {
+            assert_eq!(o.points.len(), o.runs.len());
+            for (k, run) in o.runs.iter().enumerate() {
+                let edges: Vec<_> = run.iter().map(|&i| level.outline_edges()[i]).collect();
+                assert_eq!(edges[0].a, o.points[k]);
+                assert_eq!(edges.last().unwrap().b, o.points[(k + 1) % o.points.len()]);
+                for w in edges.windows(2) {
+                    assert_eq!(w[0].b, w[1].a);
+                }
+                for &i in run {
+                    seen[i] += 1;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&n| n == 1), "{seen:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::check_outlines;
     use super::*;
-    use crate::generate::Style;
 
     const SIZE: [f32; 2] = [8.0, 8.0];
 
@@ -1749,27 +1763,6 @@ mod tests {
             .sum()
     }
 
-    /// Each level edge in exactly one run, and each loop closed: every run
-    /// starts where the previous one ended.
-    fn check_outlines(level: &Layer) {
-        let mut seen = vec![0; level.outline_edges().len()];
-        for o in level.outlines() {
-            assert_eq!(o.points.len(), o.runs.len());
-            for (k, run) in o.runs.iter().enumerate() {
-                let edges: Vec<_> = run.iter().map(|&i| level.outline_edges()[i]).collect();
-                assert_eq!(edges[0].a, o.points[k]);
-                assert_eq!(edges.last().unwrap().b, o.points[(k + 1) % o.points.len()]);
-                for w in edges.windows(2) {
-                    assert_eq!(w[0].b, w[1].a);
-                }
-                for &i in run {
-                    seen[i] += 1;
-                }
-            }
-        }
-        assert!(seen.iter().all(|&n| n == 1), "{seen:?}");
-    }
-
     #[test]
     fn outlines_of_a_block_and_the_boundary() {
         let level = Layer::from_ascii(&["....", ".##.", ".##.", "...."]);
@@ -1848,9 +1841,6 @@ mod tests {
 
         for seed in 0..30 {
             check_outlines(&Layer::soup(seed, 32, 20));
-            for style in [Style::World, Style::Cave] {
-                check_outlines(&Layer::generate(style, seed, 32, 20, [165.0, 105.0]));
-            }
         }
     }
 
@@ -2034,15 +2024,5 @@ mod tests {
         assert!(level.collides([16.0, 13.0], [3.0, 3.0]));
         // Touching the face at a single point doesn't count.
         assert!(!level.collides([15.0, 15.0], [3.0, 3.0]));
-    }
-
-    #[test]
-    fn generated_blocks_avoid_spawn() {
-        for seed in 0..200 {
-            let spawn = [161.0, 101.0];
-            let level = Layer::generate(Style::World, seed, 32, 20, spawn);
-            assert!(!level.collides(spawn, SIZE), "seed {seed}");
-            assert!((0..32).any(|x| (0..20).any(|y| !level.is_open(x, y))));
-        }
     }
 }

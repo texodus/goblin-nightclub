@@ -1,18 +1,15 @@
-//! A 2D WebAssembly + WebGPU game. JS owns the frame loop and input events
-//! and forwards them to `app::App`; Rust owns game state and rendering.
+//! The engine: tile grids and their geometry, levels of stacked layers,
+//! sight, movement, drawing lists, and level files. Nothing here touches
+//! the browser or GPU, so it compiles natively and is unit tested with
+//! `cargo test`.
 //!
-//! Browser/GPU code is compiled only for `wasm32`, so game logic can be unit
-//! tested natively with `cargo test`.
+//! The `test-util` feature exposes test helpers (levels from ASCII art,
+//! random tile soups, invariant checks) for other crates' tests.
 
-#[cfg(target_arch = "wasm32")]
-mod app;
 pub mod camera;
 pub mod draw;
-pub mod editor;
 pub mod entity;
 pub mod frame;
-pub mod game;
-pub mod generate;
 pub mod input;
 pub mod layer;
 pub mod level;
@@ -20,8 +17,6 @@ pub mod level_file;
 pub mod memory;
 pub mod palette;
 pub mod path;
-#[cfg(target_arch = "wasm32")]
-mod renderer;
 pub mod rng;
 pub mod tileset;
 pub mod vision;

@@ -166,6 +166,9 @@ async function main() {
         paint($("#secondary"), palette[state.secondary]);
         $("[data-action=undo]").disabled = !state.can_undo;
         $("[data-action=redo]").disabled = !state.can_redo;
+        $("[data-action=add-layer-above]").disabled = !state.can_add_layer;
+        $("[data-action=add-layer-below]").disabled = !state.can_add_layer;
+        $("[data-action=remove-layer]").disabled = !state.can_remove_layer;
         if (shownDepth !== state.depth) {
             shownDepth = state.depth;
             const layers = $("#layers");
@@ -226,6 +229,15 @@ async function main() {
             }
             case "save":
                 download("level.json", app.editor_save());
+                break;
+            case "add-layer-above":
+                app.editor_add_layer(true);
+                break;
+            case "add-layer-below":
+                app.editor_add_layer(false);
+                break;
+            case "remove-layer":
+                app.editor_remove_layer();
                 break;
             case "undo":
                 app.editor_undo();
