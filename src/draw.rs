@@ -13,11 +13,11 @@ pub struct Vertex {
 
 /// Triangles drawn in order, later ones on top.
 #[derive(Clone, Default)]
-pub struct Layer {
+pub struct Canvas {
     pub vertices: Vec<Vertex>,
 }
 
-impl Layer {
+impl Canvas {
     pub fn rect(&mut self, pos: [f32; 2], size: [f32; 2], color: Color) {
         let [x0, y0] = pos;
         let [x1, y1] = [x0 + size[0], y0 + size[1]];
@@ -100,7 +100,7 @@ mod tests {
     const BLUE: Color = [0.0, 0.0, 1.0, 1.0];
 
     /// Color of the last triangle covering `p`, like the GPU would draw it.
-    fn color_at(layer: &Layer, p: [f32; 2]) -> Option<Color> {
+    fn color_at(layer: &Canvas, p: [f32; 2]) -> Option<Color> {
         layer.vertices.chunks(3).rev().find_map(|t| {
             let cross = |a: [f32; 2], b: [f32; 2]| {
                 (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn bevels_light_top_left_and_shade_bottom_right() {
-        let mut layer = Layer::default();
+        let mut layer = Canvas::default();
         // A 10x10 square with its bottom-right corner cut at 45 degrees.
         let shape = [
             [0.0, 0.0],
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn bevel_strip_is_one_pixel_wide_on_diagonals() {
-        let mut layer = Layer::default();
+        let mut layer = Canvas::default();
         // A "/" face facing up-left: lit.
         let shape = [[10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
         layer.beveled(&shape, RED, GREEN, BLUE);

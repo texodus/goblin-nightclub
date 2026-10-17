@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::entity::{Entity, EntityId, Kind, sample_points};
-use crate::level::Level;
+use crate::layer::Layer;
 use crate::vision::Vision;
 
 /// An entity as it was when last seen.
@@ -31,7 +31,13 @@ impl Memory {
     /// it's been seen not to be there. Requiring the whole spot (rather than
     /// any point) keeps the marker when an entity steps just out of sight
     /// and its last position is still partly visible.
-    pub fn update(&mut self, level: &Level, vision: &Vision, entities: &[Entity], now: f32) {
+    pub fn update<'a>(
+        &mut self,
+        level: &Layer,
+        vision: &Vision,
+        entities: impl IntoIterator<Item = &'a Entity>,
+        now: f32,
+    ) {
         let seen = |pos, size| sample_points(pos, size).map(|p| vision.can_see(level, p));
 
         self.visible.clear();
@@ -55,6 +61,11 @@ impl Memory {
             .retain(|id, m| visible.contains(id) || seen(m.pos, m.size).contains(&false));
     }
 
+    /// Nothing is visible (the layer isn't in view at all); markers stay.
+    pub fn clear_visible(&mut self) {
+        self.visible.clear();
+    }
+
     pub fn is_visible(&self, id: EntityId) -> bool {
         self.visible.contains(&id)
     }
@@ -73,8 +84,8 @@ mod tests {
     use super::*;
 
     /// A wall in column 4 (x 40..50), open around its ends.
-    fn level() -> Level {
-        Level::from_ascii(&[
+    fn level() -> Layer {
+        Layer::from_ascii(&[
             "..........", //
             "....#.....", //
             "....#.....", //
@@ -83,7 +94,7 @@ mod tests {
         ])
     }
 
-    fn look(level: &Level, from: [f32; 2]) -> Vision {
+    fn look(level: &Layer, from: [f32; 2]) -> Vision {
         let mut v = Vision::new(level, f32::INFINITY);
         v.update(level, from);
         v

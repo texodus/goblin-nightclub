@@ -2,7 +2,7 @@
 
 use std::f32::consts::TAU;
 
-use crate::level::{Level, TILE};
+use crate::layer::{Layer, TILE};
 use crate::rng::Rng;
 
 pub type EntityId = u32;
@@ -15,6 +15,8 @@ pub enum Kind {
 pub struct Entity {
     pub id: EntityId,
     pub kind: Kind,
+    /// Which layer of the level it's on.
+    pub layer: usize,
     pub pos: [f32; 2],
     pub size: [f32; 2],
     heading: [f32; 2],
@@ -32,6 +34,7 @@ impl Entity {
         Self {
             id,
             kind: Kind::Npc,
+            layer: 0,
             pos,
             size: NPC_SIZE,
             heading: [0.0; 2],
@@ -39,12 +42,14 @@ impl Entity {
         }
     }
 
-    /// Place `count` NPCs at random open spots at least `min_dist` pixels
-    /// (center to center) from `avoid`.
+    /// Place `count` NPCs, numbered from `first_id`, at random open spots
+    /// of `level` at least `min_dist` pixels (center to center) from
+    /// `avoid`.
     pub fn spawn_npcs(
-        level: &Level,
+        level: &Layer,
         rng: &mut Rng,
         count: usize,
+        first_id: EntityId,
         avoid: [f32; 2],
         min_dist: f32,
     ) -> Vec<Self> {
@@ -58,7 +63,7 @@ impl Entity {
                 rng.unit() * (w - NPC_SIZE[0]),
                 rng.unit() * (h - NPC_SIZE[1]),
             ];
-            let npc = Self::npc(out.len() as EntityId, pos);
+            let npc = Self::npc(first_id + out.len() as EntityId, pos);
             let c = npc.center();
             if !level.collides(pos, NPC_SIZE)
                 && (c[0] - avoid[0]).hypot(c[1] - avoid[1]) >= min_dist
@@ -75,7 +80,7 @@ impl Entity {
 
     /// Drift in a random direction, picking a new one every few seconds or
     /// on bumping into a wall.
-    pub fn wander(&mut self, level: &Level, rng: &mut Rng, dt: f32) {
+    pub fn wander(&mut self, level: &Layer, rng: &mut Rng, dt: f32) {
         self.turn_in -= dt;
         if self.turn_in <= 0.0 {
             self.turn(rng);
@@ -128,9 +133,9 @@ mod tests {
             } else {
                 Style::Cave
             };
-            let level = Level::generate(style, seed, 32, 20, spawn);
+            let level = Layer::generate(style, seed, 32, 20, spawn);
             let mut rng = Rng::new(seed ^ 0x9E37_79B9);
-            let mut npcs = Entity::spawn_npcs(&level, &mut rng, 4, spawn, 40.0);
+            let mut npcs = Entity::spawn_npcs(&level, &mut rng, 4, 0, spawn, 40.0);
             assert_eq!(npcs.len(), 4);
             for npc in &npcs {
                 let c = npc.center();

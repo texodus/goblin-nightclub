@@ -1,20 +1,30 @@
-//! WebGPU renderer. Each frame it:
-//! 1. draws each visibility layer's triangles into its own offscreen texture;
-//! 2. draws the visibility polygon into two masks: `now`, cleared every
-//!    frame, and `seen`, never cleared, so it accumulates everything seen;
-//! 3. composites the layers to the screen, styling each pixel by the masks.
+//! WebGPU renderer. Each frame, for each layer of the level in view:
+//! 1. draws its visible, remembered and unknown canvases offscreen;
+//! 2. draws where it's void (the layer below shows through) into a mask;
+//! 3. draws its visibility polygon into two masks: `now`, cleared every
+//!    frame, and `seen`, never cleared, so it accumulates everything seen
+//!    (for a layer below the viewer's, only where it shows through).
+//!
+//! Then it composites to the screen: from the viewer's layer down through
+//! void, each layer a little smaller about the screen center (parallax),
+//! styling each pixel by its layer's masks. Everything per layer is kept in
+//! world space, so `seen` survives the viewer changing layers.
 
 use wasm_bindgen::JsError;
 use web_sys::HtmlCanvasElement;
 
 use crate::draw::Vertex;
 use crate::frame::Frame;
+use crate::level::MAX_LAYERS;
 
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
-/// MSAA sample count for the masks, which anti-aliases visibility edges.
-/// 1 gives hard pixel edges.
+/// MSAA sample count for the visibility masks, which anti-aliases their
+/// edges. 1 gives hard pixel edges.
 const MASK_SAMPLES: u32 = 4;
+
+/// Scale of each layer relative to the one above it.
+const PARALLAX: f32 = 0.97;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -31,6 +41,11 @@ struct CompositeParams {
     /// 0 for unlimited.
     radius: f32,
     time: f32,
+    top: u32,
+    /// Bit per layer drawn this frame.
+    present: u32,
+    scale: f32,
+    _pad: f32,
 }
 
 /// A vertex buffer that grows (to the next power of two) as needed.
@@ -77,45 +92,95 @@ impl GrowBuffer {
     }
 }
 
-/// A single-sample mask texture (what the compositor reads), plus the
-/// multisampled texture drawn into and resolved from when MSAA is on.
-struct Mask {
-    resolved: wgpu::TextureView,
-    msaa: Option<wgpu::TextureView>,
+/// A 2D array texture: one view of the whole array to read from, and one
+/// view per layer to draw into.
+struct ArrayTexture {
+    whole: wgpu::TextureView,
+    layers: Vec<wgpu::TextureView>,
 }
 
-impl Mask {
-    fn new(device: &wgpu::Device, label: &str, size: wgpu::Extent3d) -> Self {
-        let resolved = texture_view(
-            device,
-            label,
-            size,
-            MASK_FORMAT,
-            1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let msaa = (MASK_SAMPLES > 1).then(|| {
-            texture_view(
-                device,
-                label,
-                size,
-                MASK_FORMAT,
-                MASK_SAMPLES,
-                wgpu::TextureUsages::RENDER_ATTACHMENT,
-            )
+impl ArrayTexture {
+    fn new(
+        device: &wgpu::Device,
+        label: &str,
+        size: [u32; 2],
+        layers: u32,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: layers,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
-        Self { resolved, msaa }
+        let whole = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let layers = (0..layers)
+            .map(|i| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Self { whole, layers }
+    }
+}
+
+/// A multisampled texture drawn into and resolved to one layer of a mask
+/// array (or, with MSAA off, that layer drawn into directly).
+struct Msaa {
+    view: Option<wgpu::TextureView>,
+}
+
+impl Msaa {
+    fn new(device: &wgpu::Device, label: &str, size: [u32; 2]) -> Self {
+        let view = (MASK_SAMPLES > 1).then(|| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: size[0],
+                        height: size[1],
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: MASK_SAMPLES,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: MASK_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        });
+        Self { view }
     }
 
-    /// Color attachment that draws into the mask. With `clear` the mask is
+    /// Color attachment drawing into `resolved`. With `clear` the mask is
     /// reset first; otherwise new triangles accumulate onto what's there.
-    fn attachment(&self, clear: bool) -> wgpu::RenderPassColorAttachment<'_> {
-        let (view, resolve_target) = match &self.msaa {
-            Some(msaa) => (msaa, Some(&self.resolved)),
-            None => (&self.resolved, None),
+    fn attachment<'a>(
+        &'a self,
+        resolved: &'a wgpu::TextureView,
+        clear: bool,
+    ) -> wgpu::RenderPassColorAttachment<'a> {
+        let (view, resolve_target) = match &self.view {
+            Some(msaa) => (msaa, Some(resolved)),
+            None => (resolved, None),
         };
         // The MSAA samples only need to outlive the pass when accumulating.
-        let store = if clear && self.msaa.is_some() {
+        let store = if clear && self.view.is_some() {
             wgpu::StoreOp::Discard
         } else {
             wgpu::StoreOp::Store
@@ -136,6 +201,19 @@ impl Mask {
     }
 }
 
+/// A plain single-sample attachment, cleared first.
+fn cleared(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        depth_slice: None,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            store: wgpu::StoreOp::Store,
+        },
+    }
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -143,41 +221,29 @@ pub struct Renderer {
     globals: wgpu::BindGroup,
     shape_pipeline: wgpu::RenderPipeline,
     mask_pipeline: wgpu::RenderPipeline,
+    mask_shaft_pipeline: wgpu::RenderPipeline,
+    fill_pipeline: wgpu::RenderPipeline,
+    unmask_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     composite_bind_group: wgpu::BindGroup,
     composite_params: wgpu::Buffer,
-    /// Offscreen targets for the visible, remembered and unknown layers.
-    layers: [wgpu::TextureView; 3],
-    mask_now: Mask,
-    mask_seen: Mask,
-    vertices: GrowBuffer,
-    fan: GrowBuffer,
+    /// Per layer `a`: visible, remembered, unknown at `3a`, `3a + 1`,
+    /// `3a + 2`.
+    canvases: ArrayTexture,
+    now: ArrayTexture,
+    seen: ArrayTexture,
+    voids: ArrayTexture,
+    shafts: ArrayTexture,
+    /// Per layer, reading its shaft mask in `fs_mask_shaft`.
+    shaft_bind_groups: Vec<wgpu::BindGroup>,
+    now_msaa: Vec<Msaa>,
+    seen_msaa: Vec<Msaa>,
+    canvas_vertices: GrowBuffer,
+    mask_vertices: GrowBuffer,
 }
 
 fn js_err(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
-}
-
-fn texture_view(
-    device: &wgpu::Device,
-    label: &str,
-    size: wgpu::Extent3d,
-    format: wgpu::TextureFormat,
-    sample_count: u32,
-    usage: wgpu::TextureUsages,
-) -> wgpu::TextureView {
-    device
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size,
-            mip_level_count: 1,
-            sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage,
-            view_formats: &[],
-        })
-        .create_view(&Default::default())
 }
 
 fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
@@ -194,17 +260,31 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
 }
 
 /// A texture read with `textureLoad` in a fragment shader.
-fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+fn texture_entry(
+    binding: u32,
+    dimension: wgpu::TextureViewDimension,
+) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: false },
-            view_dimension: wgpu::TextureViewDimension::D2,
+            view_dimension: dimension,
             multisampled: false,
         },
         count: None,
     }
+}
+
+/// Two triangles per rect `(pos, size)`.
+fn rect_triangles(rects: &[([f32; 2], [f32; 2])]) -> impl Iterator<Item = Vertex> + '_ {
+    rects.iter().flat_map(|&([x, y], [w, h])| {
+        let (x1, y1) = (x + w, y + h);
+        [[x, y], [x1, y], [x, y1], [x, y1], [x1, y], [x1, y1]].map(|pos| Vertex {
+            pos,
+            ..Default::default()
+        })
+    })
 }
 
 impl Renderer {
@@ -234,11 +314,7 @@ impl Renderer {
         config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
         surface.configure(&device, &config);
         let format = config.format;
-        let size = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
+        let size = [width, height];
 
         // Screen size, shared by the shape and mask pipelines.
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -264,14 +340,24 @@ impl Renderer {
                 resource: globals_buf.as_entire_binding(),
             }],
         });
+        let shaft_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shaft"),
+            entries: &[texture_entry(0, wgpu::TextureViewDimension::D2)],
+        });
         let globals_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("globals"),
                 bind_group_layouts: &[Some(&globals_layout)],
                 ..Default::default()
             });
+        let shaft_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shaft"),
+                bind_group_layouts: &[Some(&globals_layout), Some(&shaft_layout)],
+                ..Default::default()
+            });
 
-        // Layers and masks both draw colored triangles from the same
+        // Canvases and masks all draw colored triangles from the same
         // vertices; masks just ignore the color.
         let shapes = device.create_shader_module(wgpu::include_wgsl!("shaders/shapes.wgsl"));
         let vertex_layout = wgpu::VertexBufferLayout {
@@ -279,34 +365,36 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4],
         };
-        let triangles = |label, fs, target: wgpu::ColorTargetState, samples| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&globals_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shapes,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[Some(vertex_layout.clone())],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shapes,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(target)],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: samples,
-                    ..Default::default()
-                },
-                multiview_mask: None,
-                cache: None,
-            })
-        };
+        let triangles =
+            |label, layout: &wgpu::PipelineLayout, fs, target: wgpu::ColorTargetState, samples| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(layout),
+                    vertex: wgpu::VertexState {
+                        module: &shapes,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[Some(vertex_layout.clone())],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shapes,
+                        entry_point: Some(fs),
+                        compilation_options: Default::default(),
+                        targets: &[Some(target)],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: samples,
+                        ..Default::default()
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
         let shape_pipeline = triangles(
             "shapes",
+            &globals_pipeline_layout,
             "fs_color",
             wgpu::ColorTargetState {
                 format,
@@ -315,14 +403,61 @@ impl Renderer {
             },
             1,
         );
-        let mask_pipeline = triangles("mask", "fs_mask", MASK_FORMAT.into(), MASK_SAMPLES);
+        let mask_pipeline = triangles(
+            "mask",
+            &globals_pipeline_layout,
+            "fs_mask",
+            MASK_FORMAT.into(),
+            MASK_SAMPLES,
+        );
+        let mask_shaft_pipeline = triangles(
+            "mask in shaft",
+            &shaft_pipeline_layout,
+            "fs_mask_shaft",
+            MASK_FORMAT.into(),
+            MASK_SAMPLES,
+        );
+        let fill_pipeline = triangles(
+            "fill",
+            &globals_pipeline_layout,
+            "fs_mask",
+            MASK_FORMAT.into(),
+            1,
+        );
+        let unmask_pipeline = triangles(
+            "unmask",
+            &globals_pipeline_layout,
+            "fs_unmask",
+            MASK_FORMAT.into(),
+            1,
+        );
 
-        let layer_usage =
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        let layers = ["visible layer", "remembered layer", "unknown layer"]
-            .map(|label| texture_view(&device, label, size, format, 1, layer_usage));
-        let mask_now = Mask::new(&device, "mask now", size);
-        let mask_seen = Mask::new(&device, "mask seen", size);
+        let layers = MAX_LAYERS as u32;
+        let canvases = ArrayTexture::new(&device, "canvases", size, 3 * layers, format);
+        let now = ArrayTexture::new(&device, "mask now", size, layers, MASK_FORMAT);
+        let seen = ArrayTexture::new(&device, "mask seen", size, layers, MASK_FORMAT);
+        let voids = ArrayTexture::new(&device, "voids", size, layers, MASK_FORMAT);
+        let shafts = ArrayTexture::new(&device, "shafts", size, layers, MASK_FORMAT);
+        let shaft_bind_groups = shafts
+            .layers
+            .iter()
+            .map(|view| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shaft"),
+                    layout: &shaft_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    }],
+                })
+            })
+            .collect();
+        let now_msaa = (0..MAX_LAYERS)
+            .map(|_| Msaa::new(&device, "now msaa", size))
+            .collect();
+        let seen_msaa = (0..MAX_LAYERS)
+            .map(|_| Msaa::new(&device, "seen msaa", size))
+            .collect();
 
         let composite_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("composite params"),
@@ -330,15 +465,15 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let array = wgpu::TextureViewDimension::D2Array;
         let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("composite"),
             entries: &[
                 uniform_entry(0, wgpu::ShaderStages::FRAGMENT),
-                texture_entry(1),
-                texture_entry(2),
-                texture_entry(3),
-                texture_entry(4),
-                texture_entry(5),
+                texture_entry(1, array),
+                texture_entry(2, array),
+                texture_entry(3, array),
+                texture_entry(4, array),
             ],
         });
         let texture = |binding, view| wgpu::BindGroupEntry {
@@ -353,11 +488,10 @@ impl Renderer {
                     binding: 0,
                     resource: composite_params.as_entire_binding(),
                 },
-                texture(1, &layers[0]),
-                texture(2, &layers[1]),
-                texture(3, &layers[2]),
-                texture(4, &mask_now.resolved),
-                texture(5, &mask_seen.resolved),
+                texture(1, &canvases.whole),
+                texture(2, &now.whole),
+                texture(3, &seen.whole),
+                texture(4, &voids.whole),
             ],
         });
         let composite_shader =
@@ -390,8 +524,9 @@ impl Renderer {
             cache: None,
         });
 
-        let vertices = GrowBuffer::new(&device, "layer vertices", wgpu::BufferUsages::VERTEX);
-        let fan = GrowBuffer::new(&device, "visibility fan", wgpu::BufferUsages::VERTEX);
+        let canvas_vertices =
+            GrowBuffer::new(&device, "canvas vertices", wgpu::BufferUsages::VERTEX);
+        let mask_vertices = GrowBuffer::new(&device, "mask vertices", wgpu::BufferUsages::VERTEX);
         Ok(Self {
             surface,
             device,
@@ -399,51 +534,92 @@ impl Renderer {
             globals,
             shape_pipeline,
             mask_pipeline,
+            mask_shaft_pipeline,
+            fill_pipeline,
+            unmask_pipeline,
             composite_pipeline,
             composite_bind_group,
             composite_params,
-            layers,
-            mask_now,
-            mask_seen,
-            vertices,
-            fan,
+            canvases,
+            now,
+            seen,
+            voids,
+            shafts,
+            shaft_bind_groups,
+            now_msaa,
+            seen_msaa,
+            canvas_vertices,
+            mask_vertices,
         })
     }
 
     pub fn draw(&mut self, frame: &Frame) {
-        // All layers share one vertex buffer; each layer draws its range.
-        let mut vertices = Vec::new();
-        let ranges = [&frame.visible, &frame.remembered, &frame.unknown].map(|layer| {
-            let start = vertices.len() as u32;
-            vertices.extend_from_slice(&layer.vertices);
-            start..vertices.len() as u32
-        });
-        self.vertices
-            .write(&self.device, &self.queue, bytemuck::cast_slice(&vertices));
-
-        // Visible area as a triangle list: the polygon fanning out from the
-        // origin, plus each (convex) lit shape fanned from its first point.
-        let poly = &frame.polygon;
-        let mut fan: Vec<Vertex> = (0..poly.len())
-            .flat_map(|i| [frame.origin, poly[i], poly[(i + 1) % poly.len()]])
-            .map(|pos| Vertex {
-                pos,
-                ..Default::default()
-            })
-            .collect();
-        for shape in &frame.lit_shapes {
-            fan.extend(
-                (1..shape.len().saturating_sub(1))
-                    .flat_map(|i| [shape[0], shape[i], shape[i + 1]])
+        // All vertices go in two buffers; each pass draws its range.
+        let mut canvas_vertices = Vec::new();
+        let mut mask_vertices: Vec<Vertex> = Vec::new();
+        let push = |into: &mut Vec<Vertex>, vertices: &mut dyn Iterator<Item = Vertex>| {
+            let start = into.len() as u32;
+            into.extend(vertices);
+            start..into.len() as u32
+        };
+        struct Ranges {
+            canvases: [std::ops::Range<u32>; 3],
+            visible: std::ops::Range<u32>,
+            voids: std::ops::Range<u32>,
+            standing: std::ops::Range<u32>,
+            shaft: Option<std::ops::Range<u32>>,
+        }
+        let ranges: Vec<Ranges> = frame
+            .layers
+            .iter()
+            .map(|l| {
+                let canvases = [&l.visible, &l.remembered, &l.unknown]
+                    .map(|c| push(&mut canvas_vertices, &mut c.vertices.iter().copied()));
+                // Visible area as a triangle list: the polygon fanning out
+                // from the origin, plus each (convex) lit shape fanned from
+                // its first point.
+                let poly = &l.polygon;
+                let fan = (0..poly.len())
+                    .flat_map(|i| [frame.origin, poly[i], poly[(i + 1) % poly.len()]])
+                    .chain(l.lit_shapes.iter().flat_map(|shape| {
+                        (1..shape.len().saturating_sub(1))
+                            .flat_map(move |i| [shape[0], shape[i], shape[i + 1]])
+                    }))
                     .map(|pos| Vertex {
                         pos,
                         ..Default::default()
-                    }),
-            );
-        }
-        self.fan
-            .write(&self.device, &self.queue, bytemuck::cast_slice(&fan));
+                    });
+                let visible = push(&mut mask_vertices, &mut fan.into_iter());
+                let voids = push(&mut mask_vertices, &mut rect_triangles(&l.voids));
+                let standing = push(&mut mask_vertices, &mut rect_triangles(&l.standing));
+                let shaft = l
+                    .shaft
+                    .as_ref()
+                    .map(|rects| push(&mut mask_vertices, &mut rect_triangles(rects)));
+                Ranges {
+                    canvases,
+                    visible,
+                    voids,
+                    standing,
+                    shaft,
+                }
+            })
+            .collect();
+        self.canvas_vertices.write(
+            &self.device,
+            &self.queue,
+            bytemuck::cast_slice(&canvas_vertices),
+        );
+        self.mask_vertices.write(
+            &self.device,
+            &self.queue,
+            bytemuck::cast_slice(&mask_vertices),
+        );
 
+        let present = frame
+            .layers
+            .iter()
+            .fold(0u32, |bits, l| bits | 1 << l.index);
         let params = CompositeParams {
             origin: frame.origin,
             radius: if frame.radius.is_finite() {
@@ -452,6 +628,10 @@ impl Renderer {
                 0.0
             },
             time: frame.time,
+            top: frame.top as u32,
+            present,
+            scale: PARALLAX,
+            _pad: 0.0,
         };
         self.queue
             .write_buffer(&self.composite_params, 0, bytemuck::bytes_of(&params));
@@ -464,39 +644,91 @@ impl Renderer {
         let screen = output.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
-        for (view, range) in self.layers.iter().zip(ranges) {
+        // One pass drawing `range` of a vertex buffer with `pipeline`.
+        let mut pass = |attachment: wgpu::RenderPassColorAttachment,
+                        pipeline: &wgpu::RenderPipeline,
+                        extra: Option<&wgpu::BindGroup>,
+                        buffer: &wgpu::Buffer,
+                        range: std::ops::Range<u32>| {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("layer"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
+                color_attachments: &[Some(attachment)],
+                ..Default::default()
+            });
+            if !range.is_empty() {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.globals, &[]);
+                if let Some(group) = extra {
+                    pass.set_bind_group(1, group, &[]);
+                }
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(range, 0..1);
+            }
+        };
+
+        for (l, r) in frame.layers.iter().zip(&ranges) {
+            let a = l.index;
+            for (i, range) in r.canvases.iter().enumerate() {
+                let attachment = wgpu::RenderPassColorAttachment {
+                    view: &self.canvases.layers[3 * a + i],
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
-                })],
-                ..Default::default()
-            });
-            if !range.is_empty() {
-                pass.set_pipeline(&self.shape_pipeline);
-                pass.set_bind_group(0, &self.globals, &[]);
-                pass.set_vertex_buffer(0, self.vertices.buffer.slice(..));
-                pass.draw(range, 0..1);
+                };
+                let buffer = &self.canvas_vertices.buffer;
+                pass(
+                    attachment,
+                    &self.shape_pipeline,
+                    None,
+                    buffer,
+                    range.clone(),
+                );
             }
-        }
-
-        for (mask, clear) in [(&self.mask_now, true), (&self.mask_seen, false)] {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("mask"),
-                color_attachments: &[Some(mask.attachment(clear))],
-                ..Default::default()
-            });
-            if !fan.is_empty() {
-                pass.set_pipeline(&self.mask_pipeline);
-                pass.set_bind_group(0, &self.globals, &[]);
-                pass.set_vertex_buffer(0, self.fan.buffer.slice(..));
-                pass.draw(0..fan.len() as u32, 0..1);
+            let masks = &self.mask_vertices.buffer;
+            pass(
+                cleared(&self.voids.layers[a]),
+                &self.fill_pipeline,
+                None,
+                masks,
+                r.voids.clone(),
+            );
+            // Then clear it again under whatever stands on the layer.
+            let keep = wgpu::RenderPassColorAttachment {
+                view: &self.voids.layers[a],
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            };
+            pass(keep, &self.unmask_pipeline, None, masks, r.standing.clone());
+            if let Some(shaft) = &r.shaft {
+                pass(
+                    cleared(&self.shafts.layers[a]),
+                    &self.fill_pipeline,
+                    None,
+                    masks,
+                    shaft.clone(),
+                );
+            }
+            let now = self.now_msaa[a].attachment(&self.now.layers[a], true);
+            pass(now, &self.mask_pipeline, None, masks, r.visible.clone());
+            let seen = self.seen_msaa[a].attachment(&self.seen.layers[a], false);
+            match &r.shaft {
+                // Below the viewer: remembered as seen only where it shows
+                // through.
+                Some(_) => pass(
+                    seen,
+                    &self.mask_shaft_pipeline,
+                    Some(&self.shaft_bind_groups[a]),
+                    masks,
+                    r.visible.clone(),
+                ),
+                None => pass(seen, &self.mask_pipeline, None, masks, r.visible.clone()),
             }
         }
 

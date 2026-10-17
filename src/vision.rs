@@ -1,12 +1,12 @@
 //! Line of sight for one viewer: an exact visibility polygon (for rendering)
 //! plus point queries and tile exploration (for game logic). Both derive
-//! from [`Level::los`]/[`Level::raycast`], so what is drawn as visible and
+//! from [`Layer::los`]/[`Layer::raycast`], so what is drawn as visible and
 //! what the game treats as visible agree.
 
 use std::f32::consts::TAU;
 
 use crate::draw::inward_normal;
-use crate::level::{Level, Line, Shape, TILE};
+use crate::layer::{Layer, Line, Shape, TILE};
 
 /// Minimum angular offset of the extra rays cast to either side of each
 /// corner, sampling the boundary just before and just after it.
@@ -19,7 +19,7 @@ const ARC_SAMPLES: usize = 128;
 const MERGE_EPS: f32 = 1e-6;
 
 /// How far (pixels) the side casts at a corner pass it; well above the
-/// vertex tolerance in [`Level::raycast`].
+/// vertex tolerance in [`Layer::raycast`].
 const SIDE_OFFSET: f32 = 1e-3;
 
 /// Distances along one ray closer than this (pixels) are the same point.
@@ -138,18 +138,21 @@ pub struct Vision {
     /// (clockwise on screen, since y points down). Render as a triangle fan
     /// centered on `origin`.
     polygon: Vec<[f32; 2]>,
-    /// Solid within one tile of the visible stretches of wall, as convex
-    /// pieces.
+    /// Lit solid, as convex pieces: within one tile of the visible stretches
+    /// of wall, or for a layer seen from above, whole walls whose tops show.
     wall_band: Vec<Shape>,
     /// Per outline edge of the level: visible now, and ever seen.
     edge_visible: Vec<bool>,
     edge_seen: Vec<bool>,
     cols: usize,
     explored: Vec<bool>,
+    /// Where this layer shows through to the viewer's (see
+    /// [`crate::level::Level::shaft`]); everywhere when `None`.
+    shaft: Option<Vec<bool>>,
 }
 
 impl Vision {
-    pub fn new(level: &Level, radius: f32) -> Self {
+    pub fn new(level: &Layer, radius: f32) -> Self {
         Self {
             origin: [0.0; 2],
             radius,
@@ -159,6 +162,7 @@ impl Vision {
             edge_seen: vec![false; level.outline_edges().len()],
             cols: level.cols,
             explored: vec![false; level.cols * level.rows],
+            shaft: None,
         }
     }
 
@@ -192,17 +196,100 @@ impl Vision {
     }
 
     /// Recompute visibility from `origin` (a pixel-space point in open space).
-    pub fn update(&mut self, level: &Level, origin: [f32; 2]) {
-        self.origin = origin;
-        self.rebuild_polygon(level);
-        self.find_wall_band(level);
-        self.mark_explored(level);
+    pub fn update(&mut self, level: &Layer, origin: [f32; 2]) {
+        self.update_through(level, level, None, None, origin);
     }
 
-    /// Can the viewer currently see pixel-space point `p`?
-    pub fn can_see(&self, level: &Level, p: [f32; 2]) -> bool {
+    /// Recompute visibility of a layer `own` seen from above: through the
+    /// combined walls `sight` of every layer from it up to the viewer's,
+    /// and only within `shaft` (tiles where the layers above are void).
+    /// The polygon follows `sight`; faces, the wall band and exploration
+    /// belong to `own`.
+    ///
+    /// Seen from above, it's walls' tops that show, so with `above` (the
+    /// walls of just the layers above `own`, which is then also `sight`)
+    /// each wall tile whose top is in view lights up whole, instead of a
+    /// band behind visible faces.
+    pub fn update_through(
+        &mut self,
+        sight: &Layer,
+        own: &Layer,
+        shaft: Option<&[bool]>,
+        above: Option<&Layer>,
+        origin: [f32; 2],
+    ) {
+        self.origin = origin;
+        self.shaft = shaft.map(<[bool]>::to_vec);
+        self.rebuild_polygon(sight);
+        self.find_wall_band(own);
+        if let Some(above) = above {
+            self.find_wall_tops(own, above);
+        }
+        self.mark_explored(sight, own);
+    }
+
+    /// Light each of `own`'s wall tiles whose top is in view: in the shaft,
+    /// in range, and some point of it (center, or a corner pulled slightly
+    /// in) not hidden by `above`. Its faces count as seen, and the tile as
+    /// explored.
+    fn find_wall_tops(&mut self, own: &Layer, above: &Layer) {
+        let mut lit = vec![false; own.cols * own.rows];
+        self.wall_band.clear();
+        for y in 0..own.rows {
+            for x in 0..own.cols {
+                if !self.in_shaft([x as i32, y as i32]) {
+                    continue;
+                }
+                let Some(shape) = own.tile(x as i32, y as i32).shape(x, y) else {
+                    continue;
+                };
+                let n = shape.len() as f32;
+                let c = shape
+                    .iter()
+                    .fold([0.0; 2], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
+                let seen = std::iter::once(c)
+                    .chain(shape.iter().map(|p| {
+                        let d = distance(*p, c);
+                        [
+                            p[0] + (c[0] - p[0]) / d * 0.5,
+                            p[1] + (c[1] - p[1]) / d * 0.5,
+                        ]
+                    }))
+                    .any(|p| distance(p, self.origin) <= self.radius && above.los(self.origin, p));
+                if seen {
+                    lit[y * own.cols + x] = true;
+                    self.explored[y * self.cols + x] = true;
+                    self.wall_band.push(shape);
+                }
+            }
+        }
+        for (k, e) in own.outline_edges().iter().enumerate() {
+            if own.in_bounds(e.solid) && lit[e.solid[1] as usize * own.cols + e.solid[0] as usize] {
+                self.edge_visible[k] = true;
+                self.edge_seen[k] = true;
+            }
+        }
+    }
+
+    /// Does tile `t` show through to the viewer?
+    fn in_shaft(&self, t: [i32; 2]) -> bool {
+        let Some(shaft) = &self.shaft else {
+            return true;
+        };
+        let rows = (shaft.len() / self.cols) as i32;
+        t[0] >= 0
+            && t[1] >= 0
+            && t[0] < self.cols as i32
+            && t[1] < rows
+            && shaft[t[1] as usize * self.cols + t[0] as usize]
+    }
+
+    /// Can the viewer currently see pixel-space point `p`? `level` is what
+    /// blocks sight (the sight grid, for a layer seen from above).
+    pub fn can_see(&self, level: &Layer, p: [f32; 2]) -> bool {
         let d = [p[0] - self.origin[0], p[1] - self.origin[1]];
-        d[0].hypot(d[1]) <= self.radius && level.los(self.origin, p)
+        let tile = [(p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32];
+        d[0].hypot(d[1]) <= self.radius && self.in_shaft(tile) && level.los(self.origin, p)
     }
 
     /// Has any part of tile `(x, y)` ever been visible?
@@ -210,7 +297,7 @@ impl Vision {
         self.explored[y * self.cols + x]
     }
 
-    fn rebuild_polygon(&mut self, level: &Level) {
+    fn rebuild_polygon(&mut self, level: &Layer) {
         let origin = self.origin;
         let mut rays: Vec<Ray> = Vec::new();
         // Angular zones around each corner (center, half-width) in which a
@@ -396,7 +483,7 @@ impl Vision {
     /// stretch one tile into solid, add the wedge behind every inside corner
     /// a stretch reaches (where the two extensions part), and clip it all to
     /// the solid parts of the tiles it covers.
-    fn find_wall_band(&mut self, level: &Level) {
+    fn find_wall_band(&mut self, level: &Layer) {
         const ON: f32 = 1e-2;
         self.edge_visible.fill(false);
         self.wall_band.clear();
@@ -426,6 +513,10 @@ impl Vision {
                 let (tp, tq) = (along(p), along(q));
                 let (lo, hi) = (tp.min(tq).max(0.0), tp.max(tq).min(len));
                 if hi - lo <= 1e-6 {
+                    continue;
+                }
+                // Seen from above, only faces showing through count.
+                if !self.in_shaft(e.solid) && self.shaft.is_some() {
                     continue;
                 }
                 self.edge_visible[k] = true;
@@ -472,6 +563,9 @@ impl Vision {
             };
             for y in tiles(1, level.rows) {
                 for x in tiles(0, level.cols) {
+                    if !self.in_shaft([x as i32, y as i32]) {
+                        continue;
+                    }
                     let Some(solid) = level.tile(x as i32, y as i32).shape(x, y) else {
                         continue;
                     };
@@ -486,23 +580,23 @@ impl Vision {
     }
 
     /// A tile is explored once any of its sight samples (in its open part,
-    /// or on an exposed face) is seen.
-    fn mark_explored(&mut self, level: &Level) {
+    /// or on an exposed face) is seen, through `sight`.
+    fn mark_explored(&mut self, sight: &Layer, own: &Layer) {
         let reach = self.radius + TILE * std::f32::consts::SQRT_2;
-        for y in 0..level.rows {
-            for x in 0..level.cols {
+        for y in 0..own.rows {
+            for x in 0..own.cols {
                 let i = y * self.cols + x;
-                if self.explored[i] {
+                if self.explored[i] || !self.in_shaft([x as i32, y as i32]) {
                     continue;
                 }
                 let center = [(x as f32 + 0.5) * TILE, (y as f32 + 0.5) * TILE];
                 if distance(center, self.origin) > reach {
                     continue;
                 }
-                self.explored[i] = level
+                self.explored[i] = own
                     .sight_samples(x as i32, y as i32)
                     .into_iter()
-                    .any(|p| self.can_see(level, p));
+                    .any(|p| self.can_see(sight, p));
             }
         }
     }
@@ -516,11 +610,11 @@ mod tests {
     use crate::rng::Rng;
 
     trait OpenPoint {
-        fn open_point(&mut self, level: &Level) -> [f32; 2];
+        fn open_point(&mut self, level: &Layer) -> [f32; 2];
     }
 
     impl OpenPoint for Rng {
-        fn open_point(&mut self, level: &Level) -> [f32; 2] {
+        fn open_point(&mut self, level: &Layer) -> [f32; 2] {
             loop {
                 let p = [
                     self.unit() * level.cols as f32 * TILE,
@@ -540,19 +634,19 @@ mod tests {
 
     /// Generated levels, then tile soups full of slopes, each with a
     /// suggested origin (which may be solid in a soup).
-    fn levels() -> impl Iterator<Item = (Level, [f32; 2])> {
+    fn levels() -> impl Iterator<Item = (Layer, [f32; 2])> {
         let spawn = [165.0, 105.0];
         let generated = (0..40).flat_map(move |seed| {
             [Style::World, Style::Cave]
-                .map(|style| (Level::generate(style, seed, 32, 20, spawn), spawn))
+                .map(|style| (Layer::generate(style, seed, 32, 20, spawn), spawn))
         });
-        let soups = (0..SOUPS).map(move |seed| (Level::soup(seed, 32, 20), spawn));
+        let soups = (0..SOUPS).map(move |seed| (Layer::soup(seed, 32, 20), spawn));
         generated.chain(soups)
     }
 
     /// Clear of solid space in every direction (unlike a zero-size
     /// `collides` check, which never fires exactly on a grid vertex).
-    fn is_open_point(level: &Level, p: [f32; 2]) -> bool {
+    fn is_open_point(level: &Layer, p: [f32; 2]) -> bool {
         !level.collides([p[0] - 0.01, p[1] - 0.01], [0.02, 0.02])
     }
 
@@ -582,7 +676,7 @@ mod tests {
 
     #[test]
     fn los_blocked_by_wall_and_diagonal_pinch() {
-        let level = Level::from_ascii(&[
+        let level = Layer::from_ascii(&[
             "......", //
             "..#...", //
             "...#..", //
@@ -594,7 +688,7 @@ mod tests {
         // between (2,1) and (3,2).
         assert!(!level.los([15.0, 35.0], [45.0, 5.0]));
         // Grazing a single corner, (20, 20) of tile (1,1), is allowed.
-        let single = Level::from_ascii(&["....", ".#..", "....", "...."]);
+        let single = Layer::from_ascii(&["....", ".#..", "....", "...."]);
         assert!(single.los([5.0, 35.0], [35.0, 5.0]));
         // A point on an open face is visible.
         assert!(level.los([25.0, 5.0], [25.0, 10.0]));
@@ -626,7 +720,7 @@ mod tests {
 
     /// Visible, allowing a hair of rotation: points on a line that exactly
     /// grazes a corner are visible or not only up to rounding.
-    fn visible_ish(level: &Level, vision: &Vision, p: [f32; 2]) -> bool {
+    fn visible_ish(level: &Layer, vision: &Vision, p: [f32; 2]) -> bool {
         let o = vision.origin();
         let (a, d) = (angle(o, p), distance(o, p));
         // Several sizes: a slit between corners can be narrower than the
@@ -640,7 +734,7 @@ mod tests {
 
     /// Visible, and still visible a hair of rotation either way: points
     /// seen only within rounding of a grazing line needn't be in the polygon.
-    fn visible_with_margin(level: &Level, vision: &Vision, p: [f32; 2]) -> bool {
+    fn visible_with_margin(level: &Layer, vision: &Vision, p: [f32; 2]) -> bool {
         let o = vision.origin();
         let (a, d) = (angle(o, p), distance(o, p));
         vision.can_see(level, p)
@@ -649,7 +743,7 @@ mod tests {
                 .all(|a| vision.can_see(level, at(o, *a, d)))
     }
 
-    fn check_polygon(level: &Level, vision: &Vision, rng: &mut Rng) {
+    fn check_polygon(level: &Layer, vision: &Vision, rng: &mut Rng) {
         let origin = vision.origin();
         let poly = vision.polygon();
         let ctx = format!("origin {origin:?} radius {}", vision.radius());
@@ -707,7 +801,7 @@ mod tests {
 
     #[test]
     fn radius_limits_sight() {
-        let level = Level::from_ascii(&["..........", "..........", ".........."]);
+        let level = Layer::from_ascii(&["..........", "..........", ".........."]);
         let origin = [5.0, 15.0];
         let mut near = Vision::new(&level, 30.0);
         near.update(&level, origin);
@@ -744,7 +838,7 @@ mod tests {
     #[test]
     fn band_is_one_tile_behind_visible_faces() {
         // A 3x3 block; from straight left only its left face (30px) shows.
-        let level = Level::from_ascii(&[".....", ".###.", ".###.", ".###.", "....."]);
+        let level = Layer::from_ascii(&[".....", ".###.", ".###.", ".###.", "....."]);
         let mut v = Vision::new(&level, f32::INFINITY);
         v.update(&level, [5.0, 25.0]);
         assert!((band_area(&v) - 300.0).abs() < 1e-2, "{}", band_area(&v));
@@ -759,7 +853,7 @@ mod tests {
     #[test]
     fn band_fills_inside_corners() {
         // Walls along the top and left meet at an inside corner at (10,10).
-        let level = Level::from_ascii(&["#####", "#....", "#...."]);
+        let level = Layer::from_ascii(&["#####", "#....", "#...."]);
         let mut v = Vision::new(&level, f32::INFINITY);
         v.update(&level, [30.0, 20.0]);
         // Top face 40px + left face 20px, a tile deep, plus the corner tile.
@@ -769,16 +863,16 @@ mod tests {
 
     #[test]
     fn block_and_doorless_room_light_the_same() {
-        let block = Level::from_ascii(&[
+        let block = Layer::from_ascii(&[
             ".......", ".#####.", ".#####.", ".#####.", ".#####.", ".......",
         ]);
-        let room = Level::from_ascii(&[
+        let room = Layer::from_ascii(&[
             ".......", ".#####.", ".#...#.", ".#...#.", ".#####.", ".......",
         ]);
         // The room's inner corners add rays, so the band may be cut into
         // different pieces; compare what it covers.
         for origin in [[5.0, 5.0], [35.0, 55.0], [65.0, 30.0]] {
-            let view = |level: &Level| {
+            let view = |level: &Layer| {
                 let mut v = Vision::new(level, f32::INFINITY);
                 v.update(level, origin);
                 v
@@ -819,7 +913,7 @@ mod tests {
 
     #[test]
     fn slope_faces_light_their_triangle() {
-        let level = Level::from_ascii(&["....#....", "..◸.#.◿..", "....#...."]);
+        let level = Layer::from_ascii(&["....#....", "..◸.#.◿..", "....#...."]);
         let mut vision = Vision::new(&level, f32::INFINITY);
         vision.update(&level, [35.0, 25.0]);
         // Inside the first slope, just behind its face; the second slope is
@@ -832,7 +926,7 @@ mod tests {
     fn slopes_explored_by_face_side_or_open_half() {
         // Slopes at (2,1) and (6,1); a wall at column 4 hides the second
         // from a viewer on the left.
-        let level = Level::from_ascii(&[
+        let level = Layer::from_ascii(&[
             "....#....", //
             "..◸.#.◿..", //
             "....#....", //
@@ -858,7 +952,7 @@ mod tests {
     #[test]
     fn inner_faces_of_a_room_stay_unseen_from_outside() {
         // A doorless room with 1-tile walls, viewed from all around it.
-        let level = Level::from_ascii(&[
+        let level = Layer::from_ascii(&[
             ".......", //
             ".#####.", //
             ".#...#.", //
@@ -895,8 +989,38 @@ mod tests {
     }
 
     #[test]
+    fn wall_tops_seen_from_above_light_whole() {
+        // Below: a block, then a longer one behind it.
+        let below = Layer::from_ascii(&["......", ".#.##.", "......"]);
+        let look = |deck: &Layer| {
+            let mut v = Vision::new(&below, f32::INFINITY);
+            let sight = deck_sight(&below, deck);
+            let shaft = vec![true; 18];
+            v.update_through(&sight, &below, Some(&shaft), Some(deck), [5.0, 15.0]);
+            band_area(&v)
+        };
+        // Nothing above: all three wall tops, though the far block's faces
+        // are hidden behind the near one.
+        let open = Layer::from_ascii(&["~~~~~~", "~~~~~~", "~~~~~~"]);
+        assert!((look(&open) - 300.0).abs() < 1e-2, "{}", look(&open));
+        // A wall on the layer above, between the viewer and the far block,
+        // hides its top.
+        let walled = Layer::from_ascii(&["~~~~~~", "~~#~~~", "~~~~~~"]);
+        assert!((look(&walled) - 100.0).abs() < 1e-2, "{}", look(&walled));
+    }
+
+    /// The walls of both layers together, as a level would combine them.
+    fn deck_sight(below: &Layer, deck: &Layer) -> Layer {
+        let tiles = (0..below.rows as i32)
+            .flat_map(|y| (0..below.cols as i32).map(move |x| (x, y)))
+            .map(|(x, y)| below.tile(x, y).wall().union(deck.tile(x, y).wall()))
+            .collect();
+        Layer::from_tiles(below.cols, below.rows, tiles)
+    }
+
+    #[test]
     fn exploration_accumulates() {
-        let level = Level::from_ascii(&[
+        let level = Layer::from_ascii(&[
             "..........", //
             "....#.....", //
             "....#.....", //

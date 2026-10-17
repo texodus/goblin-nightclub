@@ -11,18 +11,29 @@ struct Params {
     radius: f32,
     // Game time in seconds.
     time: f32,
+    // The viewer's layer.
+    top: u32,
+    // Bit per layer: drawn this frame.
+    present: u32,
+    // Scale of each layer relative to the one above (parallax).
+    scale: f32,
+    _pad: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var visible_layer: texture_2d<f32>;
-@group(0) @binding(2) var remembered_layer: texture_2d<f32>;
-@group(0) @binding(3) var unknown_layer: texture_2d<f32>;
-@group(0) @binding(4) var mask_now: texture_2d<f32>;
-@group(0) @binding(5) var mask_seen: texture_2d<f32>;
+// Per layer `a`: visible, remembered and unknown at 3a, 3a + 1, 3a + 2.
+@group(0) @binding(1) var canvases: texture_2d_array<f32>;
+@group(0) @binding(2) var mask_now: texture_2d_array<f32>;
+@group(0) @binding(3) var mask_seen: texture_2d_array<f32>;
+// Where each layer is void, showing the one below.
+@group(0) @binding(4) var voids: texture_2d_array<f32>;
 
 // Width (pixels) of the band inside the radius where the visible style
 // fades into the remembered one.
 const RADIUS_FADE: f32 = 12.0;
+
+// Brightness of each layer relative to the one above it.
+const LOWER_BRIGHTNESS: f32 = 0.55;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
@@ -65,19 +76,43 @@ fn style_unknown(c: vec3<f32>) -> vec3<f32> {
     return c;
 }
 
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    let px = vec2<i32>(frag.xy);
-    let dist = distance(frag.xy, params.origin);
-
-    var now = textureLoad(mask_now, px, 0).r;
-    let seen = textureLoad(mask_seen, px, 0).r;
+// Layer `a` at world pixel `px`, styled by its masks.
+fn shade(a: u32, px: vec2<i32>, screen_px: vec2<u32>) -> vec3<f32> {
+    let dist = distance(vec2<f32>(px) + 0.5, params.origin);
+    var now = textureLoad(mask_now, px, a, 0).r;
+    let seen = textureLoad(mask_seen, px, a, 0).r;
     if params.radius > 0.0 {
         now *= 1.0 - smoothstep(params.radius - RADIUS_FADE, params.radius, dist);
     }
+    let visible = style_visible(textureLoad(canvases, px, 3u * a, 0).rgb, dist);
+    let remembered = style_remembered(textureLoad(canvases, px, 3u * a + 1u, 0).rgb, screen_px);
+    let unknown = style_unknown(textureLoad(canvases, px, 3u * a + 2u, 0).rgb);
+    return mix(mix(unknown, remembered, seen), visible, now);
+}
 
-    let visible = style_visible(textureLoad(visible_layer, px, 0).rgb, dist);
-    let remembered = style_remembered(textureLoad(remembered_layer, px, 0).rgb, vec2<u32>(px));
-    let unknown = style_unknown(textureLoad(unknown_layer, px, 0).rgb);
-    return vec4(mix(mix(unknown, remembered, seen), visible, now), 1.0);
+@fragment
+fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = vec2<f32>(textureDimensions(voids));
+    let center = size / 2.0;
+    // Down from the viewer's layer through void, each layer drawn a little
+    // smaller about the screen center.
+    var scale = 1.0;
+    for (var d = 0u; d <= params.top; d++) {
+        let a = params.top - d;
+        if ((params.present >> a) & 1u) == 0u {
+            break;
+        }
+        let w = center + (frag.xy - center) / scale;
+        if any(w < vec2(0.0)) || any(w >= size) {
+            break;
+        }
+        let px = vec2<i32>(w);
+        if textureLoad(voids, px, a, 0).r > 0.5 {
+            scale *= params.scale;
+            continue;
+        }
+        let dim = pow(LOWER_BRIGHTNESS, f32(d));
+        return vec4(shade(a, px, vec2<u32>(frag.xy)) * dim, 1.0);
+    }
+    return vec4(0.0, 0.0, 0.0, 1.0);
 }

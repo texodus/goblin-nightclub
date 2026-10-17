@@ -11,6 +11,7 @@ pub mod entity;
 pub mod frame;
 pub mod game;
 pub mod generate;
+pub mod layer;
 pub mod level;
 pub mod memory;
 pub mod palette;

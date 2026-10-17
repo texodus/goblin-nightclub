@@ -32,3 +32,21 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_mask() -> @location(0) vec4<f32> {
     return vec4(1.0);
 }
+
+// Clears a mask: where something stands on a layer, it isn't void.
+@fragment
+fn fs_unmask() -> @location(0) vec4<f32> {
+    return vec4(0.0);
+}
+
+// Like `fs_mask`, but only where `shaft` is set: a layer below the viewer's
+// may only be remembered as seen where it shows through.
+@group(1) @binding(0) var shaft: texture_2d<f32>;
+
+@fragment
+fn fs_mask_shaft(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    if textureLoad(shaft, vec2<i32>(frag.xy), 0).r < 0.5 {
+        discard;
+    }
+    return vec4(1.0);
+}
