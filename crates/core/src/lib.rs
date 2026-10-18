@@ -17,6 +17,7 @@ pub mod layer;
 pub mod level;
 pub mod level_file;
 pub mod memory;
+pub mod mesh;
 pub mod palette;
 pub mod path;
 pub mod rng;
@@ -28,3 +29,10 @@ pub mod vision;
 /// resolution) is a whole number of times this, more or less.
 pub const WIDTH: u32 = 320;
 pub const HEIGHT: u32 = 200;
+
+/// The length of `v`. Not `f32::hypot`, which guards against overflow no
+/// level comes near, and which compiles to a slow software routine in
+/// wasm: sight calls this a great deal every frame.
+pub fn length(v: [f32; 2]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1]).sqrt()
+}

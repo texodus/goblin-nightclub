@@ -5,6 +5,7 @@
 //! when the layer is built. Void and stairs tiles are open, like floor;
 //! what they mean between layers is up to [`crate::level`].
 
+use crate::camera::Rect;
 use crate::draw::{Canvas, faces_light, inset_corner, inward_normal};
 use crate::palette;
 #[cfg(any(test, feature = "test-util"))]
@@ -626,6 +627,101 @@ pub struct Layer {
     edges_by_line: std::collections::HashMap<Line, Vec<usize>>,
     outlines: Vec<Outline>,
     concave: Vec<ConcaveCorner>,
+    /// `corners`, `edges` and `concave` by where they are, so sight can
+    /// look at just those within its radius.
+    corner_buckets: Buckets,
+    edge_buckets: Buckets,
+    concave_buckets: Buckets,
+}
+
+/// Edge of the square blocks [`Buckets`] sorts things into, in world units.
+const BUCKET: f32 = 8.0 * TILE;
+
+/// Indices of things in a level (corners, edges), by which square blocks
+/// of the level their bounding boxes overlap.
+#[derive(Default)]
+struct Buckets {
+    /// Things in all.
+    len: usize,
+    /// Blocks across and down.
+    blocks: [usize; 2],
+    /// Where each block's indices start in `items`, row by row, then the
+    /// end.
+    starts: Vec<u32>,
+    items: Vec<u32>,
+}
+
+impl Buckets {
+    /// Sort things into the blocks of a level `cols` x `rows` tiles, by
+    /// their bounding boxes.
+    fn new(cols: usize, rows: usize, boxes: &[Rect]) -> Self {
+        let blocks = [cols, rows].map(|n| ((n as f32 * TILE / BUCKET).ceil() as usize).max(1));
+        let mut buckets = Self {
+            len: boxes.len(),
+            blocks,
+            starts: vec![0; blocks[0] * blocks[1] + 1],
+            items: Vec::new(),
+        };
+        // Count each block's things, then place them.
+        for &b in boxes {
+            for k in buckets.blocks_over(b, 0.0) {
+                buckets.starts[k + 1] += 1;
+            }
+        }
+        for k in 1..buckets.starts.len() {
+            buckets.starts[k] += buckets.starts[k - 1];
+        }
+        let mut next = buckets.starts.clone();
+        buckets.items = vec![0; *buckets.starts.last().unwrap() as usize];
+        for (i, &b) in boxes.iter().enumerate() {
+            for k in buckets.blocks_over(b, 0.0) {
+                buckets.items[next[k] as usize] = i as u32;
+                next[k] += 1;
+            }
+        }
+        buckets
+    }
+
+    /// Indices of the blocks that `rect`, grown by `margin`, overlaps.
+    fn blocks_over(&self, rect: Rect, margin: f32) -> impl Iterator<Item = usize> + use<> {
+        let span = |axis: usize| {
+            let block =
+                |v: f32| ((v / BUCKET).floor().max(0.0) as usize).min(self.blocks[axis] - 1);
+            block(rect[0][axis] - margin)..=block(rect[1][axis] + margin)
+        };
+        let (xs, ys) = (span(0), span(1));
+        let across = self.blocks[0];
+        ys.flat_map(move |y| xs.clone().map(move |x| y * across + x))
+    }
+
+    /// Indices of the things that may come within `radius` of `p` (all of
+    /// them for an infinite radius), in increasing order, each once.
+    fn near(&self, p: [f32; 2], radius: f32) -> Vec<usize> {
+        if !radius.is_finite() {
+            return (0..self.len).collect();
+        }
+        let mut found: Vec<usize> = self
+            .blocks_over([p, p], radius)
+            .flat_map(|k| &self.items[self.starts[k] as usize..self.starts[k + 1] as usize])
+            .map(|&i| i as usize)
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+}
+
+/// The bounding box of some points.
+fn bounds(points: &[[f32; 2]]) -> Rect {
+    points.iter().fold(
+        [[f32::INFINITY; 2], [f32::NEG_INFINITY; 2]],
+        |[lo, hi], p| {
+            [
+                [lo[0].min(p[0]), lo[1].min(p[1])],
+                [hi[0].max(p[0]), hi[1].max(p[1])],
+            ]
+        },
+    )
 }
 
 impl Layer {
@@ -643,6 +739,9 @@ impl Layer {
             edges_by_line: Default::default(),
             outlines: Vec::new(),
             concave: Vec::new(),
+            corner_buckets: Buckets::default(),
+            edge_buckets: Buckets::default(),
+            concave_buckets: Buckets::default(),
         };
         level.corners = level.find_corners();
         level.edges = level.find_edges();
@@ -653,6 +752,15 @@ impl Layer {
         }
         level.outlines = level.find_outlines();
         level.concave = level.find_concave_corners();
+        let boxes = |points: &mut dyn Iterator<Item = Vec<[f32; 2]>>| -> Vec<Rect> {
+            points.map(|p| bounds(&p)).collect()
+        };
+        let corners = boxes(&mut level.corners.iter().map(|c| vec![*c]));
+        let edges = boxes(&mut level.edges.iter().map(|e| vec![e.a, e.b]));
+        let concave = boxes(&mut level.concave.iter().map(|c| vec![c.at]));
+        level.corner_buckets = Buckets::new(cols, rows, &corners);
+        level.edge_buckets = Buckets::new(cols, rows, &edges);
+        level.concave_buckets = Buckets::new(cols, rows, &concave);
         level
     }
 
@@ -962,7 +1070,7 @@ impl Layer {
     /// and a point lying on a solid tile's face counts as visible.
     pub fn los(&self, a: [f32; 2], b: [f32; 2]) -> bool {
         let d = [b[0] - a[0], b[1] - a[1]];
-        let len = d[0].hypot(d[1]);
+        let len = crate::length(d);
         if len < 1e-6 {
             return true;
         }
@@ -1095,6 +1203,24 @@ impl Layer {
     /// The outline of solid space as closed loops, straight runs merged.
     pub fn outlines(&self) -> &[Outline] {
         &self.outlines
+    }
+
+    /// Indices into [`Layer::outline_edges`] of every edge reaching
+    /// within `radius` of `p`, and maybe a few more, in order.
+    pub fn edges_near(&self, p: [f32; 2], radius: f32) -> Vec<usize> {
+        self.edge_buckets.near(p, radius)
+    }
+
+    /// Indices into [`Layer::corners`] of every corner within `radius` of
+    /// `p`, and maybe a few more, in order.
+    pub fn corners_near(&self, p: [f32; 2], radius: f32) -> Vec<usize> {
+        self.corner_buckets.near(p, radius)
+    }
+
+    /// Indices into [`Layer::concave_corners`] of every one within
+    /// `radius` of `p`, and maybe a few more, in order.
+    pub fn concave_near(&self, p: [f32; 2], radius: f32) -> Vec<usize> {
+        self.concave_buckets.near(p, radius)
     }
 
     /// Indices of the outline edges lying on `line`.
@@ -1241,7 +1367,7 @@ impl Layer {
             out.push(center);
             out.extend(open.iter().map(|p| {
                 let d = [center[0] - p[0], center[1] - p[1]];
-                let len = d[0].hypot(d[1]);
+                let len = crate::length(d);
                 [p[0] + d[0] / len * INSET, p[1] + d[1] / len * INSET]
             }));
         }
@@ -1286,7 +1412,7 @@ impl Layer {
     /// substeps short enough not to skip through a wall, pushing the box
     /// back out of solid space after each.
     pub fn move_box(&self, mut pos: [f32; 2], size: [f32; 2], delta: [f32; 2]) -> [f32; 2] {
-        let steps = (delta[0].hypot(delta[1]) / MAX_STEP).ceil().max(1.0);
+        let steps = (crate::length(delta) / MAX_STEP).ceil().max(1.0);
         let step = [delta[0] / steps, delta[1] / steps];
         for _ in 0..steps as usize {
             let next = self.push_out([pos[0] + step[0], pos[1] + step[1]], size);
@@ -1386,69 +1512,93 @@ impl Layer {
         best.or(fallback)
     }
 
-    /// Draw each tile's art from `tileset` (each part's floor, wall or
-    /// liquid, nothing where void, stairs over the whole tile), and a bevel
-    /// `width` wide along the outline edges `bevel(edge index)` picks: the
-    /// wall's light color on faces facing up or left, its dark color on
-    /// faces facing down or right. Strips along each loop are mitered at
-    /// its corners so they meet exactly.
-    pub fn draw(
+    /// Draw the art of tile `(x, y)` from `tileset`: each part's floor,
+    /// wall or liquid (translucent), nothing where void, stairs over the
+    /// whole tile.
+    pub fn draw_tile(&self, tileset: &Tileset, canvas: &mut Canvas, x: usize, y: usize) {
+        let tile = self.tiles[y * self.cols + x];
+        let origin = [x as f32 * TILE, y as f32 * TILE];
+        let mut part = |shape: Option<Shape>, part: Part| {
+            let (cell, color) = match part {
+                Part::Floor(f) => (
+                    tileset::variant(&tileset.floors[f as usize].cells, x, y),
+                    palette::WHITE,
+                ),
+                Part::Wall(w) => (
+                    tileset::variant(&tileset.walls[w as usize].cells, x, y),
+                    palette::WHITE,
+                ),
+                // Translucent, so what's beneath shows through.
+                Part::Liquid(l) => {
+                    let liquid = &tileset.liquids[l as usize];
+                    (
+                        tileset::variant(&liquid.cells, x, y),
+                        [1.0, 1.0, 1.0, liquid.alpha],
+                    )
+                }
+                Part::Void => return,
+            };
+            if let Some(shape) = shape {
+                canvas.textured(&shape, origin, cell, color);
+            }
+        };
+        if let Some(dir) = tile.stairs() {
+            let cell = match dir {
+                Dir::Up => tileset.stairs[0],
+                Dir::Down => tileset.stairs[1],
+            };
+            canvas.textured(
+                &Solid::Full.shape(x, y).unwrap(),
+                origin,
+                cell,
+                palette::WHITE,
+            );
+            return;
+        }
+        match tile.halves() {
+            Halves::Whole(p) => part(Solid::Full.shape(x, y), p),
+            Halves::Split(c, at, rest) => {
+                part(Solid::Slope(c).shape(x, y), at);
+                part(Solid::Slope(c.opposite()).shape(x, y), rest);
+            }
+        }
+    }
+
+    /// Draw every tile's art (see [`Layer::draw_tile`]).
+    pub fn draw_tiles(&self, tileset: &Tileset, canvas: &mut Canvas) {
+        for y in 0..self.rows {
+            for x in 0..self.cols {
+                self.draw_tile(tileset, canvas, x, y);
+            }
+        }
+    }
+
+    /// Draw a bevel `width` wide along the outline edges `bevel(edge
+    /// index)` picks that reach into `within`: the wall's light color on
+    /// faces facing up or left, its dark color on faces facing down or
+    /// right. Strips along each loop are mitered at its corners so they
+    /// meet exactly.
+    pub fn draw_bevels(
         &self,
         tileset: &Tileset,
         canvas: &mut Canvas,
         bevel: impl Fn(usize) -> bool,
         width: f32,
+        within: Rect,
     ) {
-        for (i, tile) in self.tiles.iter().enumerate() {
-            let (x, y) = (i % self.cols, i / self.cols);
-            let origin = [x as f32 * TILE, y as f32 * TILE];
-            let mut part = |shape: Option<Shape>, part: Part| {
-                let (cell, color) = match part {
-                    Part::Floor(f) => (
-                        tileset::variant(&tileset.floors[f as usize].cells, x, y),
-                        palette::WHITE,
-                    ),
-                    Part::Wall(w) => (
-                        tileset::variant(&tileset.walls[w as usize].cells, x, y),
-                        palette::WHITE,
-                    ),
-                    // Translucent, so what's beneath shows through.
-                    Part::Liquid(l) => {
-                        let liquid = &tileset.liquids[l as usize];
-                        (
-                            tileset::variant(&liquid.cells, x, y),
-                            [1.0, 1.0, 1.0, liquid.alpha],
-                        )
-                    }
-                    Part::Void => return,
-                };
-                if let Some(shape) = shape {
-                    canvas.textured(&shape, origin, cell, color);
-                }
+        let [lo, hi] = within;
+        let drawn = |i: usize| {
+            let e = &self.edges[i];
+            let reaches = |axis: usize| {
+                e.a[axis].max(e.b[axis]) + width >= lo[axis]
+                    && e.a[axis].min(e.b[axis]) - width <= hi[axis]
             };
-            if let Some(dir) = tile.stairs() {
-                let cell = match dir {
-                    Dir::Up => tileset.stairs[0],
-                    Dir::Down => tileset.stairs[1],
-                };
-                canvas.textured(
-                    &Solid::Full.shape(x, y).unwrap(),
-                    origin,
-                    cell,
-                    palette::WHITE,
-                );
+            reaches(0) && reaches(1) && self.in_bounds(e.solid) && bevel(i)
+        };
+        for o in &self.outlines {
+            if !o.runs.iter().flatten().any(|&i| drawn(i)) {
                 continue;
             }
-            match tile.halves() {
-                Halves::Whole(p) => part(Solid::Full.shape(x, y), p),
-                Halves::Split(c, at, rest) => {
-                    part(Solid::Slope(c).shape(x, y), at);
-                    part(Solid::Slope(c.opposite()).shape(x, y), rest);
-                }
-            }
-        }
-
-        for o in &self.outlines {
             let n = o.points.len();
             let normals: Vec<[f32; 2]> = (0..n)
                 .map(|k| inward_normal(o.points[k], o.points[(k + 1) % n]))
@@ -1471,7 +1621,7 @@ impl Layer {
                 };
                 for &i in run {
                     let e = self.edges[i];
-                    if bevel(i) && self.in_bounds(e.solid) {
+                    if drawn(i) {
                         let wall = self.tile(e.solid[0], e.solid[1]).wall_id().unwrap_or(0);
                         let wall = &tileset.walls[wall as usize];
                         let color = if lit { wall.light } else { wall.dark };
@@ -1514,7 +1664,7 @@ fn smallest_move(constraints: &[([f32; 2], f32)]) -> Option<[f32; 2]> {
     candidates
         .into_iter()
         .filter(|m| ok(*m))
-        .min_by(|x, y| x[0].hypot(x[1]).total_cmp(&y[0].hypot(y[1])))
+        .min_by(|x, y| crate::length(*x).total_cmp(&crate::length(*y)))
 }
 
 /// Invariant checks for tests, here and in other crates.
@@ -1937,21 +2087,74 @@ mod tests {
         }
     }
 
-    /// Area of everything drawn after the floor, grid and tile fills: the
-    /// bevel strips.
+    /// Area of the bevel strips drawn.
     fn bevel_area(level: &Layer, bevel: impl Fn(usize) -> bool) -> f32 {
         let tileset = tileset::testing::tileset();
-        let mut base = Canvas::new(&tileset);
-        level.draw(&tileset, &mut base, |_| false, 1.0);
         let mut canvas = Canvas::new(&tileset);
-        level.draw(&tileset, &mut canvas, bevel, 1.0);
-        canvas.vertices[base.vertices.len()..]
+        level.draw_bevels(&tileset, &mut canvas, bevel, 1.0, crate::camera::EVERYWHERE);
+        canvas
+            .vertices
             .chunks(3)
             .map(|t| {
                 let [a, b, c] = [t[0].pos, t[1].pos, t[2].pos];
                 ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0
             })
             .sum()
+    }
+
+    #[test]
+    fn bevels_out_of_view_are_left_out() {
+        // Blocks at the left and right ends.
+        let level = Layer::from_ascii(&["........", ".#....#.", "........"]);
+        let tileset = tileset::testing::tileset();
+        let area = |within: Rect| {
+            let mut canvas = Canvas::new(&tileset);
+            level.draw_bevels(&tileset, &mut canvas, |_| true, 1.0, within);
+            canvas.vertices.len()
+        };
+        let all = area(crate::camera::EVERYWHERE);
+        let left = area([[0.0, 0.0], [30.0, 30.0]]);
+        assert!(left > 0 && 2 * left == all, "{left} of {all}");
+        assert_eq!(area([[25.0, 0.0], [55.0, 30.0]]), 0, "between them");
+    }
+
+    #[test]
+    fn near_finds_everything_within_reach() {
+        let mut rng = Rng::new(5);
+        for seed in 0..10 {
+            let level = Layer::soup(seed, 60, 40);
+            for _ in 0..10 {
+                let p = [rng.unit() * 600.0, rng.unit() * 400.0];
+                let radius = rng.unit() * 200.0;
+                let dist = |q: [f32; 2]| crate::length([q[0] - p[0], q[1] - p[1]]);
+                let near = level.corners_near(p, radius);
+                assert!(near.windows(2).all(|w| w[0] < w[1]), "in order, once each");
+                for (i, c) in level.corners().iter().enumerate() {
+                    if dist(*c) <= radius {
+                        assert!(near.contains(&i), "corner {c:?} near {p:?}");
+                    }
+                }
+                let near = level.edges_near(p, radius);
+                for (i, e) in level.outline_edges().iter().enumerate() {
+                    // Its nearest point to `p`.
+                    let d = [e.b[0] - e.a[0], e.b[1] - e.a[1]];
+                    let t = (((p[0] - e.a[0]) * d[0] + (p[1] - e.a[1]) * d[1])
+                        / (d[0] * d[0] + d[1] * d[1]))
+                        .clamp(0.0, 1.0);
+                    if dist([e.a[0] + t * d[0], e.a[1] + t * d[1]]) <= radius {
+                        assert!(near.contains(&i), "edge {i} near {p:?}");
+                    }
+                }
+                let near = level.concave_near(p, radius);
+                for (i, c) in level.concave_corners().iter().enumerate() {
+                    if dist(c.at) <= radius {
+                        assert!(near.contains(&i));
+                    }
+                }
+            }
+            let all = level.corners_near([0.0; 2], f32::INFINITY);
+            assert_eq!(all.len(), level.corners().len());
+        }
     }
 
     #[test]

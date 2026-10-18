@@ -187,7 +187,7 @@ pub fn clear(
     b: [f32; 2],
     size: [f32; 2],
 ) -> bool {
-    let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+    let len = crate::length([b[0] - a[0], b[1] - a[1]]);
     let n = len.ceil().max(1.0) as usize;
     (0..=n).all(|i| {
         let t = i as f32 / n as f32;
@@ -205,7 +205,7 @@ pub fn approach(
     to: [f32; 2],
     size: [f32; 2],
 ) -> Option<[f32; 2]> {
-    let len = (to[0] - from[0]).hypot(to[1] - from[1]);
+    let len = crate::length([to[0] - from[0], to[1] - from[1]]);
     let n = len.floor() as usize;
     (1..=n).rev().find_map(|i| {
         let t = i as f32 / len;

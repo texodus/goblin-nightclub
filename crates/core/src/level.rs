@@ -17,7 +17,11 @@
 //! All of these are ordinary [`Layer`]s, so rays, collision, outlines and
 //! visibility work on them unchanged.
 
+use std::sync::{Arc, OnceLock};
+
+use crate::draw::Canvas;
 use crate::layer::{Layer, Solid, Tile};
+use crate::mesh::Mesh;
 use crate::path;
 use crate::tileset::Tileset;
 
@@ -66,6 +70,22 @@ pub struct Level {
     /// `shafts[top][k][tile]`: whether any of the tile is open from layer
     /// `k` up to `top`.
     shafts: Vec<Vec<Vec<bool>>>,
+    /// `visible[top]`; see [`Level::visible_layers`].
+    visible: Vec<Vec<usize>>,
+    /// Per layer, made when first asked for; see [`Level::meshes`].
+    meshes: Vec<OnceLock<LayerMeshes>>,
+    /// `shaft_meshes[top][k]`, made when first asked for.
+    shaft_meshes: Vec<Vec<OnceLock<Arc<Mesh>>>>,
+}
+
+/// What's drawn of a layer that only changes with its tiles.
+pub struct LayerMeshes {
+    /// Its tiles' art.
+    pub tiles: Arc<Mesh>,
+    /// Where it's void, liquid included.
+    pub voids: Arc<Mesh>,
+    /// Where it's liquid.
+    pub liquid: Arc<Mesh>,
 }
 
 impl Level {
@@ -137,12 +157,26 @@ impl Level {
                     .collect()
             })
             .collect();
+        let visible = (0..layers.len())
+            .map(|top| {
+                (0..=top)
+                    .rev()
+                    .filter(|&k| shafts[top][k].iter().any(|s| *s))
+                    .collect()
+            })
+            .collect();
+        let depth = layers.len();
         Self {
             layers,
             tileset,
             movement,
             views,
             shafts,
+            visible,
+            meshes: (0..depth).map(|_| OnceLock::new()).collect(),
+            shaft_meshes: (0..depth)
+                .map(|top| (0..=top).map(|_| OnceLock::new()).collect())
+                .collect(),
         }
     }
 
@@ -187,11 +221,45 @@ impl Level {
 
     /// The layers seen from `top`: itself, and each below it showing
     /// through any shaft, top first.
-    pub fn visible_layers(&self, top: usize) -> Vec<usize> {
-        (0..=top)
-            .rev()
-            .filter(|&k| self.shafts[top][k].iter().any(|s| *s))
-            .collect()
+    pub fn visible_layers(&self, top: usize) -> &[usize] {
+        &self.visible[top]
+    }
+
+    /// Layer `k`'s tile art, voids and liquid, as meshes.
+    pub fn meshes(&self, k: usize) -> &LayerMeshes {
+        self.meshes[k].get_or_init(|| {
+            let (layer, tileset) = (&self.layers[k], &self.tileset);
+            let (cols, rows) = (self.cols(), self.rows());
+            let canvas = || Canvas::new(tileset);
+            let tile = |x: usize, y: usize| layer.tile(x as i32, y as i32);
+            LayerMeshes {
+                tiles: Arc::new(Mesh::build(cols, rows, canvas(), |xs, ys, canvas| {
+                    for y in ys {
+                        for x in xs.clone() {
+                            layer.draw_tile(tileset, canvas, x, y);
+                        }
+                    }
+                })),
+                voids: Arc::new(Mesh::quarters(cols, rows, canvas(), |x, y| {
+                    tile(x, y).void_quarters()
+                })),
+                liquid: Arc::new(Mesh::quarters(cols, rows, canvas(), |x, y| {
+                    tile(x, y).liquid_quarters()
+                })),
+            }
+        })
+    }
+
+    /// Where layer `k` shows through to layer `top` (see
+    /// [`Level::shaft`]), as a mesh of whole tiles.
+    pub fn shaft_mesh(&self, top: usize, k: usize) -> &Arc<Mesh> {
+        self.shaft_meshes[top][k].get_or_init(|| {
+            let (cols, shaft) = (self.cols(), &self.shafts[top][k]);
+            let canvas = Canvas::new(&self.tileset);
+            Arc::new(Mesh::quarters(cols, self.rows(), canvas, |x, y| {
+                if shaft[y * cols + x] { 0b1111 } else { 0 }
+            }))
+        })
     }
 }
 
@@ -382,7 +450,7 @@ mod tests {
                     // translucent.
                     let alone = Layer::from_tiles(1, 1, vec![tile]);
                     let mut canvas = Canvas::new(&tileset);
-                    alone.draw(&tileset, &mut canvas, |_| false, 1.0);
+                    alone.draw_tiles(&tileset, &mut canvas);
                     let halves = [at, rest].iter().filter(|p| **p != Part::Void).count();
                     assert_eq!(canvas.vertices.len(), 3 * halves, "{why}: drawn");
                     let translucent = canvas.vertices.iter().filter(|v| v.color[3] < 1.0).count();
@@ -397,6 +465,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn meshes_are_made_once_and_match_the_tiles() {
+        let l = level(&[&["....", "...."], &["~~..", "~≈.."]]);
+        let tileset = l.tileset().clone();
+        let area = |m: &Mesh| -> f32 {
+            m.vertices
+                .chunks(3)
+                .map(|t| {
+                    let [a, b, c] = [t[0].pos, t[1].pos, t[2].pos];
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0
+                })
+                .sum()
+        };
+        let top = l.meshes(1);
+        assert_eq!(top.tiles.id(), l.meshes(1).tiles.id(), "kept");
+        let mut canvas = Canvas::new(&tileset);
+        l.layer(1).draw_tiles(&tileset, &mut canvas);
+        assert_eq!(top.tiles.vertices.len(), canvas.vertices.len());
+        // Four void tiles, one of them liquid; layer 0 shows through all
+        // four.
+        assert!((area(&top.voids) - 400.0).abs() < 1e-3);
+        assert!((area(&top.liquid) - 100.0).abs() < 1e-3);
+        assert!((area(l.shaft_mesh(1, 0)) - 400.0).abs() < 1e-3);
+        assert!(Arc::ptr_eq(l.shaft_mesh(1, 0), l.shaft_mesh(1, 0)));
     }
 
     #[test]

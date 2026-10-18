@@ -2,6 +2,7 @@
 //! Shared by the game and the editor.
 
 use crate::input::Input;
+use crate::layer::TILE;
 
 /// Each wheel notch zooms by this factor.
 pub const ZOOM_STEP: f32 = 1.01;
@@ -11,6 +12,51 @@ pub const ZOOM_MAX: f32 = 3.0;
 
 /// Panning speed, in screen pixels a second.
 pub const PAN_SPEED: f32 = 600.0;
+
+/// Scale of each layer relative to the one above it, at the default
+/// zoom. See [`parallax`] for other zooms.
+pub const PARALLAX: f32 = 0.925;
+
+/// How much the parallax is normalized against zooming out, 0 to 1. At 1
+/// its strength shrinks in step with the zoom, so a layer's shift at the
+/// edge of the view stays what it is at the default zoom. At 0 the
+/// strength is [`PARALLAX`] at every zoom, so the shift at the edge grows
+/// as the view widens. Zooming in never changes it.
+pub const PARALLAX_NORMALIZATION: f32 = 1.0;
+
+/// The scale of each layer relative to the one above it at `zoom` screen
+/// pixels a world unit, where `default_zoom` is the zoom the art is drawn
+/// at its own size (see [`crate::tileset::Tileset::zoom`] and the
+/// interface scale).
+pub fn parallax(zoom: f32, default_zoom: f32) -> f32 {
+    let normalized = (zoom / default_zoom).min(1.0);
+    let strength = 1.0 - PARALLAX_NORMALIZATION.clamp(0.0, 1.0) * (1.0 - normalized);
+    1.0 - (1.0 - PARALLAX) * strength
+}
+
+/// An axis-aligned rectangle in world units: top-left, bottom-right.
+pub type Rect = [[f32; 2]; 2];
+
+/// A rectangle covering any level.
+pub const EVERYWHERE: Rect = [[f32::NEG_INFINITY; 2], [f32::INFINITY; 2]];
+
+/// The part of a layer in a view `view` screen pixels in size, its
+/// top-left at world point `camera`, at `zoom` screen pixels a world unit,
+/// when the layer is drawn `scale` times its size about the view's center
+/// (parallax, for a layer below the viewer's). Padded by a tile, so
+/// rounding the camera to a pixel never uncovers anything.
+pub fn layer_view(camera: [f32; 2], view: [f32; 2], zoom: f32, scale: f32) -> Rect {
+    // A layer's world point `w` lands on view pixel
+    // `c + ((w - camera) * zoom - c) * scale`, `c` the view's center.
+    let edge = |px: f32, axis: usize| {
+        let c = view[axis] / 2.0;
+        camera[axis] + (c + (px - c) / scale) / zoom
+    };
+    [
+        [edge(0.0, 0) - TILE, edge(0.0, 1) - TILE],
+        [edge(view[0], 0) + TILE, edge(view[1], 1) + TILE],
+    ]
+}
 
 pub struct Camera {
     /// Top-left of the view, in world units.

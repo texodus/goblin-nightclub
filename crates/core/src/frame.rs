@@ -1,15 +1,22 @@
 //! Everything the renderer needs for one frame. Built by the game, so it
 //! contains no GPU types.
 
+use std::sync::Arc;
+
+use crate::camera::{self, Rect};
 use crate::draw::Canvas;
+use crate::layer::TILE;
+use crate::mesh::Mesh;
 
 /// One layer of the level as seen this frame.
 pub struct LayerFrame {
     /// Which layer (0 is the bottom).
     pub index: usize,
-    /// Drawn where the viewer can currently see.
+    /// The layer's tiles, drawn under both `visible` and `remembered`.
+    pub tiles: Arc<Mesh>,
+    /// Drawn over `tiles` where the viewer can currently see.
     pub visible: Canvas,
-    /// Drawn where the viewer has seen before but can't now.
+    /// Drawn over `tiles` where the viewer has seen before but can't now.
     pub remembered: Canvas,
     /// Drawn where the viewer has never seen.
     pub unknown: Canvas,
@@ -19,20 +26,18 @@ pub struct LayerFrame {
     /// Convex pieces of solid lit along with the polygon (which stops at
     /// wall faces): the band one tile behind the visible stretches of wall.
     pub lit_shapes: Vec<Vec<[f32; 2]>>,
-    /// Where this layer is void, as convex polygons: where the layer below
-    /// shows through.
-    pub voids: Vec<Vec<[f32; 2]>>,
+    /// Where this layer is void: where the layer below shows through.
+    pub voids: Arc<Mesh>,
     /// The part of `voids` that is liquid: drawn as a translucent tint
     /// over the layer below instead of simply showing it.
-    pub liquid: Vec<Vec<[f32; 2]>>,
+    pub liquid: Arc<Mesh>,
     /// Sprites of things standing on this layer: wherever they're opaque,
     /// the layer is drawn over any void beneath them rather than letting
     /// the layer below show through.
     pub standing: Canvas,
-    /// For a layer below the viewer's, where it shows through (as convex
-    /// polygons); only there may it be remembered as seen. `None` for the
-    /// viewer's own layer.
-    pub shaft: Option<Vec<Vec<[f32; 2]>>>,
+    /// For a layer below the viewer's, where it shows through; only there
+    /// may it be remembered as seen. `None` for the viewer's own layer.
+    pub shaft: Option<Arc<Mesh>>,
 }
 
 pub struct Frame {
@@ -80,4 +85,18 @@ pub struct Frame {
     /// Drawn over everything in interface pixels (`ui_scale` screen
     /// pixels each): the interface.
     pub ui: Canvas,
+}
+
+impl Frame {
+    /// How much smaller each layer below the viewer's is drawn than the
+    /// one above it (see [`camera::parallax`]).
+    pub fn parallax(&self) -> f32 {
+        camera::parallax(self.zoom, self.cell as f32 / TILE * self.ui_scale)
+    }
+
+    /// The part of layer `index` in view, padded a little.
+    pub fn layer_view(&self, index: usize) -> Rect {
+        let scale = self.parallax().powi((self.top - index) as i32);
+        camera::layer_view(self.camera, self.view, self.zoom, scale)
+    }
 }

@@ -158,7 +158,7 @@ impl Canvas {
 /// outline running clockwise on screen (y down).
 pub fn inward_normal(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
     let e = [b[0] - a[0], b[1] - a[1]];
-    let len = e[0].hypot(e[1]);
+    let len = crate::length(e);
     [-e[1] / len, e[0] / len]
 }
 

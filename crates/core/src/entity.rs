@@ -68,7 +68,7 @@ impl Entity {
             let npc = Self::npc(first_id + out.len() as EntityId, pos);
             let c = npc.center();
             if !level.collides(pos, NPC_SIZE)
-                && (c[0] - avoid[0]).hypot(c[1] - avoid[1]) >= min_dist
+                && crate::length([c[0] - avoid[0], c[1] - avoid[1]]) >= min_dist
             {
                 out.push(npc);
             }
@@ -92,7 +92,7 @@ impl Entity {
             self.heading[1] * NPC_SPEED * dt,
         ];
         let next = level.move_box(self.pos, self.size, delta);
-        let moved = (next[0] - self.pos[0]).hypot(next[1] - self.pos[1]);
+        let moved = crate::length([next[0] - self.pos[0], next[1] - self.pos[1]]);
         if moved < 0.5 * NPC_SPEED * dt {
             self.turn(rng);
         }

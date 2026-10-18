@@ -1,11 +1,11 @@
 //! Platform-independent game state. Nothing here touches the browser or GPU.
 
-use goblin_nightclub_core::camera::Camera;
+use goblin_nightclub_core::camera::{self, Camera};
 use goblin_nightclub_core::draw::Canvas;
 use goblin_nightclub_core::entity::{Entity, EntityId, Kind, PLAYER_SIZE};
 use goblin_nightclub_core::frame::{Frame, LayerFrame};
 pub use goblin_nightclub_core::input::Input;
-use goblin_nightclub_core::layer::{Dir, Shape, Solid, TILE, quarter_shapes};
+use goblin_nightclub_core::layer::{Dir, Solid, TILE};
 use goblin_nightclub_core::level::Level;
 use goblin_nightclub_core::level_file::LevelFile;
 use goblin_nightclub_core::memory::Memory;
@@ -63,6 +63,9 @@ pub struct Game {
     camera: Camera,
     /// Last pointer position, in view pixels.
     pointer: Option<[f32; 2]>,
+    /// What sight was last worked out from: the player's center, layer,
+    /// view radius and the ground level. Unchanged, so is what's seen.
+    observed: Option<([f32; 2], usize, f32, usize)>,
 }
 
 /// A planned walk: the tiles it crosses and the straightened waypoints
@@ -81,8 +84,8 @@ const PLAYER_SPEED: f32 = 60.0;
 const AUTO_PAUSE: bool = true;
 
 /// Size of a generated level, in tiles.
-const LEVEL_COLS: usize = 192;
-const LEVEL_ROWS: usize = 120;
+const LEVEL_COLS: usize = 96;
+const LEVEL_ROWS: usize = 60;
 
 /// How far the player can see, in pixels, indoors: under a floor or wall
 /// of some layer above. `f32::INFINITY` is unlimited.
@@ -189,6 +192,7 @@ impl Game {
             route: None,
             camera,
             pointer: None,
+            observed: None,
         };
         game.center_camera();
         game.observe();
@@ -370,7 +374,7 @@ impl Game {
         let here = center(self.player, PLAYER_SIZE);
         let target = route.waypoints[route.next];
         let to = [target[0] - here[0], target[1] - here[1]];
-        let dist = to[0].hypot(to[1]);
+        let dist = goblin_nightclub_core::length(to);
         let step = (PLAYER_SPEED * dt).min(dist);
         if dist > 1e-3 {
             let delta = [to[0] / dist * step, to[1] / dist * step];
@@ -380,13 +384,13 @@ impl Game {
                 .move_box(self.player, PLAYER_SIZE, delta);
         }
         let now = center(self.player, PLAYER_SIZE);
-        let moved = (now[0] - here[0]).hypot(now[1] - here[1]);
+        let moved = goblin_nightclub_core::length([now[0] - here[0], now[1] - here[1]]);
         route.stalled = if moved < 0.2 * step {
             route.stalled + dt
         } else {
             0.0
         };
-        if (target[0] - now[0]).hypot(target[1] - now[1]) < 0.5 {
+        if goblin_nightclub_core::length([target[0] - now[0], target[1] - now[1]]) < 0.5 {
             // Arrived: on the point exactly, since the leg was swept clear.
             let exact = [
                 target[0] - PLAYER_SIZE[0] / 2.0,
@@ -493,7 +497,7 @@ impl Game {
         let snap = |v: f32| (v * zoom).floor() / zoom;
         let mut at = center(self.player, PLAYER_SIZE);
         for &w in &route.waypoints[route.next..] {
-            let len = (w[0] - at[0]).hypot(w[1] - at[1]);
+            let len = goblin_nightclub_core::length([w[0] - at[0], w[1] - at[1]]);
             let dots = (len / 4.0) as usize;
             for i in 1..=dots {
                 let t = i as f32 * 4.0 / len;
@@ -558,20 +562,26 @@ impl Game {
         } else {
             VIEW_RADIUS
         };
+        // Others moving doesn't change what's seen, only the player does.
+        let key = Some((origin, self.top, base, self.ground));
+        let moved = self.observed != key;
+        self.observed = key;
         let visible = self.level.visible_layers(self.top);
         for k in 0..self.level.depth() {
             if !visible.contains(&k) {
                 self.memories[k].clear_visible();
                 continue;
             }
-            let shaft = (k < self.top).then(|| self.level.shaft(self.top, k));
             // Looking down, the layer's own walls don't block the view, so
             // its floors and wall tops show alike.
             let view = self.level.view(self.top, k);
-            let above = (k < self.top).then_some(view);
-            let underground = self.outdoors() && k < self.ground;
-            self.visions[k].set_radius(view_radius(base, self.top - k, underground));
-            self.visions[k].update_through(view, self.level.layer(k), shaft, above, origin);
+            if moved {
+                let shaft = (k < self.top).then(|| self.level.shaft(self.top, k));
+                let above = (k < self.top).then_some(view);
+                let underground = self.outdoors() && k < self.ground;
+                self.visions[k].set_radius(view_radius(base, self.top - k, underground));
+                self.visions[k].update_through(view, self.level.layer(k), shaft, above, origin);
+            }
             let here = self.npcs.iter().filter(|n| n.layer == k);
             self.memories[k].update(view, &self.visions[k], here, self.time);
         }
@@ -584,12 +594,18 @@ impl Game {
     pub fn frame(&self) -> Frame {
         let tileset = self.tileset();
         let bevel = 1.0 / tileset.zoom();
+        let parallax = camera::parallax(self.zoom(), tileset.zoom() * self.ui_scale());
         let layers = self
             .level
             .visible_layers(self.top)
-            .into_iter()
-            .map(|k| {
+            .iter()
+            .map(|&k| {
                 let (layer, vision) = (self.level.layer(k), &self.visions[k]);
+                // The tiles are drawn from the level's meshes; just the
+                // bevels in view are drawn here.
+                let scale = parallax.powi((self.top - k) as i32);
+                let within =
+                    camera::layer_view(self.camera.pos, self.camera.view, self.zoom(), scale);
                 // Bevels a pixel of the art wide, only on faces seen: now for
                 // the visible canvas, ever for the remembered one.
                 // Otherwise a lit wall would show the bevel of a face behind
@@ -613,29 +629,20 @@ impl Game {
                     .collect();
 
                 let mut visible = Canvas::new(tileset);
-                layer.draw(tileset, &mut visible, |i| vision.edge_visible()[i], bevel);
+                let seen_now = |i| vision.edge_visible()[i];
+                layer.draw_bevels(tileset, &mut visible, seen_now, bevel, within);
                 for &(at, cell) in &live {
                     visible.sprite(at, cell, palette::WHITE);
                 }
                 let mut remembered = Canvas::new(tileset);
-                layer.draw(tileset, &mut remembered, |i| vision.edge_seen()[i], bevel);
+                let seen_ever = |i| vision.edge_seen()[i];
+                layer.draw_bevels(tileset, &mut remembered, seen_ever, bevel, within);
                 for &(at, cell) in &stale {
                     remembered.sprite(at, cell, palette::WHITE);
                 }
 
-                // The parts of each tile given by `quarters(tile index)`.
-                let parts = |quarters: &dyn Fn(usize) -> u8| -> Vec<Shape> {
-                    (0..layer.cols * layer.rows)
-                        .flat_map(|i| quarter_shapes(i % layer.cols, i / layer.cols, quarters(i)))
-                        .collect()
-                };
-                let at = |i: usize| layer.tile((i % layer.cols) as i32, (i / layer.cols) as i32);
-                let voids = parts(&|i| at(i).void_quarters());
-                let liquid = parts(&|i| at(i).liquid_quarters());
-                let shaft = (k < self.top).then(|| {
-                    let shaft = self.level.shaft(self.top, k);
-                    parts(&|i| if shaft[i] { 0b1111 } else { 0 })
-                });
+                let meshes = self.level.meshes(k);
+                let shaft = (k < self.top).then(|| self.level.shaft_mesh(self.top, k).clone());
                 // Characters drawn on this layer cover any void their
                 // sprites overhang: the player, NPCs in view and last
                 // sightings.
@@ -657,13 +664,14 @@ impl Game {
 
                 LayerFrame {
                     index: k,
+                    tiles: meshes.tiles.clone(),
                     visible,
                     remembered,
                     unknown: Canvas::new(tileset),
                     polygon: vision.polygon().to_vec(),
                     lit_shapes: vision.wall_band().to_vec(),
-                    voids,
-                    liquid,
+                    voids: meshes.voids.clone(),
+                    liquid: meshes.liquid.clone(),
                     standing,
                     shaft,
                 }
@@ -1242,7 +1250,14 @@ mod tests {
         let top = &frame.layers[0];
         // Player and the visible NPC: a square each.
         assert_eq!(top.standing.vertices.len(), 2 * 6);
-        assert!(top.voids.len() == 60, "a whole void tile each");
+        // The void row, a rectangle in each chunk it crosses.
+        let area: f32 = (top.voids.vertices.chunks(3))
+            .map(|t| {
+                let [a, b, c] = [t[0].pos, t[1].pos, t[2].pos];
+                ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0
+            })
+            .sum();
+        assert!((area - 60.0 * TILE * TILE).abs() < 1e-2, "{area}");
     }
 
     #[test]

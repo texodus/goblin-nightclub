@@ -127,7 +127,7 @@ fn circle_crossings(c: [f32; 2], radius: f32, a: [f32; 2], b: [f32; 2]) -> Vec<[
 }
 
 fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
-    (b[0] - a[0]).hypot(b[1] - a[1])
+    crate::length([b[0] - a[0], b[1] - a[1]])
 }
 
 pub struct Vision {
@@ -224,7 +224,12 @@ impl Vision {
         origin: [f32; 2],
     ) {
         self.origin = origin;
-        self.shaft = shaft.map(<[bool]>::to_vec);
+        // Kept (it's read until the next update), but rarely changes.
+        match (&mut self.shaft, shaft) {
+            (Some(mine), Some(shaft)) if mine.as_slice() != shaft => mine.clone_from_slice(shaft),
+            (Some(_), Some(_)) => {}
+            (mine, shaft) => *mine = shaft.map(<[bool]>::to_vec),
+        }
         self.rebuild_polygon(sight);
         self.find_wall_band(own);
         if let Some(above) = above {
@@ -244,12 +249,15 @@ impl Vision {
     /// little smaller (parallax), which brings the edge of such a wall
     /// into view at the side of the hole.
     fn find_wall_tops(&mut self, own: &Layer, above: &Layer) {
-        let mut lit = vec![false; own.cols * own.rows];
+        let mut lit = Vec::new();
         self.wall_band.clear();
         let (origin, radius) = (self.origin, self.radius);
         let visible = |p: [f32; 2]| distance(p, origin) <= radius && above.los(origin, p);
-        for y in 0..own.rows {
-            for x in 0..own.cols {
+        // What's seen of a tile is in it or on its border, so only tiles
+        // within a tile of the radius can be.
+        let (xs, ys) = self.tiles_within(own, radius + TILE);
+        for y in ys {
+            for x in xs.clone() {
                 let Some(shape) = own.solid(x as i32, y as i32).shape(x, y) else {
                     continue;
                 };
@@ -271,18 +279,41 @@ impl Vision {
                     self.borders_void_in_view(x as i32, y as i32, &visible)
                 };
                 if seen {
-                    lit[y * own.cols + x] = true;
+                    lit.push([x as i32, y as i32]);
                     self.explored[y * self.cols + x] = true;
                     self.wall_band.push(shape);
                 }
             }
         }
-        for (k, e) in own.outline_edges().iter().enumerate() {
-            if own.in_bounds(e.solid) && lit[e.solid[1] as usize * own.cols + e.solid[0] as usize] {
+        if lit.is_empty() {
+            return;
+        }
+        lit.sort_unstable();
+        for k in own.edges_near(origin, radius + 2.0 * TILE) {
+            if lit.binary_search(&own.outline_edges()[k].solid).is_ok() {
                 self.edge_visible[k] = true;
                 self.edge_seen[k] = true;
             }
         }
+    }
+
+    /// The columns and rows of tiles of `level` with any of them within
+    /// `reach` of the origin (all of them for an infinite reach), and
+    /// maybe a few more.
+    fn tiles_within(
+        &self,
+        level: &Layer,
+        reach: f32,
+    ) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let span = |axis: usize, n: usize| {
+            if !reach.is_finite() {
+                return 0..n;
+            }
+            let lo = ((self.origin[axis] - reach) / TILE).floor().max(0.0) as usize;
+            let hi = (((self.origin[axis] + reach) / TILE).ceil().max(0.0) as usize).min(n);
+            lo.min(hi)..hi
+        };
+        (span(0, level.cols), span(1, level.rows))
     }
 
     /// Is a neighbor of tile `(x, y)` (across a side or a corner) in the
@@ -320,7 +351,7 @@ impl Vision {
     pub fn can_see(&self, level: &Layer, p: [f32; 2]) -> bool {
         let d = [p[0] - self.origin[0], p[1] - self.origin[1]];
         let tile = [(p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32];
-        d[0].hypot(d[1]) <= self.radius && self.in_shaft(tile) && level.los(self.origin, p)
+        crate::length(d) <= self.radius && self.in_shaft(tile) && level.los(self.origin, p)
     }
 
     /// Has any part of tile `(x, y)` ever been visible?
@@ -334,7 +365,8 @@ impl Vision {
         // Angular zones around each corner (center, half-width) in which a
         // plain ray can't be trusted to land on the right side of it.
         let mut zones: Vec<(f32, f32)> = Vec::new();
-        for &c in level.corners() {
+        for i in level.corners_near(origin, self.radius) {
+            let c = level.corners()[i];
             // Corners outside the radius can't shape the visible region.
             if distance(origin, c) > self.radius {
                 continue;
@@ -356,7 +388,8 @@ impl Vision {
             // corners. So sample either side of every such crossing, or the
             // chord between neighboring rays could cut off visible floor.
             let eps = corner_eps(self.radius);
-            for e in level.outline_edges() {
+            for k in level.edges_near(origin, self.radius) {
+                let e = &level.outline_edges()[k];
                 for p in circle_crossings(origin, self.radius, e.a, e.b) {
                     let angle = angle(origin, p);
                     rays.extend([Ray::new(angle - eps, vec![]), Ray::new(angle + eps, vec![])]);
@@ -564,7 +597,13 @@ impl Vision {
             }
         }
 
-        for c in level.concave_corners() {
+        // Every stretch reached is within the radius.
+        let near = if reached.is_empty() {
+            Vec::new()
+        } else {
+            level.concave_near(self.origin, self.radius + TILE)
+        };
+        for c in near.into_iter().map(|k| &level.concave_corners()[k]) {
             if reached.iter().any(|r| distance(*r, c.at) < 1e-3) {
                 let [p, a, b] = [c.at, c.before, c.after];
                 let k = TILE / (1.0 + a[0] * b[0] + a[1] * b[1]);
@@ -614,8 +653,9 @@ impl Vision {
     /// or on an exposed face) is seen, through `sight`.
     fn mark_explored(&mut self, sight: &Layer, own: &Layer) {
         let reach = self.radius + TILE * std::f32::consts::SQRT_2;
-        for y in 0..own.rows {
-            for x in 0..own.cols {
+        let (xs, ys) = self.tiles_within(own, reach);
+        for y in ys {
+            for x in xs.clone() {
                 let i = y * self.cols + x;
                 if self.explored[i] || !self.in_shaft([x as i32, y as i32]) {
                     continue;

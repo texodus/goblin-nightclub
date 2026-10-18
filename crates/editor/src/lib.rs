@@ -18,12 +18,12 @@
 
 use serde::Serialize;
 
-use goblin_nightclub_core::camera::Camera;
+use goblin_nightclub_core::camera::{self, Camera};
 use goblin_nightclub_core::draw::Canvas;
 use goblin_nightclub_core::entity::PLAYER_SIZE;
 use goblin_nightclub_core::frame::{Frame, LayerFrame};
 use goblin_nightclub_core::input::Input;
-use goblin_nightclub_core::layer::{Corner, Dir, Layer, Part, Shape, TILE, Tile, quarter_shapes};
+use goblin_nightclub_core::layer::{Corner, Dir, Layer, Part, TILE, Tile};
 use goblin_nightclub_core::level::{Level, MAX_LAYERS, can_stand};
 use goblin_nightclub_core::level_file::{Character, LevelFile, Spawn};
 use goblin_nightclub_core::palette::{self, Color};
@@ -695,19 +695,19 @@ impl Editor {
         let top = self.layer;
         let [w, h] = self.world();
         let everywhere = vec![[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
+        let zoom = self.camera.zoom();
+        let parallax = camera::parallax(zoom, self.tileset.zoom() * self.camera.ui_scale());
         let layers = self
             .level
             .visible_layers(top)
-            .into_iter()
-            .map(|k| {
+            .iter()
+            .map(|&k| {
                 let layer = self.level.layer(k);
+                let scale = parallax.powi((top - k) as i32);
+                let within = camera::layer_view(self.camera.pos, self.camera.view, zoom, scale);
                 let mut visible = Canvas::new(&self.tileset);
-                layer.draw(
-                    &self.tileset,
-                    &mut visible,
-                    |_| true,
-                    1.0 / self.tileset.zoom(),
-                );
+                let bevel = 1.0 / self.tileset.zoom();
+                layer.draw_bevels(&self.tileset, &mut visible, |_| true, bevel, within);
                 if self.spawn.layer == k {
                     let player = self
                         .tileset
@@ -715,28 +715,19 @@ impl Editor {
                         .map_or(self.tileset.white, |s| s.cell);
                     visible.sprite(self.spawn.pos, player, palette::WHITE);
                 }
-                let parts = |quarters: &dyn Fn(usize) -> u8| -> Vec<Shape> {
-                    (0..self.cols * self.rows)
-                        .flat_map(|i| quarter_shapes(i % self.cols, i / self.cols, quarters(i)))
-                        .collect()
-                };
-                let voids = parts(&|i| self.layers[k][i].void_quarters());
-                let liquid = parts(&|i| self.layers[k][i].liquid_quarters());
-                let shaft = (k < top).then(|| {
-                    let shaft = self.level.shaft(top, k);
-                    parts(&|i| if shaft[i] { 0b1111 } else { 0 })
-                });
+                let meshes = self.level.meshes(k);
                 LayerFrame {
                     index: k,
+                    tiles: meshes.tiles.clone(),
                     remembered: visible.clone(),
                     visible,
                     unknown: Canvas::new(&self.tileset),
                     polygon: everywhere.clone(),
                     lit_shapes: Vec::new(),
-                    voids,
-                    liquid,
+                    voids: meshes.voids.clone(),
+                    liquid: meshes.liquid.clone(),
                     standing: Canvas::new(&self.tileset),
-                    shaft,
+                    shaft: (k < top).then(|| self.level.shaft_mesh(top, k).clone()),
                 }
             })
             .collect();
@@ -998,7 +989,7 @@ mod tests {
             frame.layers.iter().map(|l| l.index).collect::<Vec<_>>(),
             [1, 0]
         );
-        assert_eq!(frame.layers[0].voids.len(), 1);
+        assert_eq!(frame.layers[0].voids.vertices.len(), 6, "one void tile");
         assert_eq!(frame.layers[0].polygon.len(), 4, "the whole level in view");
         assert!(!frame.overlay.vertices.is_empty(), "the grid");
     }
