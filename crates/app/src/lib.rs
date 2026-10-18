@@ -8,3 +8,28 @@
 mod app;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
+
+#[cfg(test)]
+mod shader_tests {
+    use wgpu::naga;
+
+    /// The renderer's shaders parse and validate: the browser checks them
+    /// only at runtime, and the renderer is built only for wasm32.
+    #[test]
+    fn shaders_are_valid() {
+        let shaders = [
+            ("shapes", include_str!("shaders/shapes.wgsl")),
+            ("composite", include_str!("shaders/composite.wgsl")),
+        ];
+        for (name, source) in shaders {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
+        }
+    }
+}

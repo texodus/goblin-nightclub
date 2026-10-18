@@ -4,7 +4,8 @@
 //! is loaded separately at runtime and handed to the renderer as a
 //! [`Sheet`]. Nothing here knows any material by name: the engine only
 //! asks a part's kind (floor, wall, liquid, void), its cells and its
-//! properties (a wall's bevel colors, a liquid's translucency).
+//! properties (a wall's bevel colors, a liquid's translucency, how its
+//! edges meet other materials: see [`Edge`] and [`Trim`]).
 //!
 //! In memory each table is a list in the file's order, and tiles refer to
 //! entries by index ([`FloorId`], [`WallId`], [`LiquidId`]); files refer to
@@ -13,7 +14,7 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::layer::{FloorId, LiquidId, TILE, WallId};
+use crate::layer::{FloorId, LiquidId, Part, TILE, WallId};
 use crate::palette::{self, Color};
 
 /// A cell of the sheet: column and row.
@@ -45,6 +46,8 @@ pub struct Floor {
     pub name: String,
     /// Variants, picked per tile.
     pub cells: Vec<Cell>,
+    pub edge: Edge,
+    pub trim: Option<Trim>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,9 +55,12 @@ pub struct Wall {
     pub name: String,
     /// Variants, picked per tile: the wall seen from above.
     pub cells: Vec<Cell>,
-    /// Bevel colors along faces facing up or left, and down or right.
+    /// Bevel colors along faces facing up or left, and down or right; for
+    /// a wall with a fringe (see [`Edge`]), its rim's.
     pub light: Color,
     pub dark: Color,
+    pub edge: Edge,
+    pub trim: Option<Trim>,
 }
 
 /// Void to the game (impassable, open to sight, the layer below showing
@@ -65,6 +71,38 @@ pub struct Liquid {
     pub cells: Vec<Cell>,
     /// Opacity, 0 to 1.
     pub alpha: f32,
+    /// Only its priority counts: a liquid has no fringe.
+    pub edge: Edge,
+    pub trim: Option<Trim>,
+}
+
+/// How a material's edges meet other materials. Where two meet, the one
+/// that ranks higher grows a ragged fringe over the other, `width` pixels
+/// of the art at most: walls rank over floors, floors over liquids,
+/// liquids over void (stairs over everything), and within a kind the
+/// higher `priority`. A material with no width keeps straight edges (and
+/// a wall, its bevels).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Edge {
+    pub priority: u8,
+    /// In pixels of the art.
+    pub width: f32,
+    /// Blended over the outermost pixels of a floor's fringe, by its
+    /// alpha, to outline it. (A wall's are its bevel colors.)
+    pub rim: Option<Color>,
+}
+
+/// Small sprites scattered along a material's edges with other
+/// materials, like tufts of grass, pebbles or foam.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Trim {
+    /// Sprites, picked at random.
+    pub cells: Vec<Cell>,
+    /// Chance of one along each edge of a tile, 0 to 1.
+    pub density: f32,
+    /// How far into the material each sits, from the edge, in pixels of
+    /// the art: 0 straddles it.
+    pub inset: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -102,6 +140,26 @@ impl Tileset {
         self.sprites.iter().find(|s| s.name == name)
     }
 
+    /// How `part`'s edges meet others' (void's are the defaults).
+    pub fn edge(&self, part: Part) -> Edge {
+        match part {
+            Part::Floor(f) => self.floors[f as usize].edge,
+            Part::Wall(w) => self.walls[w as usize].edge,
+            Part::Liquid(l) => self.liquids[l as usize].edge,
+            Part::Void => Edge::default(),
+        }
+    }
+
+    /// What's scattered along `part`'s edges, if anything.
+    pub fn trim(&self, part: Part) -> Option<&Trim> {
+        match part {
+            Part::Floor(f) => self.floors[f as usize].trim.as_ref(),
+            Part::Wall(w) => self.walls[w as usize].trim.as_ref(),
+            Part::Liquid(l) => self.liquids[l as usize].trim.as_ref(),
+            Part::Void => None,
+        }
+    }
+
     /// Sheet pixels per world unit: geometry is in world units, [`TILE`] to
     /// a tile, whatever the art's size. Also the default view zoom (screen
     /// pixels per world unit), where the art is shown at its own size.
@@ -116,11 +174,20 @@ impl Tileset {
 
     /// Every cell the tileset uses.
     pub fn cells(&self) -> impl Iterator<Item = Cell> + '_ {
+        let trims = self
+            .floors
+            .iter()
+            .map(|f| &f.trim)
+            .chain(self.walls.iter().map(|w| &w.trim))
+            .chain(self.liquids.iter().map(|l| &l.trim))
+            .flatten()
+            .flat_map(|t| t.cells.iter().copied());
         self.floors
             .iter()
             .flat_map(|f| f.cells.iter().copied())
             .chain(self.walls.iter().flat_map(|w| w.cells.iter().copied()))
             .chain(self.liquids.iter().flat_map(|l| l.cells.iter().copied()))
+            .chain(trims)
             .chain(self.sprites.iter().map(|s| s.cell))
             .chain([self.white, self.stairs[0], self.stairs[1]])
     }
@@ -239,6 +306,10 @@ pub(crate) struct RawStairs {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RawFloor {
     cells: Vec<Cell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edge: Option<RawEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trim: Option<RawTrim>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -246,12 +317,81 @@ pub(crate) struct RawWall {
     cells: Vec<Cell>,
     light: String,
     dark: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edge: Option<RawEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trim: Option<RawTrim>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RawLiquid {
     cells: Vec<Cell>,
     alpha: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edge: Option<RawEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trim: Option<RawTrim>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RawEdge {
+    #[serde(default)]
+    priority: u8,
+    #[serde(default)]
+    width: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rim: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RawTrim {
+    cells: Vec<Cell>,
+    density: f32,
+    #[serde(default)]
+    inset: f32,
+}
+
+impl Edge {
+    fn raw(&self) -> Option<RawEdge> {
+        (*self != Edge::default()).then(|| RawEdge {
+            priority: self.priority,
+            width: self.width,
+            rim: self.rim.map(palette::hex_alpha),
+        })
+    }
+
+    fn from_raw(raw: Option<RawEdge>, name: &str) -> Result<Edge, String> {
+        let Some(raw) = raw else {
+            return Ok(Edge::default());
+        };
+        let rim = raw
+            .rim
+            .map(|s| palette::parse_hex(&s).ok_or(format!("{name}: bad rim color {s:?}")))
+            .transpose()?;
+        Ok(Edge {
+            priority: raw.priority,
+            width: raw.width.max(0.0),
+            rim,
+        })
+    }
+}
+
+impl Trim {
+    fn raw(&self) -> RawTrim {
+        RawTrim {
+            cells: self.cells.clone(),
+            density: self.density,
+            inset: self.inset,
+        }
+    }
+
+    fn from_raw(raw: RawTrim) -> Trim {
+        Trim {
+            cells: raw.cells,
+            density: raw.density.clamp(0.0, 1.0),
+            inset: raw.inset,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -278,6 +418,8 @@ impl Tileset {
                         f.name.clone(),
                         RawFloor {
                             cells: f.cells.clone(),
+                            edge: f.edge.raw(),
+                            trim: f.trim.as_ref().map(Trim::raw),
                         },
                     )
                 })
@@ -292,6 +434,8 @@ impl Tileset {
                             cells: w.cells.clone(),
                             light: palette::hex(w.light),
                             dark: palette::hex(w.dark),
+                            edge: w.edge.raw(),
+                            trim: w.trim.as_ref().map(Trim::raw),
                         },
                     )
                 })
@@ -305,6 +449,8 @@ impl Tileset {
                         RawLiquid {
                             cells: l.cells.clone(),
                             alpha: l.alpha,
+                            edge: l.edge.raw(),
+                            trim: l.trim.as_ref().map(Trim::raw),
                         },
                     )
                 })
@@ -332,6 +478,7 @@ impl<'de> Deserialize<'de> for Tileset {
             palette::parse_hex(s)
                 .ok_or_else(|| D::Error::custom(format!("{name}: bad color {s:?}")))
         };
+        let edge = |raw, name: &str| Edge::from_raw(raw, name).map_err(D::Error::custom);
         let tileset = Tileset {
             cell: raw.cell,
             image: raw.image,
@@ -340,11 +487,15 @@ impl<'de> Deserialize<'de> for Tileset {
             floors: raw
                 .floors
                 .into_iter()
-                .map(|(name, f)| Floor {
-                    name,
-                    cells: f.cells,
+                .map(|(name, f)| {
+                    Ok(Floor {
+                        edge: edge(f.edge, &name)?,
+                        trim: f.trim.map(Trim::from_raw),
+                        name,
+                        cells: f.cells,
+                    })
                 })
-                .collect(),
+                .collect::<Result<_, D::Error>>()?,
             walls: raw
                 .walls
                 .into_iter()
@@ -352,6 +503,8 @@ impl<'de> Deserialize<'de> for Tileset {
                     Ok(Wall {
                         light: color(&name, &w.light)?,
                         dark: color(&name, &w.dark)?,
+                        edge: edge(w.edge, &name)?,
+                        trim: w.trim.map(Trim::from_raw),
                         name,
                         cells: w.cells,
                     })
@@ -360,12 +513,16 @@ impl<'de> Deserialize<'de> for Tileset {
             liquids: raw
                 .liquids
                 .into_iter()
-                .map(|(name, l)| Liquid {
-                    name,
-                    cells: l.cells,
-                    alpha: l.alpha.clamp(0.0, 1.0),
+                .map(|(name, l)| {
+                    Ok(Liquid {
+                        edge: edge(l.edge, &name)?,
+                        trim: l.trim.map(Trim::from_raw),
+                        name,
+                        cells: l.cells,
+                        alpha: l.alpha.clamp(0.0, 1.0),
+                    })
                 })
-                .collect(),
+                .collect::<Result<_, D::Error>>()?,
             sprites: raw
                 .sprites
                 .into_iter()
@@ -388,12 +545,16 @@ pub mod testing {
         let floor = |name: &str, cells: &[Cell]| Floor {
             name: name.into(),
             cells: cells.to_vec(),
+            edge: Edge::default(),
+            trim: None,
         };
         let wall = |name: &str, cells: &[Cell], light, dark| Wall {
             name: name.into(),
             cells: cells.to_vec(),
             light,
             dark,
+            edge: Edge::default(),
+            trim: None,
         };
         Tileset {
             cell: 16,
@@ -425,6 +586,8 @@ pub mod testing {
                 name: "water".into(),
                 cells: vec![[3, 0], [4, 0]],
                 alpha: 0.55,
+                edge: Edge::default(),
+                trim: None,
             }],
             sprites: vec![
                 Sprite {
@@ -471,6 +634,47 @@ mod tests {
         let shuffled = json.replacen("\"plain\":{\"cells\":[[0,1],[0,1],[0,1],[1,1]]},", "", 1);
         let back: Tileset = serde_json::from_str(&shuffled).unwrap();
         assert_eq!(back.floor("planks"), Some(0), "first in the file");
+    }
+
+    #[test]
+    fn edges_and_trims_round_trip_and_default() {
+        let mut t = testing::tileset();
+        t.floors[2].edge = Edge {
+            priority: 3,
+            width: 2.5,
+            rim: Some([0.0, 0.0, 0.0, 0.4]),
+        };
+        t.walls[0].edge.width = 2.0;
+        t.liquids[0].trim = Some(Trim {
+            cells: vec![[9, 3], [10, 3]],
+            density: 0.4,
+            inset: 3.0,
+        });
+        let json = serde_json::to_string(&t).unwrap();
+        // Close enough: the rim's alpha goes through a byte.
+        let back: Tileset = serde_json::from_str(&json).unwrap();
+        let rim = back.floors[2].edge.rim.unwrap();
+        assert!((rim[3] - 0.4).abs() < 1.0 / 255.0);
+        assert_eq!(
+            (back.floors[2].edge.priority, back.floors[2].edge.width),
+            (3, 2.5)
+        );
+        assert_eq!(back.walls[0].edge.width, 2.0);
+        assert_eq!(back.liquids[0].trim, t.liquids[0].trim);
+        assert_eq!(back.edge(Part::Liquid(0)), Edge::default());
+        assert!(back.trim(Part::Floor(2)).is_none());
+        // Left out when there's nothing to say, so older files stay as
+        // they were.
+        assert!(
+            !serde_json::to_string(&testing::tileset())
+                .unwrap()
+                .contains("edge")
+        );
+        // Trims' cells count as the tileset's.
+        assert!(back.cells().any(|c| c == [10, 3]));
+        let bad = json.replacen("\"rim\":\"#00000066\"", "\"rim\":\"dark\"", 1);
+        assert_ne!(bad, json);
+        assert!(serde_json::from_str::<Tileset>(&bad).is_err());
     }
 
     #[test]

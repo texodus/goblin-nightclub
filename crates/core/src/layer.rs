@@ -1577,7 +1577,8 @@ impl Layer {
     /// index)` picks that reach into `within`: the wall's light color on
     /// faces facing up or left, its dark color on faces facing down or
     /// right. Strips along each loop are mitered at its corners so they
-    /// meet exactly.
+    /// meet exactly. Walls with a fringe (see [`crate::fringe`]) have none:
+    /// their fringe's rim takes its place.
     pub fn draw_bevels(
         &self,
         tileset: &Tileset,
@@ -1593,7 +1594,11 @@ impl Layer {
                 e.a[axis].max(e.b[axis]) + width >= lo[axis]
                     && e.a[axis].min(e.b[axis]) - width <= hi[axis]
             };
-            reaches(0) && reaches(1) && self.in_bounds(e.solid) && bevel(i)
+            let fringed = || {
+                let wall = self.tile(e.solid[0], e.solid[1]).wall_id().unwrap_or(0);
+                tileset.walls[wall as usize].edge.width > 0.0
+            };
+            reaches(0) && reaches(1) && self.in_bounds(e.solid) && !fringed() && bevel(i)
         };
         for o in &self.outlines {
             if !o.runs.iter().flatten().any(|&i| drawn(i)) {
@@ -2116,6 +2121,26 @@ mod tests {
         let left = area([[0.0, 0.0], [30.0, 30.0]]);
         assert!(left > 0 && 2 * left == all, "{left} of {all}");
         assert_eq!(area([[25.0, 0.0], [55.0, 30.0]]), 0, "between them");
+    }
+
+    #[test]
+    fn fringed_walls_have_no_bevels() {
+        let level = Layer::from_ascii(&["....", ".#..", "...."]);
+        let mut tileset = tileset::testing::tileset();
+        let count = |tileset: &Tileset| {
+            let mut canvas = Canvas::new(tileset);
+            level.draw_bevels(
+                tileset,
+                &mut canvas,
+                |_| true,
+                1.0,
+                crate::camera::EVERYWHERE,
+            );
+            canvas.vertices.len()
+        };
+        assert!(count(&tileset) > 0);
+        tileset.walls[0].edge.width = 2.0;
+        assert_eq!(count(&tileset), 0, "the fringe's rim instead");
     }
 
     #[test]

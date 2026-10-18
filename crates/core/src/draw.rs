@@ -19,6 +19,13 @@ pub struct Vertex {
     /// it.
     pub cell: [f32; 2],
     pub color: Color,
+    /// For a fringe (see [`Canvas::fringe`]): a point on the edge it grows
+    /// from and the edge's outward normal, or a zero normal to grow from
+    /// just the point.
+    pub edge: [f32; 4],
+    /// For a fringe, how far it may reach past the edge, in world units;
+    /// 0 for anything else.
+    pub reach: f32,
 }
 
 /// Triangles drawn in order, later ones on top.
@@ -93,6 +100,29 @@ impl Canvas {
         self.fan(points, uv, base, color);
     }
 
+    /// A strip of tile art past the edge of a tile, cut raggedly by the
+    /// renderer: `points` (a convex polygon) show sheet cell `cell` as
+    /// [`Canvas::textured`] would with the tile's corner at `origin`, the
+    /// cell repeating past its sides, but only out to a varying distance
+    /// from `edge` (see [`Vertex::edge`]), at most `reach`. Its outermost
+    /// pixels have `rim` blended over them, by its alpha.
+    pub fn fringe(
+        &mut self,
+        points: &[[f32; 2]],
+        origin: [f32; 2],
+        cell: Cell,
+        rim: Color,
+        edge: [f32; 4],
+        reach: f32,
+    ) {
+        let start = self.vertices.len();
+        self.textured(points, origin, cell, rim);
+        for v in &mut self.vertices[start..] {
+            v.edge = edge;
+            v.reach = reach;
+        }
+    }
+
     /// Sheet cell `cell` as a tile-sized square (see
     /// [`Tileset::sprite_size`]) centered on `center`, snapped to whole
     /// sheet pixels so it lines up with the tiles' pixels.
@@ -127,6 +157,7 @@ impl Canvas {
                     uv: uv(pos),
                     cell,
                     color,
+                    ..Default::default()
                 });
             }
         }

@@ -26,25 +26,46 @@ pub const LIGHT_MAGENTA: Color = rgb(0xFF, 0x55, 0xFF);
 pub const YELLOW: Color = rgb(0xFF, 0xFF, 0x55);
 pub const WHITE: Color = rgb(0xFF, 0xFF, 0xFF);
 
+/// Not one of the sixteen: nothing, blended over anything, changes it.
+pub const TRANSPARENT: Color = [0.0; 4];
+
 /// `c` as `#rrggbb` (its alpha dropped), as tile sheets name colors.
 pub fn hex(c: Color) -> String {
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02x}{:02x}{:02x}", byte(c[0]), byte(c[1]), byte(c[2]))
 }
 
-/// A color from `#rrggbb` (or `#rgb`), opaque.
+/// `#rrggbbaa`, or `#rrggbb` when opaque.
+pub fn hex_alpha(c: Color) -> String {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    if byte(c[3]) == 255 {
+        hex(c)
+    } else {
+        format!("{}{:02x}", hex(c), byte(c[3]))
+    }
+}
+
+/// A color from `#rrggbb` (or `#rgb`), opaque, or `#rrggbbaa`.
 pub fn parse_hex(s: &str) -> Option<Color> {
     let digits = s.strip_prefix('#')?;
     let channel = |from: usize, len: usize| {
         let v = u8::from_str_radix(digits.get(from..from + len)?, 16).ok()?;
         Some(if len == 1 { v * 17 } else { v })
     };
-    let [r, g, b] = match digits.len() {
-        6 => [channel(0, 2)?, channel(2, 2)?, channel(4, 2)?],
-        3 => [channel(0, 1)?, channel(1, 1)?, channel(2, 1)?],
+    let [r, g, b, a] = match digits.len() {
+        8 => [
+            channel(0, 2)?,
+            channel(2, 2)?,
+            channel(4, 2)?,
+            channel(6, 2)?,
+        ],
+        6 => [channel(0, 2)?, channel(2, 2)?, channel(4, 2)?, 255],
+        3 => [channel(0, 1)?, channel(1, 1)?, channel(2, 1)?, 255],
         _ => return None,
     };
-    Some(rgb(r, g, b))
+    let mut c = rgb(r, g, b);
+    c[3] = a as f32 / 255.0;
+    Some(c)
 }
 
 pub const ALL: [Color; 16] = [

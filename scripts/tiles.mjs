@@ -9,6 +9,9 @@
 //              tileset still draw: plain, planks, dirt, grate (row 1);
 //              brick, rock, metal (row 2); sprites: player, npc (row 3);
 //              grass, sand, stone (row 4); two variants each
+//   row 3      after the sprites, from column 2, trims: small sprites the
+//              tileset scatters along material edges (grass tufts and a
+//              flower clump, pebbles, foam)
 //   rows 5-14  every variant of one material a row: plain, planks, dirt,
 //              grate, grass, sand, stone, rock, brick, metal
 //
@@ -694,6 +697,86 @@ function sprite(art, legend) {
     });
 }
 
+// --- Trims ----------------------------------------------------------------
+// Small sprites scattered along material edges, centered in their cells
+// (where the edge, or a point a little inside the material, is), with a
+// shadow ('~') down and right. Drawn small so they read at any angle of
+// edge.
+
+const TRIM_LEGEND = {
+    t: "#9bcb5c", h: "#69b04f", g: "#449046", d: "#2c7040", // grass
+    w: "#f3efe2", y: "#e9a83a", p: "#e9809f", // petals, pistil
+    l: "#b0b4c4", m: "#8a8ea1", n: "#6a6d81", k: "#4f5265", // stone
+    f: "#e4f6ff", F: "#92cdef", // foam
+};
+const TRIMS = [
+    // Grass tufts.
+    ["...t...",
+     ".t.h.t.",
+     ".h.g.h.",
+     "hg.g.gh",
+     ".gdgdg.",
+     "..~~~.."],
+    ["..t...t..",
+     "..h.t.h..",
+     ".hg.h.gh.",
+     ".gg.g.gd.",
+     "..dgdgd..",
+     "...~~~..."],
+    [".t.t.",
+     ".h.h.",
+     "hg.gh",
+     ".dgd.",
+     ".~~~."],
+    // A flower clump.
+    ["..w....",
+     ".wyw.p.",
+     "..w.pyp",
+     "..g..p.",
+     ".hg.g..",
+     "..dgd..",
+     "...~~.."],
+    // Pebbles.
+    [".lm..",
+     "lmmn.",
+     ".nnk~",
+     "..~~."],
+    [".lm.....",
+     "lmmn.lm.",
+     ".nk~lmmn",
+     "..~~.nk~",
+     "......~~"],
+    ["lm....",
+     "nk~.lm",
+     ".~~.nk",
+     "lm...~",
+     "nk~...",
+     ".~~..."],
+    // Foam.
+    [".ff.",
+     "fFFf",
+     ".ff."],
+    ["..f...",
+     ".fFf.f",
+     "..f.fF",
+     "....f."],
+    [".f..f.",
+     "fFf.Ff",
+     ".f...."],
+];
+
+// Art smaller than a cell, centered in one.
+function trim(art) {
+    const [w, h] = [art[0].length, art.length];
+    for (const row of art) if (row.length !== w) throw new Error(`trim row ${JSON.stringify(row)} isn't ${w} wide`);
+    const [x0, y0] = [Math.floor((CELL - w) / 2), Math.floor((CELL - h) / 2)];
+    return fill((x, y) => {
+        const k = art[y - y0]?.[x - x0];
+        if (k === "~") return [0, 0, 0, Math.round(SHADOW * 255)];
+        return k && TRIM_LEGEND[k] ? rgb(TRIM_LEGEND[k]) : null;
+    });
+}
+
 export const SPRITES = { player: [PLAYER, PLAYER_LEGEND], npc: [NPC, NPC_LEGEND] };
 export { sprite };
 
@@ -735,6 +818,7 @@ export function sheet() {
     }
     put(0, 3, sprite(PLAYER, PLAYER_LEGEND));
     put(1, 3, sprite(NPC, NPC_LEGEND));
+    TRIMS.forEach((art, i) => put(2 + i, 3, trim(art)));
     return { width: W, height: H, pixels };
 }
 

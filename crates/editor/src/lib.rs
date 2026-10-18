@@ -712,6 +712,8 @@ impl Editor {
                 LayerFrame {
                     index: k,
                     tiles: meshes.tiles.clone(),
+                    fringes: meshes.fringes.clone(),
+                    trims: meshes.trims.clone(),
                     remembered: visible.clone(),
                     visible,
                     unknown: Canvas::new(&self.tileset),

@@ -12,6 +12,7 @@ pub mod camera;
 pub mod draw;
 pub mod entity;
 pub mod frame;
+pub mod fringe;
 pub mod input;
 pub mod layer;
 pub mod level;

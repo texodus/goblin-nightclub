@@ -1,6 +1,12 @@
 // Triangles in world space, drawn through a transform (see `Globals`),
 // each showing the tile sheet times its color. `fs_color` draws them into
 // a canvas; `fs_mask` fills them with 1.0 into a single-channel mask.
+//
+// A fringe (see `goblin_nightclub_core::fringe`) is tile art past the edge of its
+// tile: its cell repeats, and it's cut raggedly, pixel by pixel of the
+// art, out to a distance from its edge that varies with a noise pinned to
+// the world, so the cut is the same in every pass and doesn't crawl as the
+// view moves. Its outermost pixels have its color blended over them.
 
 struct Globals {
     // Size of the target in pixels.
@@ -30,6 +36,13 @@ struct VsOut {
     @location(1) uv: vec2<f32>,
     // Top-left of the cell `uv` is in, in pixels.
     @location(2) @interpolate(flat) cell: vec2<f32>,
+    // World position.
+    @location(3) world: vec2<f32>,
+    // For a fringe: a point on its edge and the edge's outward normal (or
+    // a zero normal to measure from the point), and how far it may reach;
+    // 0 for anything else.
+    @location(4) @interpolate(flat) edge: vec4<f32>,
+    @location(5) @interpolate(flat) reach: f32,
 };
 
 @vertex
@@ -38,6 +51,8 @@ fn vs_main(
     @location(1) uv: vec2<f32>,
     @location(2) cell: vec2<f32>,
     @location(3) color: vec4<f32>,
+    @location(4) edge: vec4<f32>,
+    @location(5) reach: f32,
 ) -> VsOut {
     // World -> target pixels (camera and zoom, then scale about the
     // center) -> clip space (origin top-left, y down).
@@ -48,7 +63,78 @@ fn vs_main(
     out.color = color;
     out.uv = uv;
     out.cell = cell;
+    out.world = world;
+    out.edge = edge;
+    out.reach = reach;
     return out;
+}
+
+// Mirrors goblin_nightclub_core::layer::TILE: world units a tile.
+const TILE: f32 = 10.0;
+
+// Size of the bumps along a fringe's ragged edge, in pixels of the art.
+const FRINGE_GRAIN: f32 = 3.0;
+
+fn hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(0.1031, 0.1030));
+    let r = q + dot(q, q.yx + 33.33);
+    return fract((r.x + r.y) * r.x);
+}
+
+// Smooth value noise in [0, 1], a lattice point every unit.
+fn value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash(i);
+    let b = hash(i + vec2(1.0, 0.0));
+    let c = hash(i + vec2(0.0, 1.0));
+    let d = hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// Does a fringe from `edge`, reaching at most `reach`, cover world point
+// `p`? Out to a fraction of `reach` that varies along the edge: decided
+// where `p` is level with on it, so it covers solidly in from its ragged
+// end, and strips along the same line, in neighboring tiles, line up. From
+// a point, the fraction is the point's: a strip's at its end.
+fn fringe_covers(p: vec2<f32>, edge: vec4<f32>, reach: f32) -> bool {
+    var d = distance(p, edge.xy);
+    var foot = edge.xy;
+    if dot(edge.zw, edge.zw) > 0.0 {
+        d = dot(p - edge.xy, edge.zw);
+        foot = p - edge.zw * d;
+    }
+    let q = foot * globals.cell / TILE / FRINGE_GRAIN;
+    let n = 0.65 * value_noise(q) + 0.35 * value_noise(q * 2.3 + 17.0);
+    // Spread out, as the noise mostly stays near its middle: often all
+    // the way, sometimes none of it.
+    return d <= reach * clamp(n * 2.2 - 0.55, 0.0, 1.0);
+}
+
+// A fringe at world point `world`: 0 where it's cut, 1 where it shows, 2
+// where it shows and the pixel of the art beyond it doesn't (its rim).
+// Whole pixels of the art: decided at each one's center.
+fn fringe_state(world: vec2<f32>, edge: vec4<f32>, reach: f32) -> u32 {
+    let art = globals.cell / TILE;
+    let p = (floor(world * art) + 0.5) / art;
+    if !fringe_covers(p, edge, reach) {
+        return 0u;
+    }
+    var out = edge.zw;
+    if dot(out, out) == 0.0 {
+        out = normalize(p - edge.xy + vec2(1e-6));
+    }
+    if fringe_covers(p + round(out) / art, edge, reach) {
+        return 1u;
+    }
+    return 2u;
+}
+
+// `uv` past the sides of its cell moved back in: the cell repeating.
+fn repeat(uv: vec2<f32>, cell: vec2<f32>) -> vec2<f32> {
+    let d = uv - cell;
+    return cell + d - floor(d / globals.cell) * globals.cell;
 }
 
 // The sheet's pixel at `uv`, nearest, clamped to the sheet.
@@ -64,18 +150,34 @@ fn texel(uv: vec2<f32>) -> vec4<f32> {
 // crisp pixels at zooms that aren't whole numbers, and doesn't shimmer as
 // it moves. Clamped inside the cell, so neighbors in the sheet don't bleed
 // in at a tile's edge.
-fn sharp(uv: vec2<f32>, cell: vec2<f32>) -> vec4<f32> {
+// With `repeats`, the cell repeats past its sides rather than clamping.
+fn sharp(uv: vec2<f32>, cell: vec2<f32>, repeats: bool) -> vec4<f32> {
     let size = vec2<f32>(textureDimensions(sheet));
     let edge = floor(uv + 0.5);
     let per_px = max(fwidth(uv), vec2(1e-4));
     var p = edge + clamp((uv - edge) / per_px, vec2(-0.5), vec2(0.5));
+    if repeats {
+        p = repeat(p, cell);
+    }
     p = clamp(p, cell + 0.5, cell + globals.cell - 0.5);
     return textureSampleLevel(sheet, filtered, p / size, 0.0);
 }
 
 @fragment
 fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
-    return sharp(in.uv, in.cell) * in.color;
+    let fringe = in.reach > 0.0;
+    let c = sharp(in.uv, in.cell, fringe);
+    if !fringe {
+        return c * in.color;
+    }
+    let state = fringe_state(in.world, in.edge, in.reach);
+    if state == 0u {
+        discard;
+    }
+    if state == 2u {
+        return vec4(mix(c.rgb, in.color.rgb, in.color.a), c.a);
+    }
+    return c;
 }
 
 @fragment
@@ -89,11 +191,18 @@ fn fs_mask_half() -> @location(0) vec4<f32> {
     return vec4(0.5);
 }
 
-// Clears a mask where a sprite is opaque: where something stands on a
-// layer, it isn't void.
+// Clears a mask where a sprite (or a fringe) is opaque: where something
+// stands on a layer, or covers its edge, it isn't void.
 @fragment
 fn fs_unmask(in: VsOut) -> @location(0) vec4<f32> {
-    if texel(in.uv).a < 0.5 {
+    var uv = in.uv;
+    if in.reach > 0.0 {
+        if fringe_state(in.world, in.edge, in.reach) == 0u {
+            discard;
+        }
+        uv = repeat(uv, in.cell);
+    }
+    if texel(uv).a < 0.5 {
         discard;
     }
     return vec4(0.0);

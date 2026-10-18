@@ -20,6 +20,7 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::draw::Canvas;
+use crate::fringe;
 use crate::layer::{Layer, Solid, Tile};
 use crate::mesh::Mesh;
 use crate::path;
@@ -82,6 +83,11 @@ pub struct Level {
 pub struct LayerMeshes {
     /// Its tiles' art.
     pub tiles: Arc<Mesh>,
+    /// Drawn over `tiles`: where materials meet, the fringes of the
+    /// higher-ranking ones (see [`crate::fringe`]), cut by the renderer.
+    pub fringes: Arc<Mesh>,
+    /// Drawn over `fringes`: trims scattered along material edges.
+    pub trims: Arc<Mesh>,
     /// Where it's void, liquid included.
     pub voids: Arc<Mesh>,
     /// Where it's liquid.
@@ -237,6 +243,20 @@ impl Level {
                     for y in ys {
                         for x in xs.clone() {
                             layer.draw_tile(tileset, canvas, x, y);
+                        }
+                    }
+                })),
+                fringes: Arc::new(Mesh::build(cols, rows, canvas(), |xs, ys, canvas| {
+                    for y in ys {
+                        for x in xs.clone() {
+                            fringe::draw_fringes(layer, tileset, canvas, x, y);
+                        }
+                    }
+                })),
+                trims: Arc::new(Mesh::build(cols, rows, canvas(), |xs, ys, canvas| {
+                    for y in ys {
+                        for x in xs.clone() {
+                            fringe::draw_trims(layer, tileset, canvas, x, y);
                         }
                     }
                 })),

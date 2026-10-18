@@ -12,8 +12,12 @@ use crate::mesh::Mesh;
 pub struct LayerFrame {
     /// Which layer (0 is the bottom).
     pub index: usize,
-    /// The layer's tiles, drawn under both `visible` and `remembered`.
+    /// The layer's tiles, then the fringes where materials meet and the
+    /// trims along their edges, drawn under both `visible` and
+    /// `remembered`. Wherever fringes and trims show, the layer isn't void.
     pub tiles: Arc<Mesh>,
+    pub fringes: Arc<Mesh>,
+    pub trims: Arc<Mesh>,
     /// Drawn over `tiles` where the viewer can currently see.
     pub visible: Canvas,
     /// Drawn over `tiles` where the viewer has seen before but can't now.

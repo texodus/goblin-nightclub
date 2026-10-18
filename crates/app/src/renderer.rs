@@ -369,6 +369,8 @@ const TILES: usize = 0;
 const VOIDS: usize = 1;
 const LIQUID: usize = 2;
 const SHAFT: usize = 3;
+const FRINGES: usize = 4;
+const TRIMS: usize = 5;
 
 /// What's sized to the screen, a layer each.
 struct Screen {
@@ -417,8 +419,9 @@ pub struct Renderer {
     /// What goes into those each frame, kept to reuse the memory.
     canvas_scratch: Vec<Vertex>,
     mask_scratch: Vec<Vertex>,
-    /// Per layer: its tiles, voids, liquid and shaft meshes, as last drawn.
-    meshes: Vec<[Option<Uploaded>; 4]>,
+    /// Per layer: its tiles, voids, liquid, shaft, fringes and trims
+    /// meshes, as last drawn.
+    meshes: Vec<[Option<Uploaded>; 6]>,
 }
 
 fn js_err(e: impl std::fmt::Display) -> JsError {
@@ -534,6 +537,8 @@ impl Renderer {
                 1 => Float32x2,
                 2 => Float32x2,
                 3 => Float32x4,
+                4 => Float32x4,
+                5 => Float32,
             ],
         };
         let triangles =
@@ -848,6 +853,8 @@ impl Renderer {
         let camera = frame.camera.map(|c| (c * zoom).round() / zoom);
         for l in &frame.layers {
             self.upload(l.index, TILES, &l.tiles);
+            self.upload(l.index, FRINGES, &l.fringes);
+            self.upload(l.index, TRIMS, &l.trims);
             self.upload(l.index, VOIDS, &l.voids);
             self.upload(l.index, LIQUID, &l.liquid);
             if let Some(shaft) = &l.shaft {
@@ -1063,7 +1070,14 @@ impl Renderer {
             let transform = &self.layer_transforms[a].bind_group;
             let flat = &self.world_transform.bind_group;
             let (canvas, masks) = (&self.canvas_vertices.buffer, &self.mask_vertices.buffer);
-            let tiles = mesh(a, TILES, &l.tiles, view);
+            // The tiles, then fringes and trims over them.
+            let mut tiles = mesh(a, TILES, &l.tiles, view);
+            let edging = [
+                mesh(a, FRINGES, &l.fringes, view),
+                mesh(a, TRIMS, &l.trims, view),
+            ]
+            .concat();
+            tiles.extend(edging.iter().cloned());
             for (i, range) in r.canvases.iter().enumerate() {
                 let attachment = wgpu::RenderPassColorAttachment {
                     view: &screen_textures.canvases.layers[3 * a + i],
@@ -1104,6 +1118,15 @@ impl Renderer {
                 transform,
                 None,
                 &mesh(a, LIQUID, &l.liquid, view),
+            );
+            // Fringes and trims cover the void and water they reach over.
+            pass(
+                &mut encoder,
+                keep(voids),
+                &self.unmask_pipeline,
+                transform,
+                None,
+                &edging,
             );
             // Then clear it again under whatever stands on the layer.
             pass(

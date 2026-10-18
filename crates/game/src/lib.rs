@@ -672,6 +672,8 @@ impl Game {
                 LayerFrame {
                     index: k,
                     tiles: meshes.tiles.clone(),
+                    fringes: meshes.fringes.clone(),
+                    trims: meshes.trims.clone(),
                     visible,
                     remembered,
                     unknown: Canvas::new(tileset),

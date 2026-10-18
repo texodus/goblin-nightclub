@@ -28,7 +28,8 @@ pub struct Mesh {
 impl Mesh {
     /// A mesh over a level `cols` x `rows` tiles, built a chunk at a time:
     /// `draw(columns, rows, canvas)` adds the triangles of the tiles in
-    /// those ranges, which must lie within them. `canvas` is empty to
+    /// those ranges, which must lie within them, or reach at most half a
+    /// tile past them (fringes and trims do). `canvas` is empty to
     /// start and sets which sheet the triangles draw from.
     pub fn build(
         cols: usize,
@@ -100,14 +101,17 @@ impl Mesh {
         0..self.vertices.len() as u32
     }
 
-    /// Ranges of the vertices covering every chunk that overlaps `rect`
-    /// (and maybe a little more): one range per row of chunks, as a row's
-    /// chunks lie side by side in `vertices`. Empty ranges are left out.
+    /// Ranges of the vertices covering every chunk whose triangles may
+    /// reach into `rect` (and maybe a little more): one range per row of
+    /// chunks, as a row's chunks lie side by side in `vertices`. Empty
+    /// ranges are left out.
     pub fn ranges(&self, rect: Rect) -> Vec<Range<u32>> {
         let size = CHUNK as f32 * TILE;
         let span = |axis: usize| {
-            let lo = (rect[0][axis] / size).floor().max(0.0);
-            let hi = (rect[1][axis] / size).ceil().min(self.chunks[axis] as f32);
+            let lo = ((rect[0][axis] - TILE / 2.0) / size).floor().max(0.0);
+            let hi = ((rect[1][axis] + TILE / 2.0) / size)
+                .ceil()
+                .min(self.chunks[axis] as f32);
             lo as usize..(hi as usize).max(lo as usize)
         };
         let (xs, ys) = (span(0), span(1));
@@ -162,9 +166,10 @@ mod tests {
         let size = CHUNK as f32 * TILE;
         let count = |r: Rect| -> u32 { mesh.ranges(r).iter().map(|r| r.end - r.start).sum() };
         let per_chunk = (CHUNK * CHUNK / 2 * 3) as u32;
-        // Inside the middle chunk of the top row.
+        // Inside the middle chunk of the top row, more than half a tile
+        // from its sides.
         assert_eq!(
-            count([[size + 1.0, 1.0], [2.0 * size - 1.0, 10.0]]),
+            count([[size + 6.0, 6.0], [2.0 * size - 6.0, 10.0]]),
             per_chunk
         );
         // Straddling the four chunks around a corner: two ranges.
@@ -173,7 +178,7 @@ mod tests {
         assert_eq!(count(corner), 4 * per_chunk);
         // Everything, and nothing past the level.
         assert_eq!(count(crate::camera::EVERYWHERE), mesh.all().end);
-        assert_eq!(count([[-50.0, -50.0], [-1.0, -1.0]]), 0);
+        assert_eq!(count([[-50.0, -50.0], [-6.0, -6.0]]), 0);
         assert_eq!(count([[1e4, 0.0], [2e4, 10.0]]), 0);
     }
 }
