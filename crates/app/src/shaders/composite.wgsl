@@ -26,11 +26,11 @@ struct Params {
     radius_min: f32,
     zoom: f32,
     seen_zoom: f32,
-    // 1 when the viewer is under the open sky: lower layers fade into fog
-    // instead of darkening.
+    // 1 when the viewer is under the open sky: the mist over lower layers
+    // is light instead of dark.
     outdoors: f32,
-    // The ground level: looking down from outdoors, layers at or above it
-    // fade into fog, those below darken.
+    // The ground level: looking down from outdoors, the mist over layers at
+    // or above it is light, over those below dark.
     ground: u32,
     // Layers below `ground` are seen this fraction as far.
     radius_underground: f32,
@@ -56,28 +56,67 @@ const RADIUS_FADE: f32 = 12.0;
 // and column of the 4x4 pattern has.
 const REMEMBERED_MIN: f32 = 0.15;
 
-// Indoors, brightness of each layer relative to the one above it.
-const LOWER_BRIGHTNESS: f32 = 0.55;
+// Between each layer and the one below it, seen down through its holes,
+// hangs a sheet of translucent mist, drawn with parallax halfway between
+// the two layers' (so it drifts against both as the view moves). Looking
+// down from outdoors into a layer above the ground it's light haze;
+// anywhere else (indoors, or into the ground) it's dark. Each layer down is
+// seen through one more sheet, so the deeper the fainter.
+const MIST_LIGHT: vec3<f32> = vec3(0.80, 0.85, 0.92);
+const MIST_DARK: vec3<f32> = vec3(0.04, 0.03, 0.09);
+// Average opacity of a sheet of each.
+const MIST_LIGHT_ALPHA: f32 = 0.28;
+const MIST_DARK_ALPHA: f32 = 0.45;
+// How much the opacity varies across a sheet of each, either way, as a
+// fraction of the average, and how much the billows' contrast is
+// stretched first (the noise mostly stays near its middle). Dark mist
+// over dark ground needs much more of both to show.
+const MIST_LIGHT_VARIATION: f32 = 0.6;
+const MIST_LIGHT_CONTRAST: f32 = 1.0;
+const MIST_DARK_VARIATION: f32 = 0.95;
+const MIST_DARK_CONTRAST: f32 = 1.0;
+// Size of the mist's billows, in world units (a tile is 10).
+const MIST_SCALE: f32 = 60.0;
+// Drift, in world units a second of play.
+const MIST_DRIFT: vec2<f32> = vec2(2.5, 1.0);
+// Opacity steps, for the banded look of 16-bit translucency.
+const MIST_STEPS: f32 = 6.0;
 
-// Outdoors, each layer down fades this much of the way toward fog.
-const FOG_PER_LAYER: f32 = 0.4;
-const FOG_COLOR: vec3<f32> = vec3(0.67, 0.67, 0.67);
+fn hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(0.1031, 0.1030));
+    let r = q + dot(q, q.yx + 33.33);
+    return fract((r.x + r.y) * r.x);
+}
 
-// Color `c` (premultiplied by `alpha`) of layer `a`, below the viewer's,
-// as seen from there: one step for each layer looked down through, in
-// order, so the effects compound. A step down into a layer above ground,
-// from outdoors, fades toward fog; any other step darkens.
-fn at_depth(c: vec3<f32>, a: u32, alpha: f32) -> vec3<f32> {
-    var out = c;
-    for (var j = params.top; j > a; j--) {
-        let into = j - 1u;
-        if params.outdoors > 0.5 && into >= params.ground {
-            out = mix(out, FOG_COLOR * alpha, FOG_PER_LAYER);
-        } else {
-            out *= LOWER_BRIGHTNESS;
-        }
-    }
-    return out;
+// Smooth value noise in [0, 1], a lattice point every unit.
+fn value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash(i);
+    let b = hash(i + vec2(1.0, 0.0));
+    let c = hash(i + vec2(0.0, 1.0));
+    let d = hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// Opacity of a mist sheet at world point `world` (on the sheet), out of 1 at the sheet's average opacity, varying by `variation`
+// either way after stretching the billows by `contrast`. In whole pixels
+// of the art, like the tiles.
+// Every sheet has the same pattern, drifting together: stacked down a deep
+// hole, drawn at each sheet's own parallax, its copies line up at the
+// view's center and part toward the edges, which shows the depth.
+fn mist_density(world: vec2<f32>, variation: f32, contrast: f32) -> f32 {
+    let p = floor(world * params.seen_zoom) / params.seen_zoom;
+    var q = (p + MIST_DRIFT * params.time) / MIST_SCALE;
+    // Warped a little, and each octave turned, so no grid shows.
+    q += 0.6 * vec2(value_noise(q * 0.8 + 3.1), value_noise(q * 0.8 + 7.9)) - 0.3;
+    let turn = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
+    let n = 0.5 * value_noise(q) + 0.3 * value_noise(turn * q * 2.1 + 5.2)
+        + 0.2 * value_noise(turn * turn * q * 4.3 + 1.7);
+    let stretched = clamp((2.0 * n - 1.0) * contrast, -1.0, 1.0);
+    let v = 1.0 + variation * stretched;
+    return round(v * MIST_STEPS) / MIST_STEPS;
 }
 
 @vertex
@@ -154,6 +193,18 @@ fn seen_at(a: u32, world: vec2<f32>) -> f32 {
     return 0.0;
 }
 
+// How much layer `a` at view pixel `px` and world point `world` is
+// visible now, and has been seen, with view `radius` and `through` as for
+// `shade`.
+fn knowledge(a: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec2<f32> {
+    var now = textureLoad(mask_now, px, a, 0).r;
+    if radius > 0.0 {
+        let dist = distance(world, params.origin);
+        now *= 1.0 - smoothstep(radius - RADIUS_FADE, radius, dist);
+    }
+    return vec2(now, max(seen_at(a, world), through));
+}
+
 // Layer `a` at view pixel `px` and world point `world`, styled by its
 // masks, with view `radius` (0 for unlimited). `through` is how much the
 // hole this pixel looks down has been seen: a lower layer is remembered
@@ -164,11 +215,9 @@ fn seen_at(a: u32, world: vec2<f32>) -> f32 {
 // the result is too; water is the translucent case.
 fn shade(a: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec3<f32> {
     let dist = distance(world, params.origin);
-    var now = textureLoad(mask_now, px, a, 0).r;
-    let seen = max(seen_at(a, world), through);
-    if radius > 0.0 {
-        now *= 1.0 - smoothstep(radius - RADIUS_FADE, radius, dist);
-    }
+    let known = knowledge(a, px, world, radius, through);
+    let now = known.x;
+    let seen = known.y;
     let visible = style_visible(textureLoad(canvases, px, 3u * a, 0).rgb, dist, radius);
     // Pixel of the art, wrapped to the dither pattern (it can be negative
     // beyond the level's edge on lower layers).
@@ -189,8 +238,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // How much the hole looked down has been seen: the least `seen` of the
     // void passed through, on the way down.
     var through = 1.0;
-    // Water passed through tints what's beneath: the color gathered so far,
-    // and how much of what's beneath still shows.
+    // Front to back: the color gathered so far (premultiplied), and how
+    // much of what's beneath still shows through the water and mist above.
     var color = vec3(0.0);
     var remaining = 1.0;
     for (var d = 0u; d <= params.top; d++) {
@@ -200,23 +249,38 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         let world = params.camera + (center + (frag.xy - center) / scale) / params.zoom;
         let mask = textureLoad(voids, px, a, 0).r;
-        if mask > 0.25 {
-            if mask < 0.75 {
-                // Water: its styled (premultiplied) color over what's below.
-                let below = select(0.0, through, d > 0u);
-                let alpha = textureLoad(canvases, px, 3u * a, 0).a;
-                let styled = shade(a, px, world, radius_at(a, d), below);
-                color += at_depth(styled, a, alpha) * remaining;
-                remaining *= 1.0 - alpha;
-            }
-            through = min(through, seen_at(a, world));
-            scale *= params.scale;
-            continue;
-        }
         let below = select(0.0, through, d > 0u);
-        let styled = shade(a, px, world, radius_at(a, d), below);
-        color += at_depth(styled, a, 1.0) * remaining;
-        return vec4(color, 1.0);
+        let radius = radius_at(a, d);
+        if mask <= 0.25 {
+            color += shade(a, px, world, radius, below) * remaining;
+            return vec4(color, 1.0);
+        }
+        if mask < 0.75 {
+            // Water: its styled (premultiplied) color over what's below.
+            let alpha = textureLoad(canvases, px, 3u * a, 0).a;
+            color += shade(a, px, world, radius, below) * remaining;
+            remaining *= 1.0 - alpha;
+        }
+        through = min(through, seen_at(a, world));
+        // The mist down this hole, onto the next layer: there only where
+        // the hole is known, in the remembered style's gray where it isn't
+        // in view.
+        if a > 0u && ((params.present >> (a - 1u)) & 1u) != 0u {
+            let sheet = scale * sqrt(params.scale);
+            let at = params.camera + (center + (frag.xy - center) / sheet) / params.zoom;
+            let light = params.outdoors > 0.5 && a - 1u >= params.ground;
+            let tint = select(MIST_DARK, MIST_LIGHT, light);
+            let opacity = select(MIST_DARK_ALPHA, MIST_LIGHT_ALPHA, light);
+            let known = knowledge(a, px, world, radius, below);
+            let gray = vec3(luminance(tint) * 0.75);
+            let variation = select(MIST_DARK_VARIATION, MIST_LIGHT_VARIATION, light);
+            let contrast = select(MIST_DARK_CONTRAST, MIST_LIGHT_CONTRAST, light);
+            let density = mist_density(at, variation, contrast);
+            let alpha = clamp(opacity * density, 0.0, 1.0) * max(known.x, known.y);
+            color += mix(gray, tint, known.x) * alpha * remaining;
+            remaining *= 1.0 - alpha;
+        }
+        scale *= params.scale;
     }
     return vec4(color, 1.0);
 }

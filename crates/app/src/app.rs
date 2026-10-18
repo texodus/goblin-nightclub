@@ -10,7 +10,7 @@ use goblin_nightclub_core::layer::Corner;
 use goblin_nightclub_core::level_file::LevelFile;
 use goblin_nightclub_core::tileset::{Sheet, Tileset};
 use goblin_nightclub_core::{HEIGHT, WIDTH};
-use goblin_nightclub_editor::{self as editor, BrushShape, Editor, Tool};
+use goblin_nightclub_editor::{BrushShape, Editor, Tool};
 use goblin_nightclub_game::Game;
 use goblin_nightclub_generate::Params;
 
@@ -138,13 +138,21 @@ impl App {
         Ok(())
     }
 
-    /// Open the editor, on the level last edited, or a new one.
-    pub fn editor(&mut self) {
+    /// Open the editor, on the level last edited, or else on a newly
+    /// generated world from `seed`, the same as a new game's, with
+    /// generation parameters given as JSON (see [`Params`]; any left out,
+    /// or all of them without `params`, take their defaults).
+    pub fn editor(&mut self, seed: u32, params: Option<String>) -> Result<(), JsError> {
         if self.editor.is_none() {
-            let (cols, rows, depth) = (editor::NEW_COLS, editor::NEW_ROWS, editor::NEW_LAYERS);
-            self.editor_new(cols, rows, depth);
+            let params: Params = match params {
+                Some(json) => serde_json::from_str(&json).map_err(js_err)?,
+                None => Params::default(),
+            };
+            let world = goblin_nightclub_game::new_world(seed, &params);
+            self.editor = Some(Editor::from_file(&world, self.view()));
         }
         self.switch(Mode::Editor);
+        Ok(())
     }
 
     /// Try out the level being edited, from its spawn.
@@ -192,7 +200,7 @@ impl App {
             .map(|e| serde_json::to_string(&e.swatches()).unwrap())
     }
 
-    /// The editor's settings, as JSON (see [`editor::State`]).
+    /// The editor's settings, as JSON (see [`goblin_nightclub_editor::State`]).
     pub fn editor_state(&self) -> Option<String> {
         self.editor
             .as_ref()

@@ -12,9 +12,9 @@
 //! of those drawn through the camera, only the chunks in view are drawn.
 //!
 //! Then it composites to the screen, from the viewer's layer down through
-//! void, styling each pixel by its layer's masks, and draws the overlay
-//! (world space, on the viewer's layer) and the interface (view space) on
-//! top. `seen` is kept in world space so it survives camera moves, zooming
+//! void (and the mist hanging between the layers), styling each pixel by
+//! its layer's masks, and draws the overlay (world space, on the viewer's
+//! layer) and the interface (view space) on top. `seen` is kept in world space so it survives camera moves, zooming
 //! and the viewer changing layers; it's sized to the level on the first
 //! frame. Everything else is sized to the screen, at its own resolution,
 //! and made again when that changes.
@@ -69,9 +69,11 @@ struct CompositeParams {
     radius_min: f32,
     zoom: f32,
     seen_zoom: f32,
-    /// 1 when the viewer is outdoors (lower layers fog rather than dim).
+    /// 1 when the viewer is outdoors (light mist over lower layers, not
+    /// dark).
     outdoors: f32,
-    /// The ground level: layers below it darken even outdoors.
+    /// The ground level: the mist over layers below it is dark even
+    /// outdoors.
     ground: u32,
     /// Layers below `ground` are seen this fraction as far.
     radius_underground: f32,

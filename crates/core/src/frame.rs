@@ -72,11 +72,12 @@ pub struct Frame {
     pub cell: u32,
     /// Screen pixels per interface pixel, for `ui`.
     pub ui_scale: f32,
-    /// Is the viewer under the open sky? Then layers below fade into fog
-    /// instead of darkening.
+    /// Is the viewer under the open sky? Then the mist over layers below is
+    /// light instead of dark.
     pub outdoors: bool,
     /// The ground level: the lowest layer under the open sky. Looking down
-    /// from outdoors, layers at or above it fog; those below darken.
+    /// from outdoors, the mist over layers at or above it is light, over
+    /// those below dark.
     pub ground: usize,
     /// Size of the level, in world units.
     pub world: [f32; 2],

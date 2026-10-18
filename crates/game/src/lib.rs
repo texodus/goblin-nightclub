@@ -90,9 +90,12 @@ const LEVEL_ROWS: usize = 60;
 /// How far the player can see, in pixels, indoors: under a floor or wall
 /// of some layer above. `f32::INFINITY` is unlimited.
 const VIEW_RADIUS: f32 = 96.0;
+const VIEW_RADIUS_OUTDOORS_FACTOR: f32 = 5.0;
+
 /// How far outdoors: on the top layer, or with nothing but void (or
 /// water, or stairs) directly above on every layer up to it.
-const VIEW_RADIUS_OUTDOORS: f32 = 5.0 * VIEW_RADIUS;
+const VIEW_RADIUS_OUTDOORS: f32 = VIEW_RADIUS_OUTDOORS_FACTOR * VIEW_RADIUS;
+
 /// Looking down, each layer below the player's is seen this much less far,
 /// down to `VIEW_RADIUS_MIN`.
 const VIEW_RADIUS_STEP: f32 = 16.0;
@@ -100,7 +103,7 @@ const VIEW_RADIUS_MIN: f32 = 2.0 * TILE;
 
 /// From outdoors, layers below the ground level are seen only this
 /// fraction as far (after the step per layer).
-const UNDERGROUND_FROM_ABOVE: f32 = 1.0 / 5.0;
+const UNDERGROUND_FROM_ABOVE: f32 = 1.0 / VIEW_RADIUS_OUTDOORS_FACTOR;
 
 /// View distance for a layer `depth` layers below the player's, from a
 /// `base` radius (indoors or out), `underground` if the layer is below
@@ -123,15 +126,19 @@ const NPC_SPAWN_DIST: f32 = 60.0;
 const BUTTON_SIZE: [f32; 2] = [14.0, 12.0];
 const BUTTON_MARGIN: f32 = 3.0;
 
+/// A newly generated world, from `seed`: the level a new game is played
+/// on, with the player starting in its middle, on the plains.
+pub fn new_world(seed: u32, params: &Params) -> LevelFile {
+    let (cols, rows) = (LEVEL_COLS, LEVEL_ROWS);
+    let spawn = [(cols / 2) as f32 * TILE, (rows / 2) as f32 * TILE];
+    goblin_nightclub_generate::world(seed, cols, rows, spawn, params)
+}
+
 impl Game {
-    /// A new game on a generated level, seen through a view `width` x
-    /// `height` pixels.
+    /// A new game on a newly generated world (see [`new_world`]), seen
+    /// through a view `width` x `height` pixels.
     pub fn new(width: f32, height: f32, seed: u32, params: &Params) -> Self {
-        let (cols, rows) = (LEVEL_COLS, LEVEL_ROWS);
-        // Spawn in the middle tile, on the plains.
-        let spawn = [(cols / 2) as f32 * TILE, (rows / 2) as f32 * TILE];
-        let file = goblin_nightclub_generate::world(seed, cols, rows, spawn, params);
-        Self::from_file(&file, [width, height], seed)
+        Self::from_file(&new_world(seed, params), [width, height], seed)
     }
 
     /// A game on a level file (generated or saved), the player at its
@@ -1195,8 +1202,8 @@ mod tests {
         below_ground.observe();
         assert!(!below_ground.outdoors());
         assert_eq!(below_ground.visions[0].radius(), VIEW_RADIUS);
-        // The renderer is told, so it can fog the layers below, down to the
-        // ground level.
+        // The renderer is told, so it can put light mist over the layers
+        // below, down to the ground level.
         assert!(top.frame().outdoors);
         assert_eq!(
             top.frame().ground,

@@ -31,8 +31,9 @@ pub struct LevelFile {
     pub rows: usize,
     pub spawn: Spawn,
     /// The ground level: the lowest layer under the open sky. Layers below
-    /// it are underground, and darken rather than fog when looked down to
-    /// from outdoors. 0 puts the whole level above ground.
+    /// it are underground: looked down to from outdoors, they're seen
+    /// through dark mist rather than light. 0 puts the whole level above
+    /// ground.
     pub ground: usize,
     /// How the player and the NPCs are drawn.
     pub player: Character,

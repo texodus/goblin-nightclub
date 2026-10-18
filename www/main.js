@@ -147,10 +147,18 @@ async function main() {
                 show("game");
                 break;
             }
-            case "editor":
-                app.editor();
+            case "editor": {
+                // A new world to edit, as for a new game (see above).
+                const params = new URLSearchParams(location.search).get("params");
+                try {
+                    app.editor(seed(), params ?? undefined);
+                } catch (err) {
+                    warn(`Bad generation parameters: ${err.message ?? err}`);
+                    return;
+                }
                 show("editor");
                 break;
+            }
             case "load": {
                 const text = await pickFile();
                 if (text === null) return;

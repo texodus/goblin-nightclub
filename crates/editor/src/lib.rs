@@ -29,11 +29,6 @@ use goblin_nightclub_core::level_file::{Character, LevelFile, Spawn};
 use goblin_nightclub_core::palette::{self, Color};
 use goblin_nightclub_core::tileset::Tileset;
 
-/// A size for new levels.
-pub const NEW_COLS: usize = 64;
-pub const NEW_ROWS: usize = 40;
-pub const NEW_LAYERS: usize = 3;
-
 /// Steps of undo kept.
 const UNDO_LIMIT: usize = 100;
 
@@ -240,9 +235,7 @@ impl Editor {
             undo: Vec::new(),
             redo: Vec::new(),
         };
-        editor
-            .camera
-            .center_on([cols as f32 * TILE / 2.0, rows as f32 * TILE / 2.0]);
+        editor.camera.center_on(file.spawn.pos);
         editor
     }
 
