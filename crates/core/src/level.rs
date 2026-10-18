@@ -54,7 +54,7 @@ pub fn can_stand(
 
 /// Tiles a level may have per layer: the renderer keeps a level-sized mask
 /// of what's been seen on each layer, a byte per pixel.
-pub const MAX_TILES: usize = 128 * 128;
+pub const MAX_TILES: usize = 128 * 128 * 4;
 
 pub struct Level {
     layers: Vec<Layer>,

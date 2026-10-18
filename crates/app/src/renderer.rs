@@ -32,7 +32,7 @@ const MASK_SAMPLES: u32 = 4;
 
 /// Scale of each layer relative to the one above it, at the default
 /// zoom. See [`parallax`] for other zooms.
-const PARALLAX: f32 = 0.95;
+const PARALLAX: f32 = 0.925;
 
 /// How much the parallax is normalized against zooming out, 0 to 1. At 1
 /// its strength shrinks in step with the zoom, so a layer's shift at the
@@ -40,7 +40,7 @@ const PARALLAX: f32 = 0.95;
 /// default zoom. At 0 the strength is [`PARALLAX`] at every zoom, so the
 /// shift at the edge grows as the view widens. Zooming in never changes
 /// it.
-const PARALLAX_NORMALIZATION: f32 = 0.5;
+const PARALLAX_NORMALIZATION: f32 = 1.0;
 
 /// The scale of each layer relative to the one above it at `zoom` screen
 /// pixels a world unit, where `default_zoom` is the zoom the art is drawn

@@ -81,8 +81,8 @@ const PLAYER_SPEED: f32 = 60.0;
 const AUTO_PAUSE: bool = true;
 
 /// Size of a generated level, in tiles.
-const LEVEL_COLS: usize = 96;
-const LEVEL_ROWS: usize = 60;
+const LEVEL_COLS: usize = 192;
+const LEVEL_ROWS: usize = 120;
 
 /// How far the player can see, in pixels, indoors: under a floor or wall
 /// of some layer above. `f32::INFINITY` is unlimited.
