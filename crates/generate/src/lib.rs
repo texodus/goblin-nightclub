@@ -196,10 +196,7 @@ pub fn world(seed: u32, cols: usize, rows: usize, spawn: [f32; 2], params: &Para
         cols,
         rows,
         &layers,
-        Spawn {
-            layer: spawn_layer(&params).min(layers.len() - 1),
-            tile: spawn,
-        },
+        Spawn::at_tile(spawn_layer(&params).min(layers.len() - 1), spawn),
         tileset().clone(),
         PLAYER_SPRITE,
         NPC_SPRITE,
@@ -2139,7 +2136,7 @@ mod tests {
         let file = super::world(7, COLS, ROWS, SPAWN, &p);
         assert_eq!(file.tileset, *tileset());
         assert_eq!(file.spawn.layer, spawn_layer(&p));
-        assert_eq!(file.spawn.tile, spawn_tile());
+        assert_eq!(file.spawn, Spawn::at_tile(spawn_layer(&p), spawn_tile()));
         assert_eq!(file.ground, ground_layer(&p));
         assert!(file.tileset.sprite(&file.player.sprite).is_some());
         assert!(file.tileset.sprite(&file.npc.sprite).is_some());

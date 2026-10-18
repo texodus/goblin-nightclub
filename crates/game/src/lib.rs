@@ -2,7 +2,7 @@
 
 use goblin_nightclub_core::camera::Camera;
 use goblin_nightclub_core::draw::Canvas;
-use goblin_nightclub_core::entity::{Entity, EntityId, Kind};
+use goblin_nightclub_core::entity::{Entity, EntityId, Kind, PLAYER_SIZE};
 use goblin_nightclub_core::frame::{Frame, LayerFrame};
 pub use goblin_nightclub_core::input::Input;
 use goblin_nightclub_core::layer::{Dir, Shape, Solid, TILE, quarter_shapes};
@@ -75,8 +75,7 @@ struct Route {
     stalled: f32,
 }
 
-const PLAYER_SIZE: [f32; 2] = [8.0, 8.0];
-const PLAYER_SPEED: f32 = 90.0;
+const PLAYER_SPEED: f32 = 60.0;
 
 /// Pause on reaching the destination.
 const AUTO_PAUSE: bool = true;
@@ -89,7 +88,7 @@ const LEVEL_ROWS: usize = 60;
 /// of some layer above. `f32::INFINITY` is unlimited.
 const VIEW_RADIUS: f32 = 96.0;
 /// How far outdoors: on the top layer, or with nothing but void (or
-/// water) directly above on every layer up to it.
+/// water, or stairs) directly above on every layer up to it.
 const VIEW_RADIUS_OUTDOORS: f32 = 5.0 * VIEW_RADIUS;
 /// Looking down, each layer below the player's is seen this much less far,
 /// down to `VIEW_RADIUS_MIN`.
@@ -135,11 +134,8 @@ impl Game {
     /// A game on a level file (generated or saved), the player at its
     /// spawn, drawn with the sprites it names. It starts paused.
     pub fn from_file(file: &LevelFile, view: [f32; 2], seed: u32) -> Self {
-        let [x, y] = file.spawn.tile;
-        let player = [
-            x as f32 * TILE + (TILE - PLAYER_SIZE[0]) / 2.0,
-            y as f32 * TILE + (TILE - PLAYER_SIZE[1]) / 2.0,
-        ];
+        let [x, y] = file.spawn.pos;
+        let player = [x - PLAYER_SIZE[0] / 2.0, y - PLAYER_SIZE[1] / 2.0];
         let sprites = Sprites::from_file(file);
         let mut game =
             Self::with_level_at(file.level(), file.spawn.layer, player, sprites, view, seed);
@@ -253,7 +249,7 @@ impl Game {
             self.paused = !self.paused;
             return;
         }
-        self.walk_to(tile_of(self.to_world(p)));
+        self.walk_to(self.to_world(p));
     }
 
     /// Screen pixels per interface pixel; see [`Camera::ui_scale`].
@@ -281,43 +277,62 @@ impl Game {
         self.camera.to_world(p)
     }
 
-    /// Plan a walk to tile `goal` on the player's layer and set off. Plans
-    /// on what the player knows: unexplored tiles are assumed walkable.
-    /// Known void is ignored (no clicking through holes); a known wall
-    /// sends the player as near it as they can get.
-    fn walk_to(&mut self, goal: [i32; 2]) {
+    /// Plan a walk to world point `p` on the player's layer and set off.
+    /// Plans on what the player knows: unexplored tiles are assumed
+    /// walkable. A click on known void is ignored (no clicking through
+    /// holes, or into water). Where the player's box fits at `p`, the walk
+    /// ends exactly there, by the straightest way; where it doesn't (a
+    /// wall, the edge of a 45-degree tile) it ends as near as the box
+    /// gets.
+    fn walk_to(&mut self, p: [f32; 2]) {
+        let goal = tile_of(p);
         let layer = self.level.layer(self.top);
         if !layer.in_bounds(goal) {
             return;
         }
         let known = self.visions[self.top].is_explored(goal[0] as usize, goal[1] as usize);
-        let void = layer.tile(goal[0], goal[1]).void() != Solid::None;
-        if known && void && !self.walkable(goal, goal) {
+        if known && layer.is_void_at(p) {
             return;
         }
-        let start = tile_of(center(self.player, PLAYER_SIZE));
-        let goal = if self.walkable(goal, goal) {
-            goal
-        } else {
-            match path::nearest_reachable(|t| self.walkable(t, goal), start, goal) {
-                Some(g) => g,
-                None => return,
+        let from = center(self.player, PLAYER_SIZE);
+        let start = tile_of(from);
+        // The tile the player stands on is fine (even if it's stairs).
+        let ground = |t: [i32; 2]| {
+            if t == start {
+                Solid::None
+            } else {
+                self.known_solid(t, goal)
             }
         };
-        // The tile the player stands on is fine (even if it's stairs).
-        let passable = |t: [i32; 2]| t == start || self.walkable(t, goal);
-        let Some(tiles) = path::find(passable, start, goal) else {
+        // A tile to route to: the nearest reachable one from which `p` can
+        // be reached straight (if the box fits at `p` at all), else just
+        // the nearest.
+        let fits = path::fits(&ground, p, PLAYER_SIZE);
+        let candidates = path::reachable(ground, start, p);
+        let straight = |t: &[i32; 2]| path::clear(&ground, path::center(*t), p, PLAYER_SIZE);
+        let target = fits
+            .then(|| candidates.iter().take(12).copied().find(straight))
+            .flatten()
+            .or(candidates.first().copied());
+        let Some(target) = target else {
             return;
         };
-        let mut waypoints = path::smooth(
-            passable,
-            center(self.player, PLAYER_SIZE),
-            &tiles,
-            PLAYER_SIZE,
-        );
+        let Some(tiles) = path::find(ground, start, target) else {
+            return;
+        };
+        // The way: tile centers, then the point itself, or as far toward it
+        // as the box gets; straightened so the point is approached directly
+        // rather than via the last center.
+        let mut points: Vec<[f32; 2]> = tiles.iter().skip(1).map(|t| path::center(*t)).collect();
+        let last = points.last().copied().unwrap_or(from);
+        if fits && path::clear(&ground, last, p, PLAYER_SIZE) {
+            points.push(p);
+        } else if let Some(stop) = path::approach(&ground, last, p, PLAYER_SIZE) {
+            points.push(stop);
+        }
+        let waypoints = path::smooth(ground, from, &points, PLAYER_SIZE);
         if waypoints.is_empty() {
-            // Already on the goal tile: settle on its center.
-            waypoints.push(path::center(goal));
+            return;
         }
         self.route = Some(Route {
             tiles,
@@ -328,19 +343,23 @@ impl Game {
         self.paused = false;
     }
 
-    /// Can a route on the player's layer cross tile `t`, as far as the
-    /// player knows? Unexplored tiles are assumed walkable. Stairs only as
-    /// the `goal`, so a walk never changes layer on the way.
-    fn walkable(&self, t: [i32; 2], goal: [i32; 2]) -> bool {
+    /// What a route on the player's layer knows is solid in tile `t`:
+    /// nothing where unexplored (assumed walkable), everything outside the
+    /// level and on stairs (except as the `goal`, so a walk never changes
+    /// layer on the way), else the movement grid's shape, so a 45-degree
+    /// tile is crossed only where it's open.
+    fn known_solid(&self, t: [i32; 2], goal: [i32; 2]) -> Solid {
         let layer = self.level.layer(self.top);
         if !layer.in_bounds(t) {
-            return false;
+            return Solid::Full;
         }
         if layer.tile(t[0], t[1]).stairs().is_some() {
-            return t == goal;
+            return if t == goal { Solid::None } else { Solid::Full };
         }
-        !self.visions[self.top].is_explored(t[0] as usize, t[1] as usize)
-            || self.level.movement(self.top).is_open(t[0], t[1])
+        if !self.visions[self.top].is_explored(t[0] as usize, t[1] as usize) {
+            return Solid::None;
+        }
+        self.level.movement(self.top).solid(t[0], t[1])
     }
 
     /// Head for the next waypoint, sliding along anything in the way.
@@ -368,6 +387,14 @@ impl Game {
             0.0
         };
         if (target[0] - now[0]).hypot(target[1] - now[1]) < 0.5 {
+            // Arrived: on the point exactly, since the leg was swept clear.
+            let exact = [
+                target[0] - PLAYER_SIZE[0] / 2.0,
+                target[1] - PLAYER_SIZE[1] / 2.0,
+            ];
+            if !self.level.movement(self.top).collides(exact, PLAYER_SIZE) {
+                self.player = exact;
+            }
             route.next += 1;
         }
     }
@@ -391,12 +418,18 @@ impl Game {
         let goal = *route.tiles.last().unwrap();
         let at = center(self.player, PLAYER_SIZE);
         let here = path::tiles_under(at, PLAYER_SIZE);
-        let passable = |t: [i32; 2]| here.contains(&t) || self.walkable(t, goal);
+        let ground = |t: [i32; 2]| {
+            if here.contains(&t) {
+                Solid::None
+            } else {
+                self.known_solid(t, goal)
+            }
+        };
         let stops = std::iter::once(at).chain(route.waypoints[route.next..].iter().copied());
         let legs: Vec<[f32; 2]> = stops.collect();
         let blocked = legs
             .windows(2)
-            .any(|w| !path::clear(&passable, w[0], w[1], PLAYER_SIZE));
+            .any(|w| !path::clear(&ground, w[0], w[1], PLAYER_SIZE));
         if blocked || route.stalled > 0.3 {
             self.route = None;
             self.paused = true;
@@ -469,7 +502,7 @@ impl Game {
             }
             at = w;
         }
-        let goal = path::center(*route.tiles.last().unwrap());
+        let goal = *route.waypoints.last().unwrap();
         let corner = [snap(goal[0] - 2.5), snap(goal[1] - 2.5)];
         canvas.outline(corner, [5.0, 5.0], px, palette::YELLOW);
         canvas
@@ -501,13 +534,18 @@ impl Game {
     }
 
     /// Is the player under the open sky: on a layer at or above the ground
-    /// level, and on the top layer or under void (or water) on every layer
-    /// above theirs? Underground, even a shaft of daylight from above
-    /// doesn't count.
+    /// level, and on the top layer or under void (or water) or stairs on
+    /// every layer above theirs? Stairs don't count as a roof (standing on
+    /// a ramp's foot, its top is right overhead), but floors and walls do.
+    /// Underground, even a shaft of daylight from above doesn't count.
     pub fn outdoors(&self) -> bool {
         let c = center(self.player, PLAYER_SIZE);
-        self.top >= self.ground
-            && (self.top + 1..self.level.depth()).all(|k| self.level.layer(k).is_void_at(c))
+        let [x, y] = tile_of(c);
+        let open = |k: usize| {
+            let layer = self.level.layer(k);
+            layer.is_void_at(c) || layer.tile(x, y).stairs().is_some()
+        };
+        self.top >= self.ground && (self.top + 1..self.level.depth()).all(open)
     }
 
     /// Recompute what the player sees and remembers, on their layer and on
@@ -829,6 +867,137 @@ mod tests {
         assert_eq!(game.layer(), 1);
     }
 
+    /// Along a chamfered shore the route steps diagonally over the
+    /// shore tiles' open halves instead of going around them.
+    #[test]
+    fn routes_cut_past_chamfered_corners() {
+        // (0,0) is water in its top-left half: the step from (0,1) to (1,0)
+        // clips its open corner.
+        let shore = level(&[&["◜..", "...", "..."]]);
+        let mut g = game(shore, [0, 1]);
+        click_world(&mut g, path::center([1, 0]));
+        assert_eq!(
+            g.route.as_ref().unwrap().tiles.len(),
+            2,
+            "one diagonal step"
+        );
+        // Whole water there: around.
+        let lake = level(&[&["≈..", "...", "..."]]);
+        let mut g = game(lake, [0, 1]);
+        click_world(&mut g, path::center([1, 0]));
+        assert_eq!(g.route.as_ref().unwrap().tiles.len(), 3);
+    }
+
+    /// A walk ends exactly where the click was, if the box fits there:
+    /// anywhere in a tile, or over the open half of a 45-degree tile.
+    #[test]
+    fn clicks_land_exactly_where_they_point() {
+        let l = level(&[&["......", "......", "......", "......"]]);
+        let mut g = game(l, [1, 1]);
+        let p = [43.3, 27.7];
+        click_world(&mut g, p);
+        let waypoints = g.route.as_ref().unwrap().waypoints.clone();
+        assert_eq!(
+            waypoints.len(),
+            1,
+            "straight there, no tile center on the way: {waypoints:?}"
+        );
+        let last = waypoints[0];
+        assert!(
+            (last[0] - p[0]).abs() < 1e-3 && (last[1] - p[1]).abs() < 1e-3,
+            "{last:?}"
+        );
+        // The destination marker (the outline drawn last: four strips of
+        // two triangles) sits on the point, not its tile's center.
+        let overlay = g.overlay();
+        let marker = &overlay.vertices[overlay.vertices.len() - 24..];
+        let xs: Vec<f32> = marker.iter().map(|v| v.pos[0]).collect();
+        let (x0, x1) = (
+            xs.iter().copied().fold(f32::MAX, f32::min),
+            xs.iter().copied().fold(f32::MIN, f32::max),
+        );
+        assert!(
+            ((x0 + x1) / 2.0 - p[0]).abs() < 1.0,
+            "marker at {}..{}",
+            x0,
+            x1
+        );
+        for _ in 0..600 {
+            if g.paused {
+                break;
+            }
+            g.update(1.0 / 60.0);
+        }
+        assert!(g.paused && g.route.is_none());
+        let c = center(g.player, PLAYER_SIZE);
+        assert!(
+            (c[0] - p[0]).abs() < 1e-3 && (c[1] - p[1]).abs() < 1e-3,
+            "{c:?}"
+        );
+        // Over a shore tile's open half, where the box just fits (its far
+        // corner touching the water's edge).
+        let shore = level(&[&["......", "...◜..", "......"]]);
+        let mut g = game(shore, [1, 1]);
+        let p = [39.0, 19.0];
+        click_world(&mut g, p);
+        let last = *g.route.as_ref().unwrap().waypoints.last().unwrap();
+        assert!(
+            (last[0] - p[0]).abs() < 1e-3 && (last[1] - p[1]).abs() < 1e-3,
+            "{last:?}"
+        );
+        for _ in 0..600 {
+            if g.paused {
+                break;
+            }
+            g.update(1.0 / 60.0);
+        }
+        let c = center(g.player, PLAYER_SIZE);
+        assert!(
+            (c[0] - p[0]).abs() < 1e-3 && (c[1] - p[1]).abs() < 1e-3,
+            "{c:?}"
+        );
+        assert!(!g.level.movement(0).collides(g.player, PLAYER_SIZE));
+    }
+
+    /// Clicking where the box doesn't fit (the edge of a 45-degree tile)
+    /// walks as near as it gets; clicking void (or water) does nothing.
+    #[test]
+    fn clicking_a_half_tile_walks_to_its_edge() {
+        let l = level(&[&["#######", "...◜...", "#######"]]);
+        let mut g = game(l, [1, 1]);
+        // (3,1) is water in its top-left half: no standing on it, but the
+        // box gets a pixel closer than (2,1)'s center before it touches.
+        click_world(&mut g, [38.0, 18.0]);
+        let route = g.route.as_ref().unwrap();
+        assert_eq!(
+            *route.tiles.last().unwrap(),
+            [2, 1],
+            "the nearest whole tile"
+        );
+        let last = *route.waypoints.last().unwrap();
+        assert!(last[0] > 25.0 && last[0] < 27.0, "{last:?}");
+        for _ in 0..600 {
+            if g.paused {
+                break;
+            }
+            g.update(1.0 / 60.0);
+        }
+        assert!(g.paused);
+        let c = center(g.player, PLAYER_SIZE);
+        assert!(c[0] > 25.5 && c[0] <= 26.0 + 1e-3, "{c:?}");
+        assert!(!g.level.movement(0).collides(g.player, PLAYER_SIZE));
+        // The water half itself: ignored.
+        click_world(&mut g, [31.0, 11.0]);
+        assert!(g.route.is_none() && g.paused);
+        // A rim: the hole's half is ignored, the floor's half walks there.
+        let rim = level(&[&["....", "....", "...."], &["....", ".▛..", "...."]]);
+        let mut g = game(rim, [3, 1]);
+        click_world(&mut g, [18.0, 18.0]);
+        assert!(g.route.is_none(), "clicked the hole");
+        click_world(&mut g, [12.0, 12.0]);
+        assert!(g.route.is_some(), "clicked the floor");
+    }
+
     #[test]
     fn camera_pans_independently_and_freely() {
         let rows: Vec<String> = (0..40).map(|_| ".".repeat(64)).collect();
@@ -983,6 +1152,15 @@ mod tests {
         assert_eq!(player_tile(&inside), [5, 0]);
         assert!(inside.outdoors());
         assert_eq!(inside.visions[1].radius(), VIEW_RADIUS_OUTDOORS);
+        // Stairs overhead (the top of a ramp whose foot the player is on)
+        // are no roof; a floor beside them is.
+        let ramp = level(&[&["....<..."], &["....>~~~"]]);
+        let mut foot = game_on(ramp, 0, [4, 0]);
+        assert!(foot.outdoors(), "under the ramp's top");
+        assert_eq!(foot.visions[0].radius(), VIEW_RADIUS_OUTDOORS);
+        click_and_run(&mut foot, [2, 0], 600);
+        assert_eq!(player_tile(&foot), [2, 0]);
+        assert!(!foot.outdoors(), "under the floor beside it");
         // On the top layer, always outdoors.
         let top = game(level(&[&["...."], &["...."]]), [1, 0]);
         assert!(top.outdoors());
@@ -1023,7 +1201,7 @@ mod tests {
             &vec![vec![Tile::FLOOR; 4]; 3],
             Spawn {
                 layer: 2,
-                tile: [1, 0],
+                pos: [12.5, 5.25],
             },
             tileset(),
             "player",
@@ -1032,6 +1210,11 @@ mod tests {
         .with_ground(1);
         let from_file = Game::from_file(&file, VIEW, 1);
         assert_eq!(from_file.frame().ground, 1);
+        assert_eq!(
+            center(from_file.player, PLAYER_SIZE),
+            [12.5, 5.25],
+            "spawn to the pixel"
+        );
         assert_eq!(from_file.sprites, sprites(), "sprites by name");
         assert_eq!(from_file.frame().cell, 16);
         assert!(

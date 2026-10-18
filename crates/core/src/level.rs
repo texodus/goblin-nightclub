@@ -17,11 +17,40 @@
 //! All of these are ordinary [`Layer`]s, so rays, collision, outlines and
 //! visibility work on them unchanged.
 
-use crate::layer::{Layer, Solid};
+use crate::layer::{Layer, Solid, Tile};
+use crate::path;
 use crate::tileset::Tileset;
 
 /// Layers a level may have (the renderer keeps textures for each).
 pub const MAX_LAYERS: usize = 8;
+
+/// What blocks movement in `tile`: wall and void (liquid included); a part
+/// of a tile no shape can be rounds up to the whole tile.
+pub fn movement_solid(tile: Tile) -> Solid {
+    Solid::from_quarters(tile.wall().quarters() | tile.void_quarters(), true)
+}
+
+/// Can a box of `size` stand centered at `center` on a layer of `tiles`
+/// (`cols` x `rows`, row by row), by the movement rules? Outside the
+/// layer is solid.
+pub fn can_stand(
+    tiles: &[Tile],
+    cols: usize,
+    rows: usize,
+    center: [f32; 2],
+    size: [f32; 2],
+) -> bool {
+    let pos = [center[0] - size[0] / 2.0, center[1] - size[1] / 2.0];
+    path::tiles_under(center, size).into_iter().all(|t| {
+        let inside = t[0] >= 0 && t[1] >= 0 && (t[0] as usize) < cols && (t[1] as usize) < rows;
+        let solid = if inside {
+            movement_solid(tiles[t[1] as usize * cols + t[0] as usize])
+        } else {
+            Solid::Full
+        };
+        !solid.hits_box(t, pos, size)
+    })
+}
 
 /// Tiles a level may have per layer: the renderer keeps a level-sized mask
 /// of what's been seen on each layer, a byte per pixel.
@@ -55,13 +84,12 @@ impl Level {
         let solid = |l: &Layer, i: usize| l.solid(pos(i).0, pos(i).1);
         let void = |l: &Layer, i: usize| l.tile(pos(i).0, pos(i).1).void_quarters();
 
-        // Blocked where wall or void. A part of a tile no shape can be
-        // rounds up to blocking the whole tile.
+        // Blocked where wall or void (see `movement_solid`).
         let movement = layers
             .iter()
             .map(|l| {
                 let solids = (0..n)
-                    .map(|t| Solid::from_quarters(solid(l, t).quarters() | void(l, t), true))
+                    .map(|t| movement_solid(l.tile(pos(t).0, pos(t).1)))
                     .collect();
                 Layer::from_solids(cols, rows, solids)
             })

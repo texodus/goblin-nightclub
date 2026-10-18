@@ -219,6 +219,33 @@ impl Solid {
         }
     }
 
+    /// Does this shape, as tile `tile`'s, overlap the pixel-space box
+    /// `pos..pos+size`? Only the part of the box over the tile counts, and
+    /// touching a surface doesn't.
+    pub fn hits_box(self, tile: [i32; 2], pos: [f32; 2], size: [f32; 2]) -> bool {
+        match self {
+            Solid::None => false,
+            Solid::Full => {
+                let over = |a: usize| {
+                    let (lo, hi) = (tile[a] as f32 * TILE, (tile[a] + 1) as f32 * TILE);
+                    pos[a] + size[a] > lo + COLLIDE_EPS && pos[a] < hi - COLLIDE_EPS
+                };
+                over(0) && over(1)
+            }
+            Solid::Slope(c) => {
+                // The box clipped to the tile, in tile-local units; solidity
+                // is linear, so its maximum is at one of the box's corners.
+                let local = |p: f32, a: usize| (p / TILE - tile[a] as f32).clamp(0.0, 1.0);
+                let (u0, u1) = (local(pos[0], 0), local(pos[0] + size[0], 0));
+                let (v0, v1) = (local(pos[1], 1), local(pos[1] + size[1], 1));
+                let (k, g) = Solid::slope_plane(c);
+                let u = if g[0] > 0.0 { u1 } else { u0 };
+                let v = if g[1] > 0.0 { v1 } else { v0 };
+                k + g[0] * u + g[1] * v > COLLIDE_EPS / TILE
+            }
+        }
+    }
+
     /// As a set of quarters: a slope is two neighboring quarters, a full
     /// tile all four.
     pub fn quarters(self) -> u8 {
@@ -1252,21 +1279,7 @@ impl Layer {
     }
 
     fn box_hits_tile(&self, tile: [i32; 2], pos: [f32; 2], size: [f32; 2]) -> bool {
-        match self.solid(tile[0], tile[1]) {
-            Solid::None => false,
-            Solid::Full => true,
-            Solid::Slope(c) => {
-                // The box clipped to the tile, in tile-local units; solidity
-                // is linear, so its maximum is at one of the box's corners.
-                let local = |p: f32, a: usize| (p / TILE - tile[a] as f32).clamp(0.0, 1.0);
-                let (u0, u1) = (local(pos[0], 0), local(pos[0] + size[0], 0));
-                let (v0, v1) = (local(pos[1], 1), local(pos[1] + size[1], 1));
-                let (k, g) = Solid::slope_plane(c);
-                let u = if g[0] > 0.0 { u1 } else { u0 };
-                let v = if g[1] > 0.0 { v1 } else { v0 };
-                k + g[0] * u + g[1] * v > COLLIDE_EPS / TILE
-            }
-        }
+        self.solid(tile[0], tile[1]).hits_box(tile, pos, size)
     }
 
     /// Move a box by `delta`, sliding along anything it runs into. Moves in

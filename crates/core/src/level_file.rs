@@ -15,12 +15,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::layer::{Corner, Dir, Layer, Part, Tile};
-use crate::level::{Level, MAX_LAYERS, MAX_TILES};
+use crate::entity::PLAYER_SIZE;
+use crate::layer::{Corner, Dir, Layer, Part, TILE, Tile};
+use crate::level::{Level, MAX_LAYERS, MAX_TILES, can_stand};
 use crate::tileset::Tileset;
 
-/// The version written. Format 1 (before tilesets were data) isn't read.
-pub const FORMAT: u32 = 2;
+/// The version written. Earlier formats (1: before tilesets were data; 2:
+/// the spawn as a tile) aren't read.
+pub const FORMAT: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LevelFile {
@@ -40,11 +42,22 @@ pub struct LevelFile {
     pub layers: Vec<Vec<Vec<Tile>>>,
 }
 
-/// Where the player starts.
+/// Where the player starts: the center of their box, in world units
+/// ([`TILE`] to a tile), on `layer`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Spawn {
     pub layer: usize,
-    pub tile: [i32; 2],
+    pub pos: [f32; 2],
+}
+
+impl Spawn {
+    /// The middle of tile `tile` on `layer`.
+    pub fn at_tile(layer: usize, tile: [i32; 2]) -> Self {
+        Self {
+            layer,
+            pos: [(tile[0] as f32 + 0.5) * TILE, (tile[1] as f32 + 0.5) * TILE],
+        }
+    }
 }
 
 /// How a kind of character is drawn.
@@ -115,10 +128,7 @@ impl LevelFile {
         let cols = cols.clamp(1, MAX_TILES);
         let rows = rows.clamp(1, MAX_TILES / cols);
         let layers = vec![vec![Tile::FLOOR; cols * rows]; depth];
-        let spawn = Spawn {
-            layer: depth - 1,
-            tile: [(cols / 2) as i32, (rows / 2) as i32],
-        };
+        let spawn = Spawn::at_tile(depth - 1, [(cols / 2) as i32, (rows / 2) as i32]);
         Self::new(cols, rows, &layers, spawn, tileset, player, npc)
     }
 
@@ -195,10 +205,19 @@ impl LevelFile {
                 .collect();
             layers.push(rows.map_err(|e| format!("layer {k}: {e}"))?);
         }
-        let [x, y] = raw.spawn.tile;
-        let in_bounds = x >= 0 && y >= 0 && (x as usize) < raw.cols && (y as usize) < raw.rows;
+        let [x, y] = raw.spawn.pos;
+        let in_bounds = x >= 0.0
+            && y >= 0.0
+            && x < raw.cols as f32 * TILE
+            && y < raw.rows as f32 * TILE
+            && x.is_finite()
+            && y.is_finite();
         if raw.spawn.layer >= raw.layers.len() || !in_bounds {
             return Err("the spawn is outside the level".into());
+        }
+        let tiles: Vec<Tile> = layers[raw.spawn.layer].concat();
+        if !can_stand(&tiles, raw.cols, raw.rows, raw.spawn.pos, PLAYER_SIZE) {
+            return Err("the player doesn't fit at the spawn".into());
         }
         if raw.ground >= raw.layers.len() {
             return Err("the ground level is above the level's top".into());
@@ -433,14 +452,16 @@ mod tests {
                     .collect()
             })
             .collect();
+        // A spawn between tiles, to the pixel.
         let spawn = Spawn {
             layer: level.depth() - 1,
-            tile: [2, 2],
+            pos: [27.5, 24.25],
         };
         let file = file(cols as usize, rows as usize, &layers, spawn).with_ground(1);
         let json = file.to_json();
         let back = LevelFile::from_json(&json).unwrap();
         assert_eq!(back, file);
+        assert_eq!(back.spawn.pos, [27.5, 24.25]);
         assert_eq!(back.ground, 1);
         assert_eq!(back.tiles(), layers);
         assert_eq!(back.player.sprite, "player");
@@ -460,14 +481,27 @@ mod tests {
             2,
             1,
             &[vec![Tile::FLOOR, Tile::FLOOR]],
-            Spawn {
-                layer: 0,
-                tile: [0, 0],
-            },
+            Spawn::at_tile(0, [0, 0]),
         );
         let mut wrong = file.clone();
-        wrong.spawn.tile = [5, 0];
-        assert!(LevelFile::from_json(&wrong.to_json()).is_err());
+        wrong.spawn.pos = [55.0, 5.0];
+        assert!(LevelFile::from_json(&wrong.to_json()).is_err(), "outside");
+        let mut tight = file.clone();
+        tight.spawn.pos = [2.0, 5.0];
+        assert!(
+            LevelFile::from_json(&tight.to_json())
+                .unwrap_err()
+                .contains("fit"),
+            "against the level's edge"
+        );
+        let mut walled = file.clone();
+        walled.layers[0][0][0] = Tile::WALL;
+        assert!(
+            LevelFile::from_json(&walled.to_json()).is_err(),
+            "in a wall"
+        );
+        walled.spawn.pos = [15.0, 5.0];
+        assert!(LevelFile::from_json(&walled.to_json()).is_ok(), "beside it");
         let mut ragged = file.clone();
         ragged.layers[0][0].pop();
         assert!(LevelFile::from_json(&ragged.to_json()).is_err());
@@ -480,7 +514,7 @@ mod tests {
         // Names the tileset doesn't have, and the old format.
         let unknown = good.replacen("floor:plain", "floor:lava", 1);
         assert!(LevelFile::from_json(&unknown).unwrap_err().contains("lava"));
-        let old = good.replacen("\"format\": 2", "\"format\": 1", 1);
-        assert!(LevelFile::from_json(&old).unwrap_err().contains("format 1"));
+        let old = good.replacen("\"format\": 3", "\"format\": 2", 1);
+        assert!(LevelFile::from_json(&old).unwrap_err().contains("format 2"));
     }
 }

@@ -25,6 +25,8 @@ pub struct Entity {
 }
 
 const NPC_SIZE: [f32; 2] = [6.0, 6.0];
+/// The player's box, in pixels.
+pub const PLAYER_SIZE: [f32; 2] = [8.0, 8.0];
 const NPC_SPEED: f32 = 30.0;
 const NPC_TURN_MIN: f32 = 1.0;
 const NPC_TURN_MAX: f32 = 3.0;

@@ -8,7 +8,8 @@
 //! - rectangle: the region dragged out;
 //! - fill: the tile clicked and every like tile joined to it;
 //! - picker: take the brushes and shape from the tile clicked;
-//! - spawn: put the player's start on the tile clicked.
+//! - spawn: put the player's start at the point clicked (to the art's
+//!   pixel), if the player fits there.
 //!
 //! One layer is edited at a time, seen over the layers below it as in the
 //! game but with everything in view. Levels save to and load from
@@ -19,10 +20,11 @@ use serde::Serialize;
 
 use goblin_nightclub_core::camera::Camera;
 use goblin_nightclub_core::draw::Canvas;
+use goblin_nightclub_core::entity::PLAYER_SIZE;
 use goblin_nightclub_core::frame::{Frame, LayerFrame};
 use goblin_nightclub_core::input::Input;
 use goblin_nightclub_core::layer::{Corner, Dir, Layer, Part, Shape, TILE, Tile, quarter_shapes};
-use goblin_nightclub_core::level::{Level, MAX_LAYERS};
+use goblin_nightclub_core::level::{Level, MAX_LAYERS, can_stand};
 use goblin_nightclub_core::level_file::{Character, LevelFile, Spawn};
 use goblin_nightclub_core::palette::{self, Color};
 use goblin_nightclub_core::tileset::Tileset;
@@ -554,11 +556,18 @@ impl Editor {
         match self.tool {
             Tool::Pick => self.pick(t, swap),
             Tool::Spawn => {
-                self.checkpoint();
-                self.spawn = Spawn {
-                    layer: self.layer,
-                    tile: t,
-                };
+                // The point itself, on a whole pixel of the art, where the
+                // player's box fits on this layer.
+                let zoom = self.tileset.zoom();
+                let pos = self.camera.to_world(p).map(|v| (v * zoom).round() / zoom);
+                let tiles = &self.layers[self.layer];
+                if can_stand(tiles, self.cols, self.rows, pos, PLAYER_SIZE) {
+                    self.checkpoint();
+                    self.spawn = Spawn {
+                        layer: self.layer,
+                        pos,
+                    };
+                }
             }
             Tool::Fill => {
                 self.checkpoint();
@@ -700,13 +709,11 @@ impl Editor {
                     1.0 / self.tileset.zoom(),
                 );
                 if self.spawn.layer == k {
-                    let [x, y] = self.spawn.tile;
-                    let at = [(x as f32 + 0.5) * TILE, (y as f32 + 0.5) * TILE];
                     let player = self
                         .tileset
                         .sprite(&self.player.sprite)
                         .map_or(self.tileset.white, |s| s.cell);
-                    visible.sprite(at, player, palette::WHITE);
+                    visible.sprite(self.spawn.pos, player, palette::WHITE);
                 }
                 let parts = |quarters: &dyn Fn(usize) -> u8| -> Vec<Shape> {
                     (0..self.cols * self.rows)
@@ -912,15 +919,20 @@ mod tests {
         click(&mut e, [6, 4], 0);
         assert_eq!(e.layers[1][e.index([1, 1])], Tile::FLOOR);
         assert_eq!(e.layers[0][e.index([1, 1])], Tile::WALL);
+        // Into the wall just painted: ignored. Off a tile's center: kept to
+        // the art's pixel (16 to a tile).
+        click(&mut e, [1, 1], 0);
+        assert_eq!(e.spawn, Spawn::at_tile(0, [6, 4]));
+        let z = e.camera.zoom();
+        let p = [(23.3 - e.camera.pos[0]) * z, (41.1 - e.camera.pos[1]) * z];
+        e.mouse_down(p, 0);
+        e.mouse_up(p, 0);
+        assert_eq!(e.spawn.pos, [23.125, 41.25]);
+        e.undo();
+        assert_eq!(e.spawn, Spawn::at_tile(0, [6, 4]));
 
         let file = LevelFile::from_json(&e.to_file().to_json()).unwrap();
-        assert_eq!(
-            file.spawn,
-            Spawn {
-                layer: 0,
-                tile: [6, 4]
-            }
-        );
+        assert_eq!(file.spawn, Spawn::at_tile(0, [6, 4]));
         let loaded = Editor::from_file(&file, VIEW);
         assert_eq!(loaded.layers, e.layers);
         assert_eq!(loaded.state().layer, 0, "opens on the spawn's layer");
