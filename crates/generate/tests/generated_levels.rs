@@ -8,7 +8,9 @@ use goblin_nightclub_core::level::Level;
 use goblin_nightclub_core::level_file::LevelFile;
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::vision::Vision;
-use goblin_nightclub_core::vision::testing::{OpenPoint, band_covers, check_polygon, is_open_point};
+use goblin_nightclub_core::vision::testing::{
+    OpenPoint, band_covers, check_polygon, is_open_point,
+};
 use goblin_nightclub_generate::{Params, generate_level, spawn_layer, world};
 
 const SPAWN: [f32; 2] = [325.0, 205.0];

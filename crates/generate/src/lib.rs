@@ -34,12 +34,12 @@
 
 use std::sync::OnceLock;
 
-use serde::{Deserialize, Serialize};
 use goblin_nightclub_core::layer::{Corner, Dir, FloorId, Part, Side, Solid, TILE, Tile};
 use goblin_nightclub_core::level::{Level, MAX_LAYERS};
 use goblin_nightclub_core::level_file::{LevelFile, Spawn};
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::tileset::Tileset;
+use serde::{Deserialize, Serialize};
 
 /// What to generate. Every field has a default; see [`Params::default`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -110,12 +110,12 @@ impl Default for Params {
             rooms: 3,
             stairs: 2,
             pool_share: 0.06,
-            holes: 3,
-            canyons: 1,
-            hole_radius: [1, 2],
+            holes: 20,
+            canyons: 5,
+            hole_radius: [2, 4],
             canyon_width: [1, 2],
             canyon_length: [10, 24],
-            hole_depth: [1, 1],
+            hole_depth: [1, 4],
         }
     }
 }
