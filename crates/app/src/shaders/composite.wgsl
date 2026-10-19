@@ -51,6 +51,16 @@ struct Params {
 // fades into the remembered one.
 const RADIUS_FADE: f32 = 12.0;
 
+// Anywhere never seen, and beyond the level's edge: a dark gray fog in the
+// mist's billows, drifting with it, under whatever the unknown canvas
+// holds. Its average gray, and how much it varies either way (a fraction
+// of that) after its billows' contrast is stretched (see `mist_density`):
+// at most about 0.13, below the remembered style's dithered grays
+// (REMEMBERED_MIN and up), so what's known stands out against it.
+const UNKNOWN_GRAY: f32 = 0.2;
+const UNKNOWN_VARIATION: f32 = 0.3;
+const UNKNOWN_CONTRAST: f32 = 1.0;
+
 // Lowest gray (before dithering) for anything not black in the remembered
 // style. At 0.15 a dot needs a threshold of at least 0.55, which every row
 // and column of the 4x4 pattern has.
@@ -179,8 +189,11 @@ fn style_remembered(c: vec3<f32>, p: vec2<u32>) -> vec3<f32> {
     return vec3(level);
 }
 
-fn style_unknown(c: vec3<f32>) -> vec3<f32> {
-    return c;
+// The fog at world point `world`, under `c` (premultiplied).
+fn style_unknown(c: vec4<f32>, world: vec2<f32>) -> vec3<f32> {
+    let density = mist_density(world, UNKNOWN_VARIATION, UNKNOWN_CONTRAST);
+    let fog = vec3(UNKNOWN_GRAY * density);
+    return c.rgb + fog * (1.0 - c.a);
 }
 
 // Layer `a`'s `seen` at world point `world` (0 outside the level).
@@ -224,7 +237,7 @@ fn shade(a: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> 
     let dots = vec2<i32>(floor(world * params.seen_zoom));
     let cell = vec2<u32>(((dots % 4) + 4) % 4);
     let remembered = style_remembered(textureLoad(canvases, px, 3u * a + 1u, 0).rgb, cell);
-    let unknown = style_unknown(textureLoad(canvases, px, 3u * a + 2u, 0).rgb);
+    let unknown = style_unknown(textureLoad(canvases, px, 3u * a + 2u, 0), world);
     return mix(mix(unknown, remembered, seen), visible, now);
 }
 
@@ -242,6 +255,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // much of what's beneath still shows through the water and mist above.
     var color = vec3(0.0);
     var remaining = 1.0;
+    // What a hole through every layer drawn shows at its bottom: bedrock,
+    // black where the hole is known, else the unknown style (as the last
+    // layer passed through has it).
+    var bedrock = vec3(0.0);
     for (var d = 0u; d <= params.top; d++) {
         let a = params.top - d;
         if ((params.present >> a) & 1u) == 0u {
@@ -255,11 +272,16 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             color += shade(a, px, world, radius, below) * remaining;
             return vec4(color, 1.0);
         }
+        let known = knowledge(a, px, world, radius, below);
+        let unknown = (1.0 - known.x) * (1.0 - known.y);
+        bedrock = style_unknown(textureLoad(canvases, px, 3u * a + 2u, 0), world) * unknown;
         if mask < 0.75 {
             // Water: its styled (premultiplied) color over what's below.
+            // Where it's never been seen, the unknown style is opaque, so
+            // nothing beneath shows through that part.
             let alpha = textureLoad(canvases, px, 3u * a, 0).a;
             color += shade(a, px, world, radius, below) * remaining;
-            remaining *= 1.0 - alpha;
+            remaining *= (1.0 - alpha) * (1.0 - unknown);
         }
         through = min(through, seen_at(a, world));
         // The mist down this hole, onto the next layer: there only where
@@ -271,7 +293,6 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             let light = params.outdoors > 0.5 && a - 1u >= params.ground;
             let tint = select(MIST_DARK, MIST_LIGHT, light);
             let opacity = select(MIST_DARK_ALPHA, MIST_LIGHT_ALPHA, light);
-            let known = knowledge(a, px, world, radius, below);
             let gray = vec3(luminance(tint) * 0.75);
             let variation = select(MIST_DARK_VARIATION, MIST_LIGHT_VARIATION, light);
             let contrast = select(MIST_DARK_CONTRAST, MIST_LIGHT_CONTRAST, light);
@@ -282,5 +303,5 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         scale *= params.scale;
     }
-    return vec4(color, 1.0);
+    return vec4(color + bedrock * remaining, 1.0);
 }

@@ -83,6 +83,9 @@ const PLAYER_SPEED: f32 = 60.0;
 /// Pause on reaching the destination.
 const AUTO_PAUSE: bool = true;
 
+/// Spacing of the dots marking the way a walk has left, in pixels.
+const ROUTE_DOT: f32 = 4.0;
+
 /// Size of a generated level, in tiles.
 const LEVEL_COLS: usize = 96;
 const LEVEL_ROWS: usize = 60;
@@ -502,16 +505,31 @@ impl Game {
         let zoom = self.tileset().zoom();
         let px = 1.0 / zoom;
         let snap = |v: f32| (v * zoom).floor() / zoom;
-        let mut at = center(self.player, PLAYER_SIZE);
-        for &w in &route.waypoints[route.next..] {
-            let len = goblin_nightclub_core::length([w[0] - at[0], w[1] - at[1]]);
-            let dots = (len / 4.0) as usize;
-            for i in 1..=dots {
-                let t = i as f32 * 4.0 / len;
-                let p = [at[0] + (w[0] - at[0]) * t, at[1] + (w[1] - at[1]) * t];
+        // Dots every `ROUTE_DOT` along the way left, counted back from the
+        // goal, so each stays put as the player walks on (rather than the
+        // whole line sliding along with them); those the player is within a
+        // dot of are behind them.
+        let way: Vec<[f32; 2]> = std::iter::once(center(self.player, PLAYER_SIZE))
+            .chain(route.waypoints[route.next..].iter().copied())
+            .collect();
+        let length =
+            |a: [f32; 2], b: [f32; 2]| goblin_nightclub_core::length([b[0] - a[0], b[1] - a[1]]);
+        let total: f32 = way.windows(2).map(|s| length(s[0], s[1])).sum();
+        // How far back from the goal the leg ends, and the next dot is.
+        let (mut done, mut dot) = (0.0, ROUTE_DOT);
+        for leg in way.windows(2).rev() {
+            let [near, far] = [leg[0], leg[1]];
+            let len = length(near, far);
+            while dot <= done + len && dot <= total - ROUTE_DOT {
+                let t = (dot - done) / len;
+                let p = [
+                    far[0] + (near[0] - far[0]) * t,
+                    far[1] + (near[1] - far[1]) * t,
+                ];
                 canvas.rect([snap(p[0]), snap(p[1])], [px, px], palette::YELLOW);
+                dot += ROUTE_DOT;
             }
-            at = w;
+            done += len;
         }
         let goal = *route.waypoints.last().unwrap();
         let corner = [snap(goal[0] - 2.5), snap(goal[1] - 2.5)];
