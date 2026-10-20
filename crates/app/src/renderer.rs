@@ -109,6 +109,10 @@ struct CompositeParams {
     _pad: f32,
     /// Where world point (0, 0) is in the whole level.
     offset: [f32; 2],
+    /// See [`Frame::fade`] and [`Frame::sink`].
+    fade: f32,
+    sink: f32,
+    _pad2: [f32; 2],
 }
 
 /// A vertex buffer that grows (to the next power of two) as needed.
@@ -1359,7 +1363,7 @@ impl Renderer {
                 screen: frame.view,
                 camera,
                 center,
-                scale: parallax.powi(slot(l.index) as i32),
+                scale: frame.scale(l.index),
                 zoom,
                 cell,
                 _pad: 0.0,
@@ -1424,6 +1428,9 @@ impl Renderer {
             page_px: page_px as f32,
             _pad: 0.0,
             offset,
+            fade: frame.fade,
+            sink: frame.sink,
+            _pad2: [0.0; 2],
         };
         self.queue
             .write_buffer(&self.composite_params, 0, bytemuck::bytes_of(&params));

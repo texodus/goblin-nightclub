@@ -90,6 +90,13 @@ pub struct Frame {
     /// Whether what's visible is remembered as seen; the editor shows
     /// everything and remembers none of it.
     pub remember: bool,
+    /// How opaque the viewer's layer is: less than 1 while it fades in or
+    /// out, going from one layer to another, showing the layer beneath.
+    pub fade: f32,
+    /// How many layers deeper than it is each layer is drawn (so how much
+    /// smaller): between 0 and 1 (or -1) while the layers zoom from one
+    /// layer's view to the next's; 0 otherwise.
+    pub sink: f32,
     /// Drawn in world space over everything, on the viewer's layer.
     pub overlay: Canvas,
     /// Drawn over everything in interface pixels (`ui_scale` screen
@@ -104,9 +111,14 @@ impl Frame {
         camera::parallax(self.zoom, self.cell as f32 / TILE * self.ui_scale)
     }
 
+    /// How much smaller than the viewer's layer `index` is drawn.
+    pub fn scale(&self, index: usize) -> f32 {
+        self.parallax().powf((self.top - index) as f32 + self.sink)
+    }
+
     /// The part of layer `index` in view, padded a little.
     pub fn layer_view(&self, index: usize) -> Rect {
-        let scale = self.parallax().powi((self.top - index) as i32);
+        let scale = self.scale(index);
         camera::layer_view(self.camera, self.view, self.zoom, scale)
     }
 }

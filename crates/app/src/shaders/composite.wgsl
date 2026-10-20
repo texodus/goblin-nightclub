@@ -40,6 +40,12 @@ struct Params {
     // Where world point (0, 0) is in the whole level (for a level drawn a
     // window at a time), so patterns pinned to the world stay put.
     offset: vec2<f32>,
+    // Going from one layer to another: how opaque the viewer's layer is
+    // (showing the one beneath through the rest), and how many layers
+    // deeper than it is each is drawn (so how much smaller).
+    fade: f32,
+    sink: f32,
+    _pad2: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -273,7 +279,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let center = vec2<f32>(textureDimensions(voids)) / 2.0;
     // Down from the viewer's layer through void; each layer was drawn a
     // little smaller about the view's center (parallax).
-    var scale = 1.0;
+    var scale = pow(params.scale, params.sink);
     // How much the hole looked down has been seen: the least `seen` of the
     // void passed through, on the way down.
     var through = 1.0;
@@ -294,9 +300,20 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let mask = textureLoad(voids, px, d, 0).r;
         let below = select(0.0, through, d > 0u);
         let radius = radius_at(a, d);
+        // The viewer's layer, fading in or out, counts only so much; the
+        // layer beneath shows through the rest of it, solid or not.
+        let weight = select(1.0, params.fade, d == 0u);
+        let next = ((params.present >> (d + 1u)) & 1u) != 0u;
         if mask <= 0.25 {
-            color += shade(d, px, world, radius, below) * remaining;
-            return vec4(color, 1.0);
+            color += shade(d, px, world, radius, below) * remaining * weight;
+            if weight >= 1.0 || !next {
+                return vec4(color, 1.0);
+            }
+            // Under its floor, the layer beneath is as known as it is.
+            remaining *= 1.0 - weight;
+            through = 0.0;
+            scale *= params.scale;
+            continue;
         }
         let known = knowledge(d, px, world, radius, below);
         let unknown = (1.0 - known.x) * (1.0 - known.y);
@@ -306,14 +323,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             // Where it's never been seen, the unknown style is opaque, so
             // nothing beneath shows through that part.
             let alpha = textureLoad(canvases, px, 3u * d, 0).a;
-            color += shade(d, px, world, radius, below) * remaining;
-            remaining *= (1.0 - alpha) * (1.0 - unknown);
+            color += shade(d, px, world, radius, below) * remaining * weight;
+            remaining *= 1.0 - weight * (1.0 - (1.0 - alpha) * (1.0 - unknown));
         }
         through = min(through, seen_at(d, world));
         // The mist down this hole, onto the next layer: there only where
         // the hole is known, in the remembered style's gray where it isn't
         // in view.
-        if ((params.present >> (d + 1u)) & 1u) != 0u {
+        if next {
             let sheet = scale * sqrt(params.scale);
             let at = params.camera + (center + (frag.xy - center) / sheet) / params.zoom;
             let light = params.outdoors > 0.5 && a - 1u >= params.ground;
@@ -323,7 +340,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             let variation = select(MIST_DARK_VARIATION, MIST_LIGHT_VARIATION, light);
             let contrast = select(MIST_DARK_CONTRAST, MIST_LIGHT_CONTRAST, light);
             let density = mist_density(at, variation, contrast);
-            let alpha = clamp(opacity * density, 0.0, 1.0) * max(known.x, known.y);
+            let alpha = clamp(opacity * density, 0.0, 1.0) * max(known.x, known.y) * weight;
             color += mix(gray, tint, known.x) * alpha * remaining;
             remaining *= 1.0 - alpha;
         }

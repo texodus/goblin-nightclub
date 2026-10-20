@@ -743,6 +743,8 @@ impl Editor {
             offset: [0, 0],
             base: 0,
             remember: false,
+            fade: 1.0,
+            sink: 0.0,
             overlay: self.overlay(),
             ui: Canvas::new(&self.tileset),
         }

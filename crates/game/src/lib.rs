@@ -12,7 +12,7 @@ use goblin_nightclub_core::entity::{Entity, EntityId, Kind, PLAYER_SIZE};
 use goblin_nightclub_core::frame::{Frame, LayerFrame};
 pub use goblin_nightclub_core::input::Input;
 use goblin_nightclub_core::layer::{Dir, QUARTERS, Solid, TILE, quarter_at};
-use goblin_nightclub_core::level::Level;
+use goblin_nightclub_core::level::{Level, MAX_VISIBLE};
 use goblin_nightclub_core::level_file::{LevelFile, LevelMeta};
 use goblin_nightclub_core::memory::Memory;
 use goblin_nightclub_core::mesh::Mesh;
@@ -65,6 +65,8 @@ pub struct Game {
     stream: Option<Stream>,
     /// What's left of the last window's level, to drop a little at a time.
     litter: Vec<Box<dyn Any>>,
+    /// Going from one layer to another, as it's shown.
+    shift: Option<LayerShift>,
     sprites: Sprites,
     /// The player's layer.
     top: usize,
@@ -90,6 +92,29 @@ pub struct Game {
     /// What sight was last worked out from: the player's center, layer,
     /// view radius and the ground level. Unchanged, so is what's seen.
     observed: Option<([f32; 2], usize, f32, usize)>,
+}
+
+/// Going from one layer to another, as shown: the layers zoom from one
+/// layer's view to the other's as the upper of the two fades. Down, the
+/// layer left fades out as it grows past the viewer, the one beneath
+/// growing into its place; up, the one come to fades in as it shrinks into
+/// place from past the viewer, the one left shrinking beneath it.
+struct LayerShift {
+    /// The layer left, in the whole level.
+    from: usize,
+    /// How far along: from 0 to 1.
+    t: f32,
+}
+
+/// What's shown of a [`LayerShift`] at a moment: the layer drawn as the
+/// viewer's, how opaque it is, how many layers deeper each is drawn, and a
+/// layer beneath it to draw whether it shows through or not (as if it were
+/// the viewer's, which it was or is about to be).
+struct Shown {
+    top: usize,
+    fade: f32,
+    sink: f32,
+    beneath: Option<usize>,
 }
 
 /// A planned walk: the tiles it crosses and the straightened waypoints
@@ -156,6 +181,10 @@ const NPC_DENSITY: usize = 4;
 const NPC_PER_CHUNK: usize = (NPC_DENSITY * CHUNK * CHUNK).div_ceil(640);
 /// NPCs spawn at least this far (pixels) from the player.
 const NPC_SPAWN_DIST: f32 = 60.0;
+
+/// Seconds going from one layer to another takes to show (see
+/// [`LayerShift`]).
+const LAYER_SHIFT_TIME: f32 = 0.3;
 
 /// Pieces of the last window's level dropped each update (see
 /// [`Level::take_apart`]).
@@ -263,6 +292,7 @@ impl Game {
             level,
             stream: None,
             litter: Vec::new(),
+            shift: None,
             sprites,
             top,
             ground: 0,
@@ -284,6 +314,13 @@ impl Game {
     pub fn update(&mut self, dt: f32) {
         let left = self.litter.len().saturating_sub(LITTER_PER_UPDATE);
         self.litter.truncate(left);
+        // Going from one layer to another plays out, paused or not.
+        if let Some(shift) = &mut self.shift {
+            shift.t += dt / LAYER_SHIFT_TIME;
+            if shift.t >= 1.0 {
+                self.shift = None;
+            }
+        }
         // Arrow keys or WASD pan the view, paused or not.
         self.camera.pan(&self.input, dt);
         if self.paused {
@@ -628,10 +665,50 @@ impl Game {
         if here == before {
             return;
         }
+        let from = self.layer();
         match self.level.layer(self.top).tile(here[0], here[1]).stairs() {
             Some(Dir::Down) if self.top > 0 => self.top -= 1,
             Some(Dir::Up) if self.top + 1 < self.level.depth() => self.top += 1,
-            _ => {}
+            _ => return,
+        }
+        self.shift = Some(LayerShift { from, t: 0.0 });
+    }
+
+    /// What's shown of going from one layer to another, if anything is.
+    fn shown(&self) -> Shown {
+        let still = Shown {
+            top: self.top,
+            fade: 1.0,
+            sink: 0.0,
+            beneath: None,
+        };
+        let base = self.layer() - self.top;
+        // The layer left, if it's still in the window, next to this one.
+        let from = self.shift.as_ref().and_then(|s| {
+            let from = s.from.checked_sub(base)?;
+            (from.abs_diff(self.top) == 1 && from < self.level.depth()).then_some((from, s.t))
+        });
+        let Some((from, t)) = from else {
+            return still;
+        };
+        // Eased in and out. Either way it ends as the view from this
+        // layer: the one above it gone, or this one in place.
+        let t = t.clamp(0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t);
+        if from > self.top {
+            Shown {
+                top: from,
+                fade: 1.0 - t,
+                sink: -t,
+                beneath: Some(self.top),
+            }
+        } else {
+            Shown {
+                fade: t,
+                sink: t - 1.0,
+                beneath: Some(from),
+                ..still
+            }
         }
     }
 
@@ -801,15 +878,20 @@ impl Game {
         let tileset = self.tileset();
         let bevel = 1.0 / tileset.zoom();
         let parallax = camera::parallax(self.zoom(), tileset.zoom() * self.ui_scale());
-        let layers = self
-            .level
-            .visible_layers(self.top)
+        let shown = self.shown();
+        let top = shown.top;
+        let mut seen = self.level.visible_layers(top);
+        if let Some(k) = shown.beneath.filter(|k| !seen.contains(k)) {
+            seen.insert(1, k);
+            seen.truncate(MAX_VISIBLE);
+        }
+        let layers = seen
             .iter()
             .map(|&k| {
                 let (layer, vision) = (self.level.layer(k), &self.visions[k]);
                 // The tiles are drawn from the level's meshes; just the
                 // bevels in view are drawn here.
-                let scale = parallax.powi((self.top - k) as i32);
+                let scale = parallax.powf((top - k) as f32 + shown.sink);
                 let within =
                     camera::layer_view(self.camera.pos, self.camera.view, self.zoom(), scale);
                 // Bevels a pixel of the art wide, only on faces seen: now for
@@ -848,7 +930,10 @@ impl Game {
                 }
 
                 let meshes = self.level.meshes(k);
-                let shaft = (k < self.top).then(|| self.level.shaft_mesh(self.top, k));
+                // The layer beneath going from one layer to another is
+                // shown whole, as the viewer's is.
+                let through = k < top && shown.beneath != Some(k);
+                let shaft = through.then(|| self.level.shaft_mesh(top, k));
                 // Characters drawn on this layer cover any void their
                 // sprites overhang: the player, NPCs in view and last
                 // sightings.
@@ -885,7 +970,7 @@ impl Game {
         let vision = &self.visions[self.top];
         Frame {
             depth: self.level.depth(),
-            top: self.top,
+            top,
             layers,
             origin: vision.origin(),
             radius: vision.radius(),
@@ -911,6 +996,8 @@ impl Game {
                 .map_or([0, 0], |s| s.window.tile_origin()),
             base: self.stream.as_ref().map_or(0, |s| s.window.base),
             remember: true,
+            fade: shown.fade,
+            sink: shown.sink,
             overlay: self.overlay(),
             ui: self.ui(),
         }
@@ -1413,6 +1500,50 @@ mod tests {
         assert_eq!(game.layer(), 0);
         click_and_run(&mut game, [4, 1], 600);
         assert_eq!(game.layer(), 1);
+    }
+
+    #[test]
+    fn changing_layers_fades_and_zooms_between_them() {
+        let l = level(&[
+            &["..........", "....<.....", ".........."],
+            &["..........", "....>.....", ".........."],
+        ]);
+        let mut game = game(l, [3, 1]);
+        // Onto the stairs down.
+        game.player = [
+            path::center([4, 1])[0] - PLAYER_SIZE[0] / 2.0,
+            path::center([4, 1])[1] - PLAYER_SIZE[1] / 2.0,
+        ];
+        game.take_stairs([3, 1]);
+        assert_eq!(game.top, 0);
+        let at = |game: &mut Game, t: f32| {
+            game.shift.as_mut().unwrap().t = t;
+            let f = game.frame();
+            let beneath = f.layers.iter().find(|l| l.index + 1 == f.top);
+            (f.top, f.fade, f.sink, beneath.map(|l| l.shaft.is_none()))
+        };
+        let between = |v: f32, a: f32, b: f32| v > a && v < b;
+        // Down: the layer left fading out and growing past the viewer,
+        // over this one, shown whole, growing into place.
+        let (top, fade, sink, beneath) = at(&mut game, 0.5);
+        assert_eq!((top, beneath), (1, Some(true)));
+        assert!(between(fade, 0.0, 1.0) && between(sink, -1.0, 0.0));
+        // Up: this one fading in and shrinking into place, over the layer
+        // left, shown whole, shrinking beneath it.
+        game.top = 1;
+        game.shift = Some(LayerShift { from: 0, t: 0.0 });
+        let (top, fade, sink, beneath) = at(&mut game, 0.5);
+        assert_eq!((top, beneath), (1, Some(true)));
+        assert!(between(fade, 0.0, 1.0) && between(sink, -1.0, 0.0));
+        // Each starts as the view from the layer left.
+        let (top, fade, sink, _) = at(&mut game, 0.0);
+        assert_eq!((top, fade, sink), (1, 0.0, -1.0));
+        // And done, paused or not.
+        game.paused = true;
+        game.update(LAYER_SHIFT_TIME);
+        assert!(game.shift.is_none());
+        let f = game.frame();
+        assert_eq!((f.top, f.fade, f.sink), (1, 1.0, 0.0));
     }
 
     /// Along a chamfered shore the route steps diagonally over the
