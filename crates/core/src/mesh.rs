@@ -91,6 +91,12 @@ impl Mesh {
         })
     }
 
+    /// The vertices of its chunk `(cx, cy)`.
+    pub fn chunk_vertices(&self, cx: usize, cy: usize) -> &[Vertex] {
+        let i = cy * self.chunks[0] + cx;
+        &self.vertices[self.starts[i] as usize..self.starts[i + 1] as usize]
+    }
+
     /// Different for every mesh built, even with the same triangles.
     pub fn id(&self) -> u64 {
         self.id

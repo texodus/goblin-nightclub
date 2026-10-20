@@ -54,18 +54,22 @@ fn vs_main(
     @location(3) color: vec4<f32>,
     @location(4) edge: vec4<f32>,
     @location(5) reach: f32,
+    // Where the draw moves its vertices to: a chunk's piece of a layer
+    // from its chunk's corner to where that is (see `Renderer::shifts`).
+    @location(6) shift: vec2<f32>,
 ) -> VsOut {
+    let at = world + shift;
     // World -> target pixels (camera and zoom, then scale about the
     // center) -> clip space (origin top-left, y down).
-    let px = globals.center + ((world - globals.camera) * globals.zoom - globals.center) * globals.scale;
+    let px = globals.center + ((at - globals.camera) * globals.zoom - globals.center) * globals.scale;
     let ndc = vec2(px.x / globals.screen.x * 2.0 - 1.0, 1.0 - px.y / globals.screen.y * 2.0);
     var out: VsOut;
     out.clip = vec4(ndc, 0.0, 1.0);
     out.color = color;
     out.uv = uv;
     out.cell = cell;
-    out.world = world;
-    out.edge = edge;
+    out.world = at;
+    out.edge = vec4(edge.xy + shift, edge.zw);
     out.reach = reach;
     return out;
 }

@@ -6,18 +6,18 @@ use std::sync::Arc;
 use crate::camera::{self, Rect};
 use crate::draw::Canvas;
 use crate::layer::TILE;
+use crate::level::LayerMeshes;
 use crate::mesh::Mesh;
 
 /// One layer of the level as seen this frame.
 pub struct LayerFrame {
     /// Which layer (0 is the bottom).
     pub index: usize,
-    /// The layer's tiles, then the fringes where materials meet and the
-    /// trims along their edges, drawn under both `visible` and
-    /// `remembered`. Wherever fringes and trims show, the layer isn't void.
-    pub tiles: Arc<Mesh>,
-    pub fringes: Arc<Mesh>,
-    pub trims: Arc<Mesh>,
+    /// What's drawn of the layer whatever's seen: its tiles, then the
+    /// fringes where materials meet and the trims along their edges, drawn
+    /// under both `visible` and `remembered` (wherever fringes and trims
+    /// show, the layer isn't void); and where it's void, and liquid.
+    pub meshes: Arc<LayerMeshes>,
     /// Drawn over `tiles` where the viewer can currently see.
     pub visible: Canvas,
     /// Drawn over `tiles` where the viewer has seen before but can't now.
@@ -30,11 +30,6 @@ pub struct LayerFrame {
     /// Convex pieces of solid lit along with the polygon (which stops at
     /// wall faces): the band one tile behind the visible stretches of wall.
     pub lit_shapes: Vec<Vec<[f32; 2]>>,
-    /// Where this layer is void: where the layer below shows through.
-    pub voids: Arc<Mesh>,
-    /// The part of `voids` that is liquid: drawn as a translucent tint
-    /// over the layer below instead of simply showing it.
-    pub liquid: Arc<Mesh>,
     /// Sprites of things standing on this layer: wherever they're opaque,
     /// the layer is drawn over any void beneath them rather than letting
     /// the layer below show through.

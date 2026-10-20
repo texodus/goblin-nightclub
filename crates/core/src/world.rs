@@ -11,13 +11,15 @@
 //! out of sight. A level that fits in one window is played whole, and
 //! never moves.
 
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::chunk::{CHUNK, Chunk, ChunkKey, Chunks};
-use crate::layer::{Layer, QUARTERS, Tile};
-use crate::level::{Level, MAX_VISIBLE, movement_layer};
+use crate::layer::{Layer, Piece, QUARTERS, Tile};
+use crate::level::{LayerMeshes, Level, MAX_VISIBLE, MeshPiece, movement_solid};
 use crate::level_file::LevelFile;
+use crate::mesh::Mesh;
 use crate::tileset::Tileset;
 
 /// Chunks a window reaches either side of the chunk it's centered on.
@@ -27,6 +29,96 @@ pub const WINDOW_REACH: usize = 3;
 /// stairs, and above for the stairs.
 pub const WINDOW_BELOW: usize = MAX_VISIBLE;
 pub const WINDOW_ABOVE: usize = 2;
+
+/// [`Piece`]s kept for the next window: about two windows' worth.
+pub const PIECES_KEPT: usize = 3000;
+/// [`MeshPiece`]s kept for the next window: a window's worth (one a chunk
+/// of each layer seen) and a column more, as they're big.
+pub const MESH_PIECES_KEPT: usize = 450;
+
+/// What a [`Piece`] is of: a layer, where it blocks movement, or where it
+/// blocks the view of it from layer `top` (see [`Level::view`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PieceOf {
+    Tiles,
+    Movement,
+    View { top: usize },
+}
+
+/// Pieces of layers made for a window, kept for the next one, which
+/// shares most of its chunks: of their geometry ([`Piece`]s) and what's
+/// drawn of them ([`MeshPiece`]s), those used most recently. Each is of a
+/// chunk of the level, the same in any window.
+#[derive(Default)]
+pub struct Pieces {
+    geometry: Kept<(PieceOf, ChunkKey), Piece>,
+    meshes: Kept<ChunkKey, MeshPiece>,
+}
+
+impl Pieces {
+    /// The piece of `of` over chunk `key`, made by `make` unless it's kept.
+    pub fn get(&mut self, of: PieceOf, key: ChunkKey, make: impl FnOnce() -> Piece) -> Arc<Piece> {
+        self.geometry.get((of, key), PIECES_KEPT, make)
+    }
+
+    /// What's drawn of chunk `key`, made by `make` unless it's kept.
+    pub fn meshes(&mut self, key: ChunkKey, make: impl FnOnce() -> MeshPiece) -> Arc<MeshPiece> {
+        self.meshes.get(key, MESH_PIECES_KEPT, make)
+    }
+
+    /// How many pieces of geometry have been made, all told.
+    pub fn made(&self) -> usize {
+        self.geometry.made
+    }
+
+    /// How many [`MeshPiece`]s have been made, all told.
+    pub fn meshes_made(&self) -> usize {
+        self.meshes.made
+    }
+}
+
+/// Things kept by key, the most recently used.
+struct Kept<K, T> {
+    kept: HashMap<K, (Arc<T>, u64)>,
+    /// Counts uses, to tell the most recent.
+    clock: u64,
+    /// How many have been made.
+    made: usize,
+}
+
+impl<K, T> Default for Kept<K, T> {
+    fn default() -> Self {
+        Self {
+            kept: HashMap::new(),
+            clock: 0,
+            made: 0,
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq, T> Kept<K, T> {
+    /// The thing kept by `key`, made by `make` if there's none, keeping
+    /// about `most`.
+    fn get(&mut self, key: K, most: usize, make: impl FnOnce() -> T) -> Arc<T> {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some((thing, used)) = self.kept.get_mut(&key) {
+            *used = clock;
+            return thing.clone();
+        }
+        let thing = Arc::new(make());
+        self.made += 1;
+        self.kept.insert(key, (thing.clone(), clock));
+        // Down to the most recent, a batch at a time.
+        if self.kept.len() > most + most / 4 {
+            let mut uses: Vec<u64> = self.kept.values().map(|&(_, used)| used).collect();
+            let gone = self.kept.len() - most;
+            let cut = *uses.select_nth_unstable(gone).1;
+            self.kept.retain(|_, &mut (_, used)| used >= cut);
+        }
+        thing
+    }
+}
 
 /// Where a level's chunks come from: a file, a generator, a server.
 pub trait ChunkSource {
@@ -190,6 +282,15 @@ impl Window {
         }
     }
 
+    /// Tiles across and down of its chunk `(x, y)` (from its top left)
+    /// that are in the level.
+    pub fn chunk_size(&self, x: usize, y: usize) -> [usize; 2] {
+        [
+            CHUNK.min(self.cols - x * CHUNK),
+            CHUNK.min(self.rows - y * CHUNK),
+        ]
+    }
+
     /// Its top-left tile in the level.
     pub fn tile_origin(&self) -> [i32; 2] {
         self.origin.map(|c| c * CHUNK as i32)
@@ -220,12 +321,14 @@ impl Window {
     }
 }
 
-/// A window being made into a [`Level`], a piece at a time: the roofs over
+/// A window being made into a [`Level`], a step at a time: the roofs over
 /// it, each layer, then what's drawn of the layers seen from the
 /// player's, then what they're seen through, so swapping it in costs
-/// nothing more.
+/// nothing more. Each layer's geometry is made of [`Piece`]s, those of
+/// chunks a window before had reused.
 pub struct Build {
     source: Rc<dyn ChunkSource>,
+    pieces: Arc<Mutex<Pieces>>,
     window: Window,
     roofs: Option<Vec<Roof>>,
     /// The layer it's for, local to the window.
@@ -235,6 +338,10 @@ pub struct Build {
     level: Option<Level>,
     /// How many of the pieces after the level are done.
     done: usize,
+    /// What's drawn of the layers seen, as made, and where they show
+    /// through.
+    made: Vec<Arc<LayerMeshes>>,
+    shafts: Vec<Arc<Mesh>>,
 }
 
 impl Build {
@@ -243,6 +350,7 @@ impl Build {
     pub fn new(source: Rc<dyn ChunkSource>, window: Window, top: usize) -> Self {
         Self {
             source,
+            pieces: Default::default(),
             window,
             roofs: None,
             top: top.clamp(window.base, window.base + window.depth - 1) - window.base,
@@ -250,11 +358,32 @@ impl Build {
             movement: Vec::new(),
             level: None,
             done: 0,
+            made: Vec::new(),
+            shafts: Vec::new(),
         }
+    }
+
+    /// Reusing the pieces in `pieces` (those of the window before), and
+    /// keeping those it makes there for the next.
+    pub fn with_pieces(mut self, pieces: Arc<Mutex<Pieces>>) -> Self {
+        self.pieces = pieces;
+        self
+    }
+
+    /// The pieces it reuses and keeps.
+    pub fn pieces(&self) -> Arc<Mutex<Pieces>> {
+        self.pieces.clone()
     }
 
     pub fn window(&self) -> Window {
         self.window
+    }
+
+    /// The meshes of the layers seen made so far, which a renderer can
+    /// have ready by the time the level's done.
+    pub fn meshes(&self) -> impl Iterator<Item = &Mesh> {
+        let shafts = self.shafts.iter().map(|m| &**m);
+        self.made.iter().flat_map(|m| m.all()).chain(shafts)
     }
 
     /// Make one more piece: whether it's all made. A layer whose chunks
@@ -272,17 +401,31 @@ impl Build {
         }
         let k = self.layers.len();
         if self.level.is_none() && k < w.depth {
-            let keys = (0..w.chunks[1] as i32).flat_map(|y| {
-                (0..w.chunks[0] as i32).map(move |x| (w.base + k, w.origin[0] + x, w.origin[1] + y))
-            });
+            let keys: Vec<ChunkKey> = (0..w.chunks[1] as i32)
+                .flat_map(|y| {
+                    (0..w.chunks[0] as i32)
+                        .map(move |x| (w.base + k, w.origin[0] + x, w.origin[1] + y))
+                })
+                .collect();
             // Likewise.
-            let chunks: Vec<_> = keys.map(|key| self.source.chunk(key)).collect();
-            let Some(chunks) = chunks.into_iter().collect() else {
+            let chunks: Vec<_> = keys.iter().map(|&key| self.source.chunk(key)).collect();
+            let Some(chunks) = chunks.into_iter().collect::<Option<Vec<_>>>() else {
                 return false;
             };
-            let layer =
-                Layer::from_chunks(Chunks::from_chunks(w.cols, w.rows, chunks)).at(w.tile_origin());
-            self.movement.push(movement_layer(&layer));
+            let mut kept = self.pieces.lock().unwrap();
+            let (mut tiles, mut movement) = (Vec::new(), Vec::new());
+            for (i, (key, chunk)) in keys.into_iter().zip(chunks).enumerate() {
+                let [w, h] = w.chunk_size(i % w.chunks[0], i / w.chunks[0]);
+                movement.push(kept.get(PieceOf::Movement, key, || {
+                    let at = |t: usize| movement_solid(chunk.get(t % w, t / w));
+                    Piece::from_solids([w, h], (0..w * h).map(at).collect())
+                }));
+                tiles.push(kept.get(PieceOf::Tiles, key, || Piece::new(chunk, [w, h])));
+            }
+            drop(kept);
+            let layer = Layer::from_pieces(w.cols, w.rows, &tiles).at(w.tile_origin());
+            self.movement
+                .push(Layer::from_pieces(w.cols, w.rows, &movement));
             self.layers.push(layer);
             return false;
         }
@@ -291,11 +434,8 @@ impl Build {
                 std::mem::take(&mut self.layers),
                 std::mem::take(&mut self.movement),
             );
-            self.level = Some(Level::from_parts(
-                layers,
-                movement,
-                self.source.tileset().clone(),
-            ));
+            let level = Level::from_parts(layers, movement, self.source.tileset().clone());
+            self.level = Some(level.placed(w.base, w.origin, self.pieces.clone()));
             return false;
         };
         // Then a layer seen from `top` a piece: its art, then what it's
@@ -304,10 +444,10 @@ impl Build {
         let Some(&k) = seen.get(self.done) else {
             return true;
         };
-        level.meshes(k);
+        self.made.push(level.meshes(k).clone());
         level.view(self.top, k);
         if k < self.top {
-            level.shaft_mesh(self.top, k);
+            self.shafts.push(level.shaft_mesh(self.top, k));
         }
         self.done += 1;
         self.done == seen.len()
@@ -328,9 +468,38 @@ impl Build {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::draw::{Canvas, Vertex};
+    use crate::fringe::{draw_fringes, draw_trims};
     use crate::layer::{Dir, Part, Solid};
+    use crate::level::MeshPiece;
     use crate::level_file::Spawn;
+    use crate::mesh::Mesh;
     use crate::rng::Rng;
+
+    /// Triangles of `vertices` moved `by` (as the renderer moves them),
+    /// each vertex all it says, rounded (to a thousandth of a pixel).
+    fn triangles(vertices: &[Vertex], by: [f32; 2]) -> Vec<[Vec<i64>; 3]> {
+        let r = |v: f32| (v * 1000.0).round() as i64;
+        let key = |v: &Vertex| {
+            // Where a fringe grows from moves too; for anything else it
+            // means nothing.
+            let edge = if v.reach > 0.0 {
+                [v.edge[0] + by[0], v.edge[1] + by[1], v.edge[2], v.edge[3]]
+            } else {
+                [0.0; 4]
+            };
+            let at = [v.pos[0] + by[0], v.pos[1] + by[1]];
+            [&at[..], &v.uv, &v.cell, &v.color, &edge, &[v.reach]]
+                .concat()
+                .into_iter()
+                .map(r)
+                .collect::<Vec<_>>()
+        };
+        vertices
+            .chunks(3)
+            .map(|t| [key(&t[0]), key(&t[1]), key(&t[2])])
+            .collect()
+    }
 
     /// A level file `cols` x `rows` x `depth` of random tiles: floor,
     /// wall, void, splits, stairs.
@@ -480,6 +649,149 @@ mod tests {
     }
 
     #[test]
+    fn windows_reuse_the_pieces_of_the_one_before() {
+        use crate::level::movement_layer;
+        let mut file = file(7, 300, 90, 5);
+        // Art with variants, fringes and trims, so there's all of it to draw.
+        file.tileset.floors[0].cells = (0..8).map(|i| [i, 1]).collect();
+        file.tileset.floors[0].edge.width = 3.0;
+        file.tileset.floors[0].trim = Some(crate::tileset::Trim {
+            cells: vec![[9, 3], [10, 3]],
+            density: 0.8,
+            inset: 2.0,
+        });
+        let whole = file.level();
+        let source: Rc<dyn ChunkSource> = Rc::new(FileSource::new(&file));
+        let (a, b) = (
+            Window::around(source.size(), [100, 40], 4),
+            Window::around(source.size(), [140, 40], 4),
+        );
+        assert_eq!(b.origin, [a.origin[0] + 1, a.origin[1]]);
+        let first = Build::new(source.clone(), a, 4);
+        let pieces = first.pieces();
+        first.finish();
+        let (made, drawn) = {
+            let p = pieces.lock().unwrap();
+            (p.made(), p.meshes_made())
+        };
+        let (level, _) = Build::new(source.clone(), b, 4)
+            .with_pieces(pieces.clone())
+            .finish();
+        // Only the chunks new to it were made: a column, on each layer, of
+        // tiles, movement and each view.
+        let p = pieces.lock().unwrap();
+        let seen = level.visible_layers(4).len();
+        assert_eq!(p.made() - made, b.chunks[1] * (2 * b.depth + seen));
+        // And what's drawn, of each layer seen.
+        assert_eq!(p.meshes_made() - drawn, b.chunks[1] * seen);
+        drop(p);
+
+        // And all is as if made afresh, here and at the level's corner,
+        // where its chunks are cut short.
+        let afresh = |level: &Level, b: Window| {
+            let [x0, y0] = b.tile_origin();
+            let layers: Vec<Layer> = (0..b.depth)
+                .map(|k| {
+                    let tile = |t: usize| {
+                        let [x, y] = [(t % b.cols) as i32 + x0, (t / b.cols) as i32 + y0];
+                        whole.layer(b.base + k).tile(x, y)
+                    };
+                    Layer::from_tiles(b.cols, b.rows, (0..b.cols * b.rows).map(tile).collect())
+                        .at([x0, y0])
+                })
+                .collect();
+            let movement = layers.iter().map(movement_layer).collect();
+            let fresh = Level::from_parts(layers, movement, file.tileset.clone());
+            let same = |a: &Layer, b: &Layer, what: &str| {
+                assert_eq!(a.corners(), b.corners(), "{what}");
+                assert_eq!(a.outline_edges(), b.outline_edges(), "{what}");
+                assert_eq!(a.concave_corners(), b.concave_corners(), "{what}");
+            };
+            for k in 0..b.depth {
+                same(level.layer(k), fresh.layer(k), &format!("layer {k}"));
+                same(
+                    level.movement(k),
+                    fresh.movement(k),
+                    &format!("movement {k}"),
+                );
+            }
+            for k in level.visible_layers(4) {
+                same(
+                    &level.view(4, k),
+                    &fresh.view(4, k),
+                    &format!("view of {k}"),
+                );
+                // What's drawn: each piece's triangles, where it goes, and
+                // those along the chunks' edges, are those of drawing the
+                // whole layer at once (to within rounding where they're
+                // moved).
+                let (m, layer) = (level.meshes(k), fresh.layer(k));
+                let tileset = &file.tileset;
+                let whole = |draw: fn(&Layer, &Tileset, &mut Canvas, usize, usize)| {
+                    let mut canvas = Canvas::new(tileset);
+                    for y in 0..b.rows {
+                        for x in 0..b.cols {
+                            draw(layer, tileset, &mut canvas, x, y);
+                        }
+                    }
+                    triangles(&canvas.vertices, [0.0; 2])
+                };
+                let quarters = |q: fn(Tile) -> u8| {
+                    let mesh = Mesh::quarters(b.cols, b.rows, Canvas::new(tileset), |x, y| {
+                        q(layer.tile(x as i32, y as i32))
+                    });
+                    triangles(&mesh.vertices, [0.0; 2])
+                };
+                let pieces = |of: fn(&MeshPiece) -> &Mesh, along: Option<&Mesh>| {
+                    let mut all = triangles(along.map_or(&[], |m| &m.vertices), [0.0; 2]);
+                    for (i, piece) in m.pieces.iter().enumerate() {
+                        all.extend(triangles(&of(piece).vertices, m.corner(i)));
+                    }
+                    all.sort();
+                    all
+                };
+                let draw_tile: fn(&Layer, &Tileset, &mut Canvas, usize, usize) =
+                    |l, t, c, x, y| l.draw_tile(t, c, x, y);
+                let pairs = [
+                    (pieces(|p| &p.tiles, None), whole(draw_tile), "tiles"),
+                    (
+                        pieces(|p| &p.fringes, Some(&m.fringes)),
+                        whole(draw_fringes),
+                        "fringes",
+                    ),
+                    (
+                        pieces(|p| &p.trims, Some(&m.trims)),
+                        whole(draw_trims),
+                        "trims",
+                    ),
+                    (
+                        pieces(|p| &p.voids, None),
+                        quarters(|t| t.void_quarters()),
+                        "voids",
+                    ),
+                    (
+                        pieces(|p| &p.liquid, None),
+                        quarters(|t| t.liquid_quarters()),
+                        "liquid",
+                    ),
+                ];
+                for (drawn, mut expected, what) in pairs {
+                    expected.sort();
+                    assert!(!expected.is_empty() || what == "liquid", "{what} of {k}");
+                    assert!(drawn == expected, "{what} of {k}");
+                }
+            }
+        };
+        afresh(&level, b);
+        let c = Window::around(source.size(), [295, 85], 4);
+        assert!(!c.cols.is_multiple_of(CHUNK) && !c.rows.is_multiple_of(CHUNK));
+        let (corner, _) = Build::new(source.clone(), c, 4)
+            .with_pieces(pieces)
+            .finish();
+        afresh(&corner, c);
+    }
+
+    #[test]
     fn builds_go_a_piece_at_a_time_and_wait_for_chunks() {
         struct Slow(
             FileSource,
@@ -514,6 +826,20 @@ mod tests {
         // layer waiting once for its chunks, all asked for together.
         let seen = build.level.as_ref().unwrap().visible_layers(2).len();
         assert_eq!(steps, 1 + 2 * w.depth + 1 + seen);
+        // What's drawn of those, to have ready: what the level draws.
+        let made: Vec<u64> = build.meshes().map(|m| m.id()).collect();
+        let (level, _) = build.finish();
+        let seen = level.visible_layers(2);
+        let mut drawn: Vec<u64> = seen
+            .iter()
+            .flat_map(|&k| level.meshes(k).all().map(|m| m.id()))
+            .collect();
+        let below = seen.iter().filter(|&&k| k < 2);
+        drawn.extend(below.map(|&k| level.shaft_mesh(2, k).id()));
+        assert_eq!(made, drawn);
+        // And it comes apart: each layer, each to move by, and each seen
+        // through.
+        assert!(level.take_apart().len() >= 2 * w.depth);
     }
 
     #[test]

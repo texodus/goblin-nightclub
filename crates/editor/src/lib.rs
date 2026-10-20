@@ -711,16 +711,12 @@ impl Editor {
                 let meshes = self.level.meshes(k);
                 LayerFrame {
                     index: k,
-                    tiles: meshes.tiles.clone(),
-                    fringes: meshes.fringes.clone(),
-                    trims: meshes.trims.clone(),
+                    meshes: meshes.clone(),
                     remembered: visible.clone(),
                     visible,
                     unknown: Canvas::new(&self.tileset),
                     polygon: everywhere.clone(),
                     lit_shapes: Vec::new(),
-                    voids: meshes.voids.clone(),
-                    liquid: meshes.liquid.clone(),
                     standing: Canvas::new(&self.tileset),
                     shaft: (k < top).then(|| self.level.shaft_mesh(top, k)),
                 }
@@ -987,7 +983,8 @@ mod tests {
             frame.layers.iter().map(|l| l.index).collect::<Vec<_>>(),
             [1, 0]
         );
-        assert_eq!(frame.layers[0].voids.vertices.len(), 6, "one void tile");
+        let voids = &frame.layers[0].meshes.pieces[0].voids;
+        assert_eq!(voids.vertices.len(), 6, "one void tile");
         assert_eq!(frame.layers[0].polygon.len(), 4, "the whole level in view");
         assert!(!frame.overlay.vertices.is_empty(), "the grid");
     }

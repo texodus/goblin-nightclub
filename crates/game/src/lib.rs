@@ -2,6 +2,7 @@
 
 mod stream;
 
+use std::any::Any;
 use std::rc::Rc;
 
 use goblin_nightclub_core::camera::{self, Camera};
@@ -14,6 +15,7 @@ use goblin_nightclub_core::layer::{Dir, QUARTERS, Solid, TILE, quarter_at};
 use goblin_nightclub_core::level::Level;
 use goblin_nightclub_core::level_file::{LevelFile, LevelMeta};
 use goblin_nightclub_core::memory::Memory;
+use goblin_nightclub_core::mesh::Mesh;
 use goblin_nightclub_core::palette;
 use goblin_nightclub_core::path;
 use goblin_nightclub_core::rng::Rng;
@@ -61,6 +63,8 @@ pub struct Game {
     /// For a level played a window at a time: where the window is, the
     /// next one, and what's kept between them.
     stream: Option<Stream>,
+    /// What's left of the last window's level, to drop a little at a time.
+    litter: Vec<Box<dyn Any>>,
     sprites: Sprites,
     /// The player's layer.
     top: usize,
@@ -152,6 +156,10 @@ const NPC_DENSITY: usize = 4;
 const NPC_PER_CHUNK: usize = (NPC_DENSITY * CHUNK * CHUNK).div_ceil(640);
 /// NPCs spawn at least this far (pixels) from the player.
 const NPC_SPAWN_DIST: f32 = 60.0;
+
+/// Pieces of the last window's level dropped each update (see
+/// [`Level::take_apart`]).
+const LITTER_PER_UPDATE: usize = 2;
 
 /// The pause button, in interface pixels from the top-right corner.
 const BUTTON_SIZE: [f32; 2] = [14.0, 12.0];
@@ -254,6 +262,7 @@ impl Game {
             memories: (0..level.depth()).map(|_| Memory::default()).collect(),
             level,
             stream: None,
+            litter: Vec::new(),
             sprites,
             top,
             ground: 0,
@@ -273,6 +282,8 @@ impl Game {
     }
 
     pub fn update(&mut self, dt: f32) {
+        let left = self.litter.len().saturating_sub(LITTER_PER_UPDATE);
+        self.litter.truncate(left);
         // Arrow keys or WASD pan the view, paused or not.
         self.camera.pan(&self.input, dt);
         if self.paused {
@@ -288,6 +299,13 @@ impl Game {
         self.observe();
         self.check_route();
         self.advance_stream();
+    }
+
+    /// What's drawn of the next window, as it's made: to have ready for
+    /// when it's swapped in.
+    pub fn upcoming(&self) -> impl Iterator<Item = &Mesh> {
+        let next = self.stream.iter().flat_map(|s| &s.next);
+        next.flat_map(|b| b.meshes())
     }
 
     /// For a level played a window at a time: once the player has moved
@@ -306,9 +324,9 @@ impl Game {
                 if want == stream.window {
                     return;
                 }
-                stream
-                    .next
-                    .insert(Build::new(stream.source.clone(), want, top))
+                stream.next.insert(
+                    Build::new(stream.source.clone(), want, top).with_pieces(stream.pieces.clone()),
+                )
             }
         };
         if !build.step() {
@@ -364,7 +382,8 @@ impl Game {
         self.visions = stream.visions(&level, VIEW_RADIUS);
         let avoid = center(self.player, PLAYER_SIZE);
         self.npcs = stream.wake(&level, NPC_PER_CHUNK, avoid, NPC_SPAWN_DIST);
-        self.level = level;
+        let old = std::mem::replace(&mut self.level, level);
+        self.litter.extend(old.take_apart());
         self.observed = None;
         self.observe();
     }
@@ -851,16 +870,12 @@ impl Game {
 
                 LayerFrame {
                     index: k,
-                    tiles: meshes.tiles.clone(),
-                    fringes: meshes.fringes.clone(),
-                    trims: meshes.trims.clone(),
+                    meshes: meshes.clone(),
                     visible,
                     remembered,
                     unknown: Canvas::new(tileset),
                     polygon: vision.polygon().to_vec(),
                     lit_shapes: vision.wall_band().to_vec(),
-                    voids: meshes.voids.clone(),
-                    liquid: meshes.liquid.clone(),
                     standing,
                     shaft,
                 }
@@ -952,7 +967,7 @@ impl Opening {
     pub fn finish(self) -> Result<Game, String> {
         let meta = &self.meta;
         let size = [meta.cols, meta.rows, meta.depth];
-        let window = self.build.window();
+        let (window, pieces) = (self.build.window(), self.build.pieces());
         let (level, roofs) = self.build.finish();
         let o = window.tile_origin().map(|t| t as f32 * TILE);
         let [x, y] = meta.spawn.pos;
@@ -970,7 +985,7 @@ impl Opening {
             game.ground = meta.ground.min(size[2] - 1);
             return Ok(game);
         }
-        let mut stream = Stream::new(self.source, window, roofs, self.seed);
+        let mut stream = Stream::new(self.source, window, roofs, pieces, self.seed);
         let avoid = center(player, PLAYER_SIZE);
         let npcs = stream.wake(&level, NPC_PER_CHUNK, avoid, NPC_SPAWN_DIST);
         let rng = Rng::new(self.seed ^ 0x9E37_79B9);
@@ -1776,7 +1791,9 @@ mod tests {
         // Player and the visible NPC: a square each.
         assert_eq!(top.standing.vertices.len(), 2 * 6);
         // The void row, a rectangle in each chunk it crosses.
-        let area: f32 = (top.voids.vertices.chunks(3))
+        let voids = top.meshes.pieces.iter().flat_map(|p| &p.voids.vertices);
+        let voids: Vec<_> = voids.collect();
+        let area: f32 = (voids.chunks(3))
             .map(|t| {
                 let [a, b, c] = [t[0].pos, t[1].pos, t[2].pos];
                 ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0

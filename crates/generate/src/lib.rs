@@ -101,7 +101,7 @@ impl Default for Params {
     fn default() -> Self {
         Self {
             overworld_layers: 4,
-            underworld_layers: 10,
+            underworld_layers: 5,
             terrain_scale: 14.0,
             hill_share: 0.4,
             mountain_share: 0.25,

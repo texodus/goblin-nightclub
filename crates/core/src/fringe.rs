@@ -225,6 +225,7 @@ fn hash(ns: [u32; 4]) -> f32 {
 /// (inside the level): by chance, a sprite at a random spot along each,
 /// moved into the part by the trim's inset.
 pub fn draw_trims(layer: &Layer, tileset: &Tileset, canvas: &mut Canvas, x: usize, y: usize) {
+    let origin = [x as f32 * TILE, y as f32 * TILE];
     for (part, edges) in pieces(layer, x, y) {
         let Some(trim) = tileset.trim(part) else {
             continue;
@@ -247,14 +248,14 @@ pub fn draw_trims(layer: &Layer, tileset: &Tileset, canvas: &mut Canvas, x: usiz
             if key(0) >= trim.density {
                 continue;
             }
+            // From the tile's corner, so it's placed the same wherever the
+            // tile is drawn (see [`Canvas::sprite_from`]).
             let t = 0.2 + 0.6 * key(1);
-            let on = [
-                e.a[0] + (e.b[0] - e.a[0]) * t,
-                e.a[1] + (e.b[1] - e.a[1]) * t,
-            ];
+            let [a, b] = [e.a, e.b].map(|p| [p[0] - origin[0], p[1] - origin[1]]);
+            let on = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
             let center = [on[0] - e.out[0] * inset, on[1] - e.out[1] * inset];
             let cell = trim.cells[(key(2) * trim.cells.len() as f32) as usize % trim.cells.len()];
-            canvas.sprite(center, cell, palette::WHITE);
+            canvas.sprite_from(origin, center, cell, palette::WHITE);
         }
     }
 }

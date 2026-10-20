@@ -41,6 +41,7 @@ use goblin_nightclub_core::draw::Vertex;
 use goblin_nightclub_core::frame::{Frame, LayerFrame};
 use goblin_nightclub_core::layer::TILE;
 use goblin_nightclub_core::level::MAX_VISIBLE;
+use goblin_nightclub_core::level::MeshPiece;
 use goblin_nightclub_core::mesh::Mesh;
 use goblin_nightclub_core::tileset::Sheet;
 
@@ -484,20 +485,17 @@ struct PageDraw {
     rect: Rect,
 }
 
-/// A mesh kept on the GPU, and which mesh it is.
-struct Uploaded {
-    id: u64,
+/// A mesh kept on the GPU (see [`Renderer::keep`]).
+struct Kept {
     /// `None` for a mesh with no triangles.
     buffer: Option<wgpu::Buffer>,
+    /// Whether it's been drawn or offered since the last frame drawn.
+    used: bool,
 }
 
-/// Which of a layer's meshes, in [`Renderer::meshes`].
-const TILES: usize = 0;
-const VOIDS: usize = 1;
-const LIQUID: usize = 2;
-const SHAFT: usize = 3;
-const FRINGES: usize = 4;
-const TRIMS: usize = 5;
+/// A draw of a range of a vertex buffer's vertices, moved by an entry of
+/// [`Renderer::shifts`] (0, none).
+type Draw<'a> = (&'a wgpu::Buffer, Range<u32>, u32);
 
 /// What's sized to the screen, a slot each.
 struct Screen {
@@ -548,9 +546,25 @@ pub struct Renderer {
     /// What goes into those each frame, kept to reuse the memory.
     canvas_scratch: Vec<Vertex>,
     mask_scratch: Vec<Vertex>,
-    /// Per layer drawn: its tiles, voids, liquid, shaft, fringes and trims
-    /// meshes, as last drawn.
-    meshes: HashMap<usize, [Option<Uploaded>; 6]>,
+    /// By mesh id, those on the GPU: drawn, or offered to be (see
+    /// [`Renderer::preload`]). A layer's meshes are mostly its chunks'
+    /// (see [`goblin_nightclub_core::level::LayerMeshes`]), shared with the windows before and after
+    /// it, so they stay as long as any has them.
+    meshes: HashMap<u64, Kept>,
+    /// What each draw moves its vertices by, per frame: nothing, then
+    /// where each piece of each layer drawn goes.
+    shifts: GrowBuffer,
+}
+
+/// `mesh`'s triangles on the GPU, if it has any.
+fn mesh_buffer(device: &wgpu::Device, mesh: &Mesh) -> Option<wgpu::Buffer> {
+    (!mesh.vertices.is_empty()).then(|| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh"),
+            contents: bytemuck::cast_slice(&mesh.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        })
+    })
 }
 
 fn js_err(e: impl std::fmt::Display) -> JsError {
@@ -670,6 +684,12 @@ impl Renderer {
                 5 => Float32,
             ],
         };
+        // And where each draw moves them to (see `Renderer::shifts`).
+        let shift_layout = wgpu::VertexBufferLayout {
+            array_stride: size_of::<[f32; 2]>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![6 => Float32x2],
+        };
         let triangles =
             |label, layout: &wgpu::PipelineLayout, fs, target: wgpu::ColorTargetState, samples| {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -679,7 +699,7 @@ impl Renderer {
                         module: &shapes,
                         entry_point: Some("vs_main"),
                         compilation_options: Default::default(),
-                        buffers: &[Some(vertex_layout.clone())],
+                        buffers: &[Some(vertex_layout.clone()), Some(shift_layout.clone())],
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &shapes,
@@ -793,6 +813,7 @@ impl Renderer {
         let canvas_vertices =
             GrowBuffer::new(&device, "canvas vertices", wgpu::BufferUsages::VERTEX);
         let mask_vertices = GrowBuffer::new(&device, "mask vertices", wgpu::BufferUsages::VERTEX);
+        let shifts = GrowBuffer::new(&device, "shifts", wgpu::BufferUsages::VERTEX);
         Ok(Self {
             surface,
             device,
@@ -824,6 +845,7 @@ impl Renderer {
             canvas_scratch: Vec::new(),
             mask_scratch: Vec::new(),
             meshes: HashMap::new(),
+            shifts,
         })
     }
 
@@ -978,25 +1000,25 @@ impl Renderer {
             }));
     }
 
-    /// Keep `mesh` on the GPU as layer `layer`'s mesh `which`, unless it
-    /// already is.
-    fn upload(&mut self, layer: usize, which: usize, mesh: &Mesh) {
-        let kept = &mut self.meshes.entry(layer).or_default()[which];
-        if kept.as_ref().is_some_and(|u| u.id == mesh.id()) {
-            return;
+    /// Keep `mesh` on the GPU, putting it there unless it is, through
+    /// the next frame drawn; after that, only if it's kept again.
+    fn keep(&mut self, mesh: &Mesh) {
+        let device = &self.device;
+        let kept = self.meshes.entry(mesh.id()).or_insert_with(|| Kept {
+            buffer: mesh_buffer(device, mesh),
+            used: false,
+        });
+        kept.used = true;
+    }
+
+    /// Put `meshes` on the GPU ahead of drawing them, those not there
+    /// already: a level's being made (offered a few more each frame, as
+    /// they're made), so the frame it's first drawn needn't. Those not
+    /// offered again (or drawn) before the next frame's drawn are let go.
+    pub fn preload<'a>(&mut self, meshes: impl IntoIterator<Item = &'a Mesh>) {
+        for mesh in meshes {
+            self.keep(mesh);
         }
-        let buffer = (!mesh.vertices.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh"),
-                    contents: bytemuck::cast_slice(&mesh.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
-        *kept = Some(Uploaded {
-            id: mesh.id(),
-            buffer,
-        });
     }
 
     /// Hand the pages whose pixels have reached the CPU to [`Pages`].
@@ -1153,18 +1175,19 @@ impl Renderer {
             .filter(|l| frame.top - l.index < MAX_VISIBLE)
             .collect();
         let slot = |index: usize| frame.top - index;
-        self.meshes
-            .retain(|index, _| layers.iter().any(|l| l.index == *index));
+        // Each layer's meshes on the GPU, and where each of its pieces
+        // goes: its first in `shifts` at `firsts`.
+        let mut shifts = vec![[0.0f32; 2]];
+        let mut firsts = Vec::new();
         for l in &layers {
-            self.upload(l.index, TILES, &l.tiles);
-            self.upload(l.index, FRINGES, &l.fringes);
-            self.upload(l.index, TRIMS, &l.trims);
-            self.upload(l.index, VOIDS, &l.voids);
-            self.upload(l.index, LIQUID, &l.liquid);
-            if let Some(shaft) = &l.shaft {
-                self.upload(l.index, SHAFT, shaft);
+            for mesh in l.meshes.all().chain(l.shaft.as_deref()) {
+                self.keep(mesh);
             }
+            firsts.push(shifts.len() as u32);
+            shifts.extend((0..l.meshes.pieces.len()).map(|i| l.meshes.corner(i)));
         }
+        self.shifts
+            .write(&self.device, &self.queue, bytemuck::cast_slice(&shifts));
 
         // Everything else goes in two buffers; each pass draws its range.
         let mut canvas_vertices = std::mem::take(&mut self.canvas_scratch);
@@ -1320,6 +1343,8 @@ impl Renderer {
         );
         self.canvas_scratch = canvas_vertices;
         self.mask_scratch = mask_vertices;
+        self.meshes
+            .retain(|_, kept| std::mem::replace(&mut kept.used, false));
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         self.apply_page_ops(&mut encoder);
@@ -1408,31 +1433,32 @@ impl Renderer {
         let screen_textures = self.screen.as_ref().unwrap();
 
         // One pass with `pipeline` through `transform`, drawing each range
-        // of a vertex buffer in turn.
-        type Draws<'a> = [(&'a wgpu::Buffer, Range<u32>)];
+        // of a vertex buffer in turn, moved by its shift.
+        let shift_buffer = &self.shifts.buffer;
         let pass = |encoder: &mut wgpu::CommandEncoder,
                     attachment: wgpu::RenderPassColorAttachment,
                     pipeline: &wgpu::RenderPipeline,
                     transform: &wgpu::BindGroup,
                     extra: Option<&wgpu::BindGroup>,
-                    draws: &Draws| {
+                    draws: &[Draw]| {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pass"),
                 color_attachments: &[Some(attachment)],
                 ..Default::default()
             });
             let mut ready = false;
-            for (buffer, range) in draws.iter().filter(|(_, r)| !r.is_empty()) {
+            for (buffer, range, shift) in draws.iter().filter(|(_, r, _)| !r.is_empty()) {
                 if !ready {
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, transform, &[]);
                     if let Some(group) = extra {
                         pass.set_bind_group(1, group, &[]);
                     }
+                    pass.set_vertex_buffer(1, shift_buffer.slice(..));
                     ready = true;
                 }
                 pass.set_vertex_buffer(0, buffer.slice(..));
-                pass.draw(range.clone(), 0..1);
+                pass.draw(range.clone(), *shift..*shift + 1);
             }
         };
         let keep = |view| wgpu::RenderPassColorAttachment {
@@ -1444,31 +1470,53 @@ impl Renderer {
                 store: wgpu::StoreOp::Store,
             },
         };
-        // Layer `a`'s mesh `which`: the chunks of it in `view` (`None` for
-        // all of it).
-        let mesh = |a: usize, which: usize, m: &Mesh, view: Option<Rect>| {
-            let Some(Some(Uploaded {
+        // Mesh `m`'s chunks that reach into `view`, moved by shift
+        // `shift` (`view` is where they are before that): as few draws as
+        // there are runs of them side by side in its buffer.
+        let mesh = |m: &Mesh, view: Rect, shift: u32| -> Vec<Draw> {
+            let Some(Kept {
                 buffer: Some(buffer),
                 ..
-            })) = self.meshes.get(&a).map(|kept| &kept[which])
+            }) = self.meshes.get(&m.id())
             else {
                 return Vec::new();
             };
-            let ranges = view.map_or_else(|| vec![m.all()], |v| m.ranges(v));
-            ranges.into_iter().map(|r| (buffer, r)).collect::<Vec<_>>()
+            let mut ranges: Vec<Range<u32>> = Vec::new();
+            for r in m.ranges(view) {
+                match ranges.last_mut() {
+                    Some(last) if last.end == r.start => last.end = r.end,
+                    _ => ranges.push(r),
+                }
+            }
+            ranges.into_iter().map(|r| (buffer, r, shift)).collect()
+        };
+        // Of each piece of layer `l` (its first shift `first`), mesh `of`,
+        // where it reaches into `view`.
+        let pieces = |l: &LayerFrame, first: u32, of: fn(&MeshPiece) -> &Mesh, view: Rect| {
+            let mut draws = Vec::new();
+            for (i, piece) in l.meshes.pieces.iter().enumerate() {
+                let c = l.meshes.corner(i);
+                let local = view.map(|p| [p[0] - c[0], p[1] - c[1]]);
+                draws.extend(mesh(of(piece), local, first + i as u32));
+            }
+            draws
         };
 
         let mut page_transforms = self.page_transforms.iter();
-        for ((l, r), page_draws) in layers.iter().zip(&ranges).zip(&draws) {
+        for (((l, r), page_draws), &first) in layers.iter().zip(&ranges).zip(&draws).zip(&firsts) {
             let (a, s) = (l.index, slot(l.index));
-            let view = Some(frame.layer_view(a));
+            let view = frame.layer_view(a);
             let transform = &self.layer_transforms[s].bind_group;
             let (canvas, masks) = (&self.canvas_vertices.buffer, &self.mask_vertices.buffer);
-            // The tiles, then fringes and trims over them.
-            let mut tiles = mesh(a, TILES, &l.tiles, view);
+            // The tiles, then fringes and trims over them: the pieces', then
+            // those along their edges.
+            let m = &l.meshes;
+            let mut tiles = pieces(l, first, |p| &p.tiles, view);
             let edging = [
-                mesh(a, FRINGES, &l.fringes, view),
-                mesh(a, TRIMS, &l.trims, view),
+                pieces(l, first, |p| &p.fringes, view),
+                mesh(&m.fringes, view, 0),
+                pieces(l, first, |p| &p.trims, view),
+                mesh(&m.trims, view, 0),
             ]
             .concat();
             tiles.extend(edging.iter().cloned());
@@ -1485,7 +1533,7 @@ impl Renderer {
                 // The tiles under the visible and remembered canvases.
                 let under = if i < 2 { tiles.as_slice() } else { &[] };
                 let mut draws = under.to_vec();
-                draws.push((canvas, range.clone()));
+                draws.push((canvas, range.clone(), 0));
                 pass(
                     &mut encoder,
                     attachment,
@@ -1502,7 +1550,7 @@ impl Renderer {
                 &self.fill_pipeline,
                 transform,
                 None,
-                &mesh(a, VOIDS, &l.voids, view),
+                &pieces(l, first, |p| &p.voids, view),
             );
             // Liquid is void that tints what shows through: mark it half.
             pass(
@@ -1511,7 +1559,7 @@ impl Renderer {
                 &self.water_pipeline,
                 transform,
                 None,
-                &mesh(a, LIQUID, &l.liquid, view),
+                &pieces(l, first, |p| &p.liquid, view),
             );
             // Fringes and trims cover the void and water they reach over.
             pass(
@@ -1529,7 +1577,7 @@ impl Renderer {
                 &self.unmask_pipeline,
                 transform,
                 None,
-                &[(masks, r.standing.clone())],
+                &[(masks, r.standing.clone(), 0)],
             );
             let now = screen_textures.now_msaa[s].attachment(&screen_textures.now.layers[s], true);
             pass(
@@ -1538,13 +1586,13 @@ impl Renderer {
                 &self.mask_pipeline,
                 transform,
                 None,
-                &[(masks, r.visible.clone())],
+                &[(masks, r.visible.clone(), 0)],
             );
             // What's visible, into each page of `seen` it covers.
             for d in page_draws {
                 let onto = &page_transforms.next().unwrap().bind_group;
                 let page = keep(&seen.atlas.layers[d.slot as usize]);
-                let visible = [(masks, r.visible.clone())];
+                let visible = [(masks, r.visible.clone(), 0)];
                 match &l.shaft {
                     // Below the viewer: remembered as seen only where it
                     // shows through.
@@ -1555,7 +1603,7 @@ impl Renderer {
                             &self.fill_pipeline,
                             onto,
                             None,
-                            &mesh(a, SHAFT, shaft, Some(d.rect)),
+                            &mesh(shaft, d.rect, 0),
                         );
                         let group = Some(&seen.shaft_bind_group);
                         let pipeline = &self.seen_shaft_pipeline;
@@ -1601,7 +1649,7 @@ impl Renderer {
             &self.shape_pipeline,
             top,
             None,
-            &[(canvas, overlay)],
+            &[(canvas, overlay, 0)],
         );
         let ui_group = &self.ui_transform.bind_group;
         pass(
@@ -1610,7 +1658,7 @@ impl Renderer {
             &self.shape_pipeline,
             ui_group,
             None,
-            &[(canvas, ui)],
+            &[(canvas, ui, 0)],
         );
 
         self.queue.submit([encoder.finish()]);

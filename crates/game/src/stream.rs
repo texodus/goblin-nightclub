@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use goblin_nightclub_core::chunk::{CHUNK, ChunkKey};
 use goblin_nightclub_core::entity::{Entity, EntityId};
@@ -13,7 +14,7 @@ use goblin_nightclub_core::layer::{Edge, TILE};
 use goblin_nightclub_core::level::Level;
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::vision::Vision;
-use goblin_nightclub_core::world::{Build, ChunkSource, Roofs, Window};
+use goblin_nightclub_core::world::{Build, ChunkSource, Pieces, Roofs, Window};
 
 /// Words of bits for a chunk's tiles.
 const WORDS: usize = CHUNK * CHUNK / 64;
@@ -25,6 +26,8 @@ pub(crate) struct Stream {
     pub roofs: Roofs,
     /// The next one, being made.
     pub next: Option<Build>,
+    /// Pieces of the layers' geometry, kept from one window to the next.
+    pub pieces: Arc<Mutex<Pieces>>,
     /// Per chunk, its tiles ever explored, a bit each, row by row.
     explored: HashMap<ChunkKey, Box<[u64; WORDS]>>,
     /// Outline edges ever seen: the layer, and the ends in eighths of a
@@ -39,12 +42,19 @@ pub(crate) struct Stream {
 }
 
 impl Stream {
-    pub fn new(source: Rc<dyn ChunkSource>, window: Window, roofs: Roofs, seed: u32) -> Self {
+    pub fn new(
+        source: Rc<dyn ChunkSource>,
+        window: Window,
+        roofs: Roofs,
+        pieces: Arc<Mutex<Pieces>>,
+        seed: u32,
+    ) -> Self {
         Self {
             source,
             window,
             roofs,
             next: None,
+            pieces,
             explored: HashMap::new(),
             seen: HashSet::new(),
             asleep: HashMap::new(),

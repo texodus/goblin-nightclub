@@ -127,12 +127,19 @@ impl Canvas {
     /// [`Tileset::sprite_size`]) centered on `center`, snapped to whole
     /// sheet pixels so it lines up with the tiles' pixels.
     pub fn sprite(&mut self, center: [f32; 2], cell: Cell, color: Color) {
+        self.sprite_from([0.0; 2], center, cell, color);
+    }
+
+    /// The same, centered `center` from `origin`, a point on the sheet's
+    /// pixel grid (a tile's corner), and snapped from there: so it lands on
+    /// the same pixels, to the last bit, wherever `origin` is.
+    pub fn sprite_from(&mut self, origin: [f32; 2], center: [f32; 2], cell: Cell, color: Color) {
         let size = [TILE, TILE];
         let zoom = self.zoom();
         let snap = |v: f32| (v * zoom).round() / zoom;
         let [x0, y0] = [
-            snap(center[0] - size[0] / 2.0),
-            snap(center[1] - size[1] / 2.0),
+            origin[0] + snap(center[0] - size[0] / 2.0),
+            origin[1] + snap(center[1] - size[1] / 2.0),
         ];
         let [x1, y1] = [x0 + size[0], y0 + size[1]];
         self.textured(

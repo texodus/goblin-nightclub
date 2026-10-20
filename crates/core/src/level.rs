@@ -23,15 +23,18 @@
 //! a level keeps a few layers of these whatever its depth, not one for
 //! every pair of layers.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::chunk::CHUNK;
 use crate::draw::Canvas;
 use crate::fringe;
-use crate::layer::{Layer, QUARTERS, Solid, Tile};
+use crate::layer::{Layer, Piece, QUARTERS, Solid, TILE, Tile};
 use crate::mesh::Mesh;
 use crate::path;
 use crate::tileset::Tileset;
+use crate::world::{PieceOf, Pieces};
 
 /// Layers a level may have: a bound on what a file may ask for.
 pub const MAX_LAYERS: usize = 1024;
@@ -94,13 +97,23 @@ pub struct Level {
     /// up it shows through to, at most.
     deepest: Vec<u8>,
     /// Per layer, made when first asked for; see [`Level::meshes`].
-    meshes: Vec<OnceLock<LayerMeshes>>,
+    meshes: Vec<OnceLock<Arc<LayerMeshes>>>,
     /// By `(top, k)`, made when first asked for and dropped once the viewer
     /// is further than a layer from `top`: [`Level::view`],
     /// [`Level::shaft`] and [`Level::shaft_mesh`].
     views: Cache<Arc<Layer>>,
     shafts: Cache<Arc<[bool]>>,
     shaft_meshes: Cache<Arc<Mesh>>,
+    /// For a level that's a window onto a bigger one: where it is, and
+    /// the pieces its views are made of, kept for the next window.
+    placed: Option<Placed>,
+}
+
+struct Placed {
+    /// Its lowest layer, and its top-left chunk, in the whole level.
+    base: usize,
+    origin: [i32; 2],
+    pieces: Arc<Mutex<Pieces>>,
 }
 
 type Cache<T> = Mutex<HashMap<(usize, usize), T>>;
@@ -118,19 +131,117 @@ fn cached<T: Clone>(cache: &Cache<T>, top: usize, k: usize, make: impl FnOnce() 
     made
 }
 
-/// What's drawn of a layer that only changes with its tiles.
+/// What's drawn of a layer that only changes with its tiles: a piece a
+/// chunk, each where it is, and what's along the chunks' edges.
 pub struct LayerMeshes {
-    /// Its tiles' art.
-    pub tiles: Arc<Mesh>,
-    /// Drawn over `tiles`: where materials meet, the fringes of the
-    /// higher-ranking ones (see [`crate::fringe`]), cut by the renderer.
+    /// Chunks across.
+    pub across: usize,
+    /// Each chunk's, row by row (see [`MeshPiece`]): each in pixels from
+    /// its chunk's top-left corner, [`LayerMeshes::corner`].
+    pub pieces: Vec<Arc<MeshPiece>>,
+    /// The fringes and trims of the tiles along the chunks' edges, which
+    /// depend on the chunks beside them (and past the layer's edge, that
+    /// there are none): in the layer's own pixels.
     pub fringes: Arc<Mesh>,
-    /// Drawn over `fringes`: trims scattered along material edges.
     pub trims: Arc<Mesh>,
+}
+
+impl LayerMeshes {
+    /// Where piece `i`'s chunk's top-left corner is, in pixels.
+    pub fn corner(&self, i: usize) -> [f32; 2] {
+        [i % self.across, i / self.across].map(|c| (c * CHUNK) as f32 * TILE)
+    }
+
+    /// All of its meshes.
+    pub fn all(&self) -> impl Iterator<Item = &Mesh> {
+        let pieces = self.pieces.iter().flat_map(|p| p.all());
+        pieces.chain([&*self.fringes, &*self.trims])
+    }
+}
+
+/// Each tile's art of `layer`, as a mesh.
+fn tile_mesh(layer: &Layer, tileset: &Tileset) -> Mesh {
+    Mesh::build(
+        layer.cols,
+        layer.rows,
+        Canvas::new(tileset),
+        |xs, ys, canvas| {
+            for y in ys {
+                for x in xs.clone() {
+                    layer.draw_tile(tileset, canvas, x, y);
+                }
+            }
+        },
+    )
+}
+
+/// Draws a tile's fringes or trims: see [`fringe`].
+type DrawTile = fn(&Layer, &Tileset, &mut Canvas, usize, usize);
+
+/// What's drawn of a chunk of a layer, the same in any window, so made
+/// once it can be reused by each, and kept on the GPU as long: in pixels
+/// from the chunk's top-left corner. Its fringes and trims leave out the
+/// tiles along its edge, which depend on the chunks beside it (see
+/// [`LayerMeshes`]).
+pub struct MeshPiece {
+    /// Its tiles' art.
+    pub tiles: Mesh,
+    /// Drawn over the tiles (all pieces' tiles): where materials meet, the
+    /// fringes of the higher-ranking ones (see [`crate::fringe`]), cut by
+    /// the renderer.
+    pub fringes: Mesh,
+    /// Drawn over the fringes: trims scattered along material edges.
+    pub trims: Mesh,
     /// Where it's void, liquid included.
-    pub voids: Arc<Mesh>,
+    pub voids: Mesh,
     /// Where it's liquid.
-    pub liquid: Arc<Mesh>,
+    pub liquid: Mesh,
+}
+
+impl MeshPiece {
+    /// What's drawn of `chunk`, a layer's chunk alone (see
+    /// [`Layer::chunk_alone`]).
+    pub fn new(chunk: &Layer, tileset: &Tileset) -> Self {
+        let size = [chunk.cols, chunk.rows];
+        let inside = |draw: DrawTile| {
+            Mesh::build(size[0], size[1], Canvas::new(tileset), |xs, ys, canvas| {
+                for y in ys {
+                    for x in xs.clone().filter(|&x| !on_edge(size, x, y)) {
+                        draw(chunk, tileset, canvas, x, y);
+                    }
+                }
+            })
+        };
+        let canvas = || Canvas::new(tileset);
+        let tile = |x: usize, y: usize| chunk.tile(x as i32, y as i32);
+        Self {
+            tiles: tile_mesh(chunk, tileset),
+            fringes: inside(fringe::draw_fringes),
+            trims: inside(fringe::draw_trims),
+            voids: Mesh::quarters(size[0], size[1], canvas(), |x, y| {
+                tile(x, y).void_quarters()
+            }),
+            liquid: Mesh::quarters(size[0], size[1], canvas(), |x, y| {
+                tile(x, y).liquid_quarters()
+            }),
+        }
+    }
+
+    /// All of its meshes.
+    pub fn all(&self) -> [&Mesh; 5] {
+        [
+            &self.tiles,
+            &self.fringes,
+            &self.trims,
+            &self.voids,
+            &self.liquid,
+        ]
+    }
+}
+
+/// Whether tile `(x, y)` of a chunk `size` is along its edge.
+fn on_edge(size: [usize; 2], x: usize, y: usize) -> bool {
+    x == 0 || y == 0 || x + 1 == size[0] || y + 1 == size[1]
 }
 
 impl Level {
@@ -186,7 +297,21 @@ impl Level {
             views: Default::default(),
             shafts: Default::default(),
             shaft_meshes: Default::default(),
+            placed: None,
         }
+    }
+
+    /// The same level, a window onto a bigger one: its lowest layer at
+    /// `base` and its top-left chunk at `origin` there. What its layers
+    /// are seen through ([`Level::view`]) is made of pieces kept in
+    /// `pieces`, reused if they're there.
+    pub fn placed(mut self, base: usize, origin: [i32; 2], pieces: Arc<Mutex<Pieces>>) -> Self {
+        self.placed = Some(Placed {
+            base,
+            origin,
+            pieces,
+        });
+        self
     }
 
     pub fn depth(&self) -> usize {
@@ -245,17 +370,41 @@ impl Level {
     pub fn view(&self, top: usize, k: usize) -> Arc<Layer> {
         cached(&self.views, top, k, || {
             let (cols, rows) = (self.cols(), self.rows());
-            let solids = (0..cols * rows)
-                .map(|t| {
-                    let (x, y) = ((t % cols) as i32, (t / cols) as i32);
-                    let mut q = self.layers[top].solid(x, y).quarters();
-                    for j in k + 1..top {
-                        q |= self.layers[j].solid(x, y).quarters() & self.open_to(top, j, t);
-                    }
-                    Solid::from_quarters(q, true)
+            let solid = |x: usize, y: usize| {
+                let mut q = self.layers[top].solid(x as i32, y as i32).quarters();
+                for j in k + 1..top {
+                    let open = self.open_to(top, j, y * cols + x);
+                    q |= self.layers[j].solid(x as i32, y as i32).quarters() & open;
+                }
+                Solid::from_quarters(q, true)
+            };
+            let Some(placed) = &self.placed else {
+                let solids = (0..cols * rows)
+                    .map(|t| solid(t % cols, t / cols))
+                    .collect();
+                return Arc::new(Layer::from_solids(cols, rows, solids));
+            };
+            // A chunk's piece depends only on the chunks over it from `k`
+            // up to `top`, wherever the window is.
+            let across = cols.div_ceil(CHUNK);
+            let mut kept = placed.pieces.lock().unwrap();
+            let pieces: Vec<_> = (0..across * rows.div_ceil(CHUNK))
+                .map(|c| {
+                    let [cx, cy] = [c % across, c / across];
+                    let [w, h] = [CHUNK.min(cols - cx * CHUNK), CHUNK.min(rows - cy * CHUNK)];
+                    let of = PieceOf::View {
+                        top: placed.base + top,
+                    };
+                    let [x, y] = [cx as i32, cy as i32];
+                    let key = (placed.base + k, placed.origin[0] + x, placed.origin[1] + y);
+                    kept.get(of, key, || {
+                        let at = |t: usize| solid(cx * CHUNK + t % w, cy * CHUNK + t / w);
+                        Piece::from_solids([w, h], (0..w * h).map(at).collect())
+                    })
                 })
                 .collect();
-            Arc::new(Layer::from_solids(cols, rows, solids))
+            drop(kept);
+            Arc::new(Layer::from_pieces(cols, rows, &pieces))
         })
     }
 
@@ -278,42 +427,53 @@ impl Level {
             .collect()
     }
 
-    /// Layer `k`'s tile art, voids and liquid, as meshes.
-    pub fn meshes(&self, k: usize) -> &LayerMeshes {
+    /// What's drawn of layer `k`: each chunk's piece, reused from the
+    /// window before if it's a window onto a bigger level, and the
+    /// fringes and trims along the chunks' edges.
+    pub fn meshes(&self, k: usize) -> &Arc<LayerMeshes> {
         self.meshes[k].get_or_init(|| {
             let (layer, tileset) = (&self.layers[k], &self.tileset);
             let (cols, rows) = (self.cols(), self.rows());
-            let canvas = || Canvas::new(tileset);
-            let tile = |x: usize, y: usize| layer.tile(x as i32, y as i32);
-            LayerMeshes {
-                tiles: Arc::new(Mesh::build(cols, rows, canvas(), |xs, ys, canvas| {
+            let across = cols.div_ceil(CHUNK);
+            let make = |cx: usize, cy: usize| MeshPiece::new(&layer.chunk_alone(cx, cy), tileset);
+            let chunks = 0..across * rows.div_ceil(CHUNK);
+            let pieces: Vec<_> = match &self.placed {
+                None => chunks
+                    .map(|c| Arc::new(make(c % across, c / across)))
+                    .collect(),
+                Some(placed) => {
+                    let mut kept = placed.pieces.lock().unwrap();
+                    chunks
+                        .map(|c| {
+                            let [cx, cy] = [c % across, c / across];
+                            let [x, y] = [cx as i32, cy as i32];
+                            let key = (placed.base + k, placed.origin[0] + x, placed.origin[1] + y);
+                            kept.meshes(key, || make(cx, cy))
+                        })
+                        .collect()
+                }
+            };
+            let edge = |x: usize, y: usize| {
+                let size =
+                    [cols - x / CHUNK * CHUNK, rows - y / CHUNK * CHUNK].map(|n| n.min(CHUNK));
+                on_edge(size, x % CHUNK, y % CHUNK)
+            };
+            let along_edges = |draw: DrawTile| {
+                let mesh = Mesh::build(cols, rows, Canvas::new(tileset), |xs, ys, canvas| {
                     for y in ys {
-                        for x in xs.clone() {
-                            layer.draw_tile(tileset, canvas, x, y);
+                        for x in xs.clone().filter(|&x| edge(x, y)) {
+                            draw(layer, tileset, canvas, x, y);
                         }
                     }
-                })),
-                fringes: Arc::new(Mesh::build(cols, rows, canvas(), |xs, ys, canvas| {
-                    for y in ys {
-                        for x in xs.clone() {
-                            fringe::draw_fringes(layer, tileset, canvas, x, y);
-                        }
-                    }
-                })),
-                trims: Arc::new(Mesh::build(cols, rows, canvas(), |xs, ys, canvas| {
-                    for y in ys {
-                        for x in xs.clone() {
-                            fringe::draw_trims(layer, tileset, canvas, x, y);
-                        }
-                    }
-                })),
-                voids: Arc::new(Mesh::quarters(cols, rows, canvas(), |x, y| {
-                    tile(x, y).void_quarters()
-                })),
-                liquid: Arc::new(Mesh::quarters(cols, rows, canvas(), |x, y| {
-                    tile(x, y).liquid_quarters()
-                })),
-            }
+                });
+                Arc::new(mesh)
+            };
+            Arc::new(LayerMeshes {
+                across,
+                pieces,
+                fringes: along_edges(fringe::draw_fringes),
+                trims: along_edges(fringe::draw_trims),
+            })
         })
     }
 
@@ -327,6 +487,23 @@ impl Level {
                 if shaft[y * cols + x] { 0b1111 } else { 0 }
             }))
         })
+    }
+
+    /// Its layers (and those they're seen through), the bulk of it, apart:
+    /// a big level takes a while to drop, so it can go a piece at a time.
+    pub fn take_apart(self) -> Vec<Box<dyn Any>> {
+        let Self {
+            layers,
+            movement,
+            views,
+            ..
+        } = self;
+        let views = views.into_inner().unwrap().into_values();
+        let pieces = layers.into_iter().chain(movement);
+        let pieces = pieces.map(|l| Box::new(l) as Box<dyn Any>);
+        pieces
+            .chain(views.map(|v| Box::new(v) as Box<dyn Any>))
+            .collect()
     }
 }
 
@@ -548,14 +725,17 @@ mod tests {
                 .sum()
         };
         let top = l.meshes(1);
-        assert_eq!(top.tiles.id(), l.meshes(1).tiles.id(), "kept");
+        assert!(Arc::ptr_eq(top, l.meshes(1)), "kept");
+        // A small level is one chunk.
+        assert_eq!(top.pieces.len(), 1);
+        let piece = &top.pieces[0];
         let mut canvas = Canvas::new(&tileset);
         l.layer(1).draw_tiles(&tileset, &mut canvas);
-        assert_eq!(top.tiles.vertices.len(), canvas.vertices.len());
+        assert_eq!(piece.tiles.vertices.len(), canvas.vertices.len());
         // Four void tiles, one of them liquid; layer 0 shows through all
         // four.
-        assert!((area(&top.voids) - 400.0).abs() < 1e-3);
-        assert!((area(&top.liquid) - 100.0).abs() < 1e-3);
+        assert!((area(&piece.voids) - 400.0).abs() < 1e-3);
+        assert!((area(&piece.liquid) - 100.0).abs() < 1e-3);
         assert!((area(&l.shaft_mesh(1, 0)) - 400.0).abs() < 1e-3);
         assert!(Arc::ptr_eq(&l.shaft_mesh(1, 0), &l.shaft_mesh(1, 0)));
     }

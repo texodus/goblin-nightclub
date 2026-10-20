@@ -5,8 +5,10 @@
 //! when the layer is built. Void and stairs tiles are open, like floor;
 //! what they mean between layers is up to [`crate::level`].
 
+use std::sync::Arc;
+
 use crate::camera::Rect;
-use crate::chunk::Chunks;
+use crate::chunk::{CHUNK, Chunk, Chunks};
 use crate::draw::{Canvas, faces_light, inset_corner, inward_normal};
 use crate::palette;
 #[cfg(any(test, feature = "test-util"))]
@@ -634,6 +636,272 @@ impl Line {
     }
 }
 
+/// Indices of a layer's outline edges by the grid line each lies on: a
+/// slot per line through a `cols` x `rows` layer, the horizontal ones top
+/// to bottom, then the vertical, rising and falling ones, by their number.
+#[derive(Default)]
+struct Lines {
+    cols: i32,
+    rows: i32,
+    /// Where each slot's indices start in `items`, then the end.
+    starts: Vec<u32>,
+    items: Vec<usize>,
+}
+
+impl Lines {
+    fn new(cols: usize, rows: usize, edges: &[Edge]) -> Self {
+        let mut lines = Self {
+            cols: cols as i32,
+            rows: rows as i32,
+            starts: Vec::new(),
+            items: vec![0; edges.len()],
+        };
+        let slots = 3 * (cols + rows) + 4;
+        let slot = |e: &Edge| lines.slot(line_of(e)).expect("edges lie inside");
+        let slots_of: Vec<usize> = edges.iter().map(slot).collect();
+        let mut starts = vec![0u32; slots + 1];
+        for &k in &slots_of {
+            starts[k + 1] += 1;
+        }
+        for k in 1..starts.len() {
+            starts[k] += starts[k - 1];
+        }
+        let mut next = starts.clone();
+        for (i, &k) in slots_of.iter().enumerate() {
+            lines.items[next[k] as usize] = i;
+            next[k] += 1;
+        }
+        lines.starts = starts;
+        lines
+    }
+
+    /// `line`'s slot, if it runs through the layer.
+    fn slot(&self, line: Line) -> Option<usize> {
+        let (c, r) = (self.cols, self.rows);
+        let (at, lo, hi, before) = match line {
+            Line::Horizontal(y) => (y, 0, r, 0),
+            Line::Vertical(x) => (x, 0, c, r + 1),
+            Line::Rising(s) => (s, 0, c + r, r + c + 2),
+            Line::Falling(d) => (d, -r, c, 2 * (r + c) + 3),
+        };
+        (lo..=hi).contains(&at).then(|| (before + at - lo) as usize)
+    }
+
+    fn on(&self, line: Line) -> &[usize] {
+        let Some(k) = self.slot(line).filter(|&k| k + 1 < self.starts.len()) else {
+            return &[];
+        };
+        &self.items[self.starts[k] as usize..self.starts[k + 1] as usize]
+    }
+}
+
+/// The grid point at pixel position `p`, in tiles.
+fn vertex(p: [f32; 2]) -> [i32; 2] {
+    [(p[0] / TILE).round() as i32, (p[1] / TILE).round() as i32]
+}
+
+/// Which way an outline edge heads, in eighths of a turn clockwise on
+/// screen from east.
+fn heading(e: &Edge) -> i32 {
+    let ([ax, ay], [bx, by]) = (vertex(e.a), vertex(e.b));
+    match [(bx - ax).signum(), (by - ay).signum()] {
+        [1, 0] => 0,
+        [1, 1] => 1,
+        [0, 1] => 2,
+        [-1, 1] => 3,
+        [-1, 0] => 4,
+        [-1, -1] => 5,
+        [0, -1] => 6,
+        _ => 7,
+    }
+}
+
+/// How far clockwise a turn from heading `from` to `to` is, in eighths of
+/// a turn: from -3, sharply left, through 0, straight on, to 4, back.
+fn turn(from: i32, to: i32) -> i32 {
+    (to - from + 11).rem_euclid(8) - 3
+}
+
+/// The grid line an outline edge (a tile long) lies on.
+fn line_of(e: &Edge) -> Line {
+    let ([ax, ay], [bx, by]) = (vertex(e.a), vertex(e.b));
+    if ay == by {
+        Line::Horizontal(ay)
+    } else if ax == bx {
+        Line::Vertical(ax)
+    } else if ax + ay == bx + by {
+        Line::Rising(ax + ay)
+    } else {
+        Line::Falling(ax - ay)
+    }
+}
+
+/// Grid point `(gx, gy)` in pixels, if the outline of a grid shaped
+/// `solid(x, y)` turns there (or ends, or meets itself).
+fn corner_at(solid: &impl Fn(i32, i32) -> Solid, gx: i32, gy: i32) -> Option<[f32; 2]> {
+    let nw = solid(gx - 1, gy - 1);
+    let ne = solid(gx, gy - 1);
+    let sw = solid(gx - 1, gy);
+    let se = solid(gx, gy);
+
+    // The ways outline runs from this vertex.
+    let mut dirs = [[0i32; 2]; 8];
+    let mut n = 0;
+    // An axis edge is outline where exactly one side covers it.
+    for (d, outline) in [
+        ([0, -1], nw.covers(Side::E) != ne.covers(Side::W)),
+        ([0, 1], sw.covers(Side::E) != se.covers(Side::W)),
+        ([-1, 0], nw.covers(Side::S) != sw.covers(Side::N)),
+        ([1, 0], ne.covers(Side::S) != se.covers(Side::N)),
+    ] {
+        if outline {
+            dirs[n] = d;
+            n += 1;
+        }
+    }
+    // A slope's face is outline, running from this vertex across its tile
+    // when the vertex is one of the face's ends.
+    for (tile, d, at) in [
+        (nw, [-1, -1], Corner::SE),
+        (ne, [1, -1], Corner::SW),
+        (sw, [-1, 1], Corner::NE),
+        (se, [1, 1], Corner::NW),
+    ] {
+        if let Solid::Slope(s) = tile
+            && at != s
+            && at != s.opposite()
+        {
+            dirs[n] = d;
+            n += 1;
+        }
+    }
+
+    let straight = n == 2 && dirs[0][0] == -dirs[1][0] && dirs[0][1] == -dirs[1][1];
+    (n > 0 && !straight).then_some([gx as f32 * TILE, gy as f32 * TILE])
+}
+
+/// Onto `out`, the outline edges of a grid shaped `solid(x, y)` along the
+/// top and left sides of tile `(x, y)` (all of them, over every tile and
+/// one more row and column), and its slope's face if it's `inside` the
+/// grid; oriented with the solid side on the right.
+fn edges_at(solid: &impl Fn(i32, i32) -> Solid, x: i32, y: i32, inside: bool, out: &mut Vec<Edge>) {
+    let px = |x: i32, y: i32| [x as f32 * TILE, y as f32 * TILE];
+    let here = solid(x, y);
+    let (above, left) = (solid(x, y - 1), solid(x - 1, y));
+    match (here.covers(Side::N), above.covers(Side::S)) {
+        (true, false) => out.push(Edge {
+            a: px(x, y),
+            b: px(x + 1, y),
+            solid: [x, y],
+        }),
+        (false, true) => out.push(Edge {
+            a: px(x + 1, y),
+            b: px(x, y),
+            solid: [x, y - 1],
+        }),
+        _ => {}
+    }
+    match (here.covers(Side::W), left.covers(Side::E)) {
+        (true, false) => out.push(Edge {
+            a: px(x, y + 1),
+            b: px(x, y),
+            solid: [x, y],
+        }),
+        (false, true) => out.push(Edge {
+            a: px(x, y),
+            b: px(x, y + 1),
+            solid: [x - 1, y],
+        }),
+        _ => {}
+    }
+    if let Solid::Slope(c) = here
+        && inside
+    {
+        // The face joins the two corners beside the solid one; orient it so
+        // the solid corner is on its right.
+        let corner = |k: Corner| {
+            let [dx, dy] = k.offset();
+            px(x + dx, y + dy)
+        };
+        let [mut a, mut b] = c.face_ends().map(corner);
+        let s = corner(c);
+        let (e, to_solid) = ([b[0] - a[0], b[1] - a[1]], [s[0] - a[0], s[1] - a[1]]);
+        if -e[1] * to_solid[0] + e[0] * to_solid[1] < 0.0 {
+            std::mem::swap(&mut a, &mut b);
+        }
+        out.push(Edge {
+            a,
+            b,
+            solid: [x, y],
+        });
+    }
+}
+
+/// A chunk's own part of a layer's geometry, the same whichever window
+/// it's seen through, so made once it can be reused by each (see
+/// [`Layer::from_pieces`]): its tiles, their shapes, and the corners and
+/// edges of the outline at its grid points and tile sides; all but those
+/// along its top and left, which depend on the chunks beside it.
+pub struct Piece {
+    tiles: Arc<Chunk>,
+    /// Its tiles across and down in the level: fewer than [`CHUNK`] at the
+    /// level's right and bottom edges.
+    size: [usize; 2],
+    /// Row by row.
+    solids: Vec<Solid>,
+    /// In pixels from its top-left corner, row by row (as a layer's are),
+    /// and where each row's start in them, then the end.
+    corners: Vec<[f32; 2]>,
+    corner_rows: Vec<u32>,
+    edges: Vec<Edge>,
+    edge_rows: Vec<u32>,
+}
+
+impl Piece {
+    /// The piece of a layer that's chunk `tiles`, `size` of it in the
+    /// level.
+    pub fn new(tiles: Arc<Chunk>, size: [usize; 2]) -> Self {
+        let solids = (0..size[0] * size[1])
+            .map(|i| tiles.get(i % size[0], i / size[0]).wall())
+            .collect();
+        Self::shaped(tiles, size, solids)
+    }
+
+    /// The piece of a layer of default tiles shaped `solids`, `size` of
+    /// them row by row (see [`Layer::from_solids`]).
+    pub fn from_solids(size: [usize; 2], solids: Vec<Solid>) -> Self {
+        let [w, h] = size;
+        let tiles =
+            Chunk::from_fn(|x, y| Tile::from_solid(solids[y.min(h - 1) * w + x.min(w - 1)]));
+        Self::shaped(Arc::new(tiles), size, solids)
+    }
+
+    fn shaped(tiles: Arc<Chunk>, size: [usize; 2], solids: Vec<Solid>) -> Self {
+        let [w, h] = size.map(|n| n as i32);
+        let solid = |x: i32, y: i32| solids[(y * w + x) as usize];
+        let (mut corners, mut edges) = (Vec::new(), Vec::new());
+        // The first row, along its top, has none.
+        let (mut corner_rows, mut edge_rows) = (vec![0, 0], vec![0, 0]);
+        for y in 1..h {
+            for x in 1..w {
+                corners.extend(corner_at(&solid, x, y));
+                edges_at(&solid, x, y, true, &mut edges);
+            }
+            corner_rows.push(corners.len() as u32);
+            edge_rows.push(edges.len() as u32);
+        }
+        Self {
+            tiles,
+            size,
+            solids,
+            corners,
+            corner_rows,
+            edges,
+            edge_rows,
+        }
+    }
+}
+
 pub struct Layer {
     pub cols: usize,
     pub rows: usize,
@@ -647,8 +915,11 @@ pub struct Layer {
     solids: Vec<Solid>,
     corners: Vec<[f32; 2]>,
     edges: Vec<Edge>,
-    edges_by_line: std::collections::HashMap<Line, Vec<usize>>,
-    outlines: Vec<Outline>,
+    edges_by_line: Lines,
+    /// For each edge, the next along its outline loop, and the one before
+    /// (see [`Layer::link_edges`]).
+    next: Vec<u32>,
+    prev: Vec<u32>,
     concave: Vec<ConcaveCorner>,
     /// `corners`, `edges` and `concave` by where they are, so sight can
     /// look at just those within its radius.
@@ -720,11 +991,18 @@ impl Buckets {
     /// Indices of the things that may come within `radius` of `p` (all of
     /// them for an infinite radius), in increasing order, each once.
     fn near(&self, p: [f32; 2], radius: f32) -> Vec<usize> {
-        if !radius.is_finite() {
+        self.over([p, p], radius)
+    }
+
+    /// Indices of the things that may reach into `rect` grown by `margin`
+    /// (all of them for an infinite one), in increasing order, each once.
+    fn over(&self, rect: Rect, margin: f32) -> Vec<usize> {
+        let finite = rect.iter().flatten().all(|v| v.is_finite()) && margin.is_finite();
+        if !finite || self.starts.is_empty() {
             return (0..self.len).collect();
         }
         let mut found: Vec<usize> = self
-            .blocks_over([p, p], radius)
+            .blocks_over(rect, margin)
             .flat_map(|k| &self.items[self.starts[k] as usize..self.starts[k + 1] as usize])
             .map(|&i| i as usize)
             .collect();
@@ -760,40 +1038,112 @@ impl Layer {
         let solids = (0..cols * rows)
             .map(|i| tiles.get(i % cols, i / cols).wall())
             .collect();
-        let mut level = Self {
-            cols,
-            rows,
+        let mut level = Self::bare(tiles, solids);
+        level.corners = level.find_corners();
+        level.edges = level.find_edges();
+        level.link()
+    }
+
+    /// A level `cols` x `rows` made of `pieces`, a chunk each, row by row:
+    /// the same as one made from all their tiles at once (see
+    /// [`Layer::from_chunks`]), but only the outline along the seams
+    /// between them, and around its edge, is left to work out.
+    pub fn from_pieces(cols: usize, rows: usize, pieces: &[Arc<Piece>]) -> Self {
+        let across = cols.div_ceil(CHUNK);
+        assert_eq!(pieces.len(), across * rows.div_ceil(CHUNK));
+        for (i, p) in pieces.iter().enumerate() {
+            let [cx, cy] = [i % across, i / across];
+            let size = [CHUNK.min(cols - cx * CHUNK), CHUNK.min(rows - cy * CHUNK)];
+            assert_eq!(p.size, size, "piece ({cx}, {cy})");
+        }
+        let piece = |cx: usize, y: usize| &pieces[y / CHUNK * across + cx];
+        let mut solids = Vec::with_capacity(cols * rows);
+        for y in 0..rows {
+            for cx in 0..across {
+                let p = piece(cx, y);
+                let row = y % CHUNK * p.size[0];
+                solids.extend_from_slice(&p.solids[row..row + p.size[0]]);
+            }
+        }
+        let tiles = pieces.iter().map(|p| p.tiles.clone()).collect();
+        let mut level = Self::bare(Chunks::from_chunks(cols, rows, tiles), solids);
+
+        // Row by row, as the whole layer's are: along a seam, worked out;
+        // between them, each piece's row and the seam before it.
+        let (mut corners, mut edges) = (Vec::new(), Vec::new());
+        let solid = |x: i32, y: i32| level.solid(x, y);
+        let ([c, r], k) = ([cols as i32, rows as i32], CHUNK as i32);
+        for y in 0..=r {
+            if y % k == 0 || y == r {
+                for x in 0..=c {
+                    corners.extend(corner_at(&solid, x, y));
+                    edges_at(&solid, x, y, x < c && y < r, &mut edges);
+                }
+                continue;
+            }
+            let row = (y % k) as usize;
+            for cx in 0..across {
+                let p = piece(cx, y as usize);
+                let at = [cx as i32 * k, y - row as i32];
+                corners.extend(corner_at(&solid, at[0], y));
+                edges_at(&solid, at[0], y, true, &mut edges);
+                let px = at.map(|t| t as f32 * TILE);
+                let shift = |q: [f32; 2]| [q[0] + px[0], q[1] + px[1]];
+                let span = |starts: &[u32]| starts[row] as usize..starts[row + 1] as usize;
+                corners.extend(p.corners[span(&p.corner_rows)].iter().map(|&q| shift(q)));
+                edges.extend(p.edges[span(&p.edge_rows)].iter().map(|e| Edge {
+                    a: shift(e.a),
+                    b: shift(e.b),
+                    solid: [e.solid[0] + at[0], e.solid[1] + at[1]],
+                }));
+            }
+            corners.extend(corner_at(&solid, c, y));
+            edges_at(&solid, c, y, false, &mut edges);
+        }
+        level.corners = corners;
+        level.edges = edges;
+        level.link()
+    }
+
+    /// A level of `tiles`, shaped `solids`, its outline not yet found.
+    fn bare(tiles: Chunks, solids: Vec<Solid>) -> Self {
+        Self {
+            cols: tiles.cols(),
+            rows: tiles.rows(),
             origin: [0, 0],
             tiles,
             solids,
             corners: Vec::new(),
             edges: Vec::new(),
             edges_by_line: Default::default(),
-            outlines: Vec::new(),
+            next: Vec::new(),
+            prev: Vec::new(),
             concave: Vec::new(),
             corner_buckets: Buckets::default(),
             edge_buckets: Buckets::default(),
             concave_buckets: Buckets::default(),
-        };
-        level.corners = level.find_corners();
-        level.edges = level.find_edges();
-        for (i, e) in level.edges.iter().enumerate() {
-            for line in Line::through(e.a, e.b, 1e-3) {
-                level.edges_by_line.entry(line).or_default().push(i);
-            }
         }
-        level.outlines = level.find_outlines();
-        level.concave = level.find_concave_corners();
-        let boxes = |points: &mut dyn Iterator<Item = Vec<[f32; 2]>>| -> Vec<Rect> {
-            points.map(|p| bounds(&p)).collect()
-        };
-        let corners = boxes(&mut level.corners.iter().map(|c| vec![*c]));
-        let edges = boxes(&mut level.edges.iter().map(|e| vec![e.a, e.b]));
-        let concave = boxes(&mut level.concave.iter().map(|c| vec![c.at]));
-        level.corner_buckets = Buckets::new(cols, rows, &corners);
-        level.edge_buckets = Buckets::new(cols, rows, &edges);
-        level.concave_buckets = Buckets::new(cols, rows, &concave);
-        level
+    }
+
+    /// The rest of a level made from its outline's corners and edges: the
+    /// edges linked into loops, the concave corners, and all three by
+    /// where they are.
+    fn link(mut self) -> Self {
+        let (cols, rows) = (self.cols, self.rows);
+        self.edges_by_line = Lines::new(cols, rows, &self.edges);
+        self.next = self.link_edges();
+        self.prev = vec![0; self.next.len()];
+        for (i, &n) in self.next.iter().enumerate() {
+            self.prev[n as usize] = i as u32;
+        }
+        self.concave = self.find_concave_corners();
+        let corners: Vec<Rect> = self.corners.iter().map(|&c| [c, c]).collect();
+        let edges: Vec<Rect> = self.edges.iter().map(|e| bounds(&[e.a, e.b])).collect();
+        let concave: Vec<Rect> = self.concave.iter().map(|c| [c.at, c.at]).collect();
+        self.corner_buckets = Buckets::new(cols, rows, &corners);
+        self.edge_buckets = Buckets::new(cols, rows, &edges);
+        self.concave_buckets = Buckets::new(cols, rows, &concave);
+        self
     }
 
     /// A layer of default tiles with shapes `solids`, row by row: wall
@@ -862,6 +1212,19 @@ impl Layer {
             })
             .collect();
         Self::from_solids(cols, rows, tiles)
+    }
+
+    /// Its chunk `(cx, cy)` alone, as a layer of its own at its place in
+    /// the whole level, without its outline: for drawing.
+    pub fn chunk_alone(&self, cx: usize, cy: usize) -> Layer {
+        let [w, h] = [
+            CHUNK.min(self.cols - cx * CHUNK),
+            CHUNK.min(self.rows - cy * CHUNK),
+        ];
+        let tiles = Chunks::from_chunks(w, h, vec![self.tiles.chunk(cx, cy).clone()]);
+        let solids = (0..w * h).map(|i| tiles.get(i % w, i / w).wall()).collect();
+        let at = [cx, cy].map(|c| (c * CHUNK) as i32);
+        Self::bare(tiles, solids).at([self.origin[0] + at[0], self.origin[1] + at[1]])
     }
 
     /// The same, its tile (0, 0) at `origin` in the whole level.
@@ -1125,45 +1488,11 @@ impl Layer {
     }
 
     fn find_corners(&self) -> Vec<[f32; 2]> {
+        let solid = |x: i32, y: i32| self.solid(x, y);
         let mut out = Vec::new();
         for gy in 0..=self.rows as i32 {
             for gx in 0..=self.cols as i32 {
-                let nw = self.solid(gx - 1, gy - 1);
-                let ne = self.solid(gx, gy - 1);
-                let sw = self.solid(gx - 1, gy);
-                let se = self.solid(gx, gy);
-
-                // An axis edge is outline where exactly one side covers it.
-                let mut dirs: Vec<[i32; 2]> = [
-                    ([0, -1], nw.covers(Side::E) != ne.covers(Side::W)),
-                    ([0, 1], sw.covers(Side::E) != se.covers(Side::W)),
-                    ([-1, 0], nw.covers(Side::S) != sw.covers(Side::N)),
-                    ([1, 0], ne.covers(Side::S) != se.covers(Side::N)),
-                ]
-                .into_iter()
-                .filter_map(|(d, outline)| outline.then_some(d))
-                .collect();
-                // A slope's face is outline, running from this vertex across
-                // its tile when the vertex is one of the face's ends.
-                for (tile, d, at) in [
-                    (nw, [-1, -1], Corner::SE),
-                    (ne, [1, -1], Corner::SW),
-                    (sw, [-1, 1], Corner::NE),
-                    (se, [1, 1], Corner::NW),
-                ] {
-                    if let Solid::Slope(s) = tile
-                        && at != s
-                        && at != s.opposite()
-                    {
-                        dirs.push(d);
-                    }
-                }
-
-                let straight =
-                    dirs.len() == 2 && dirs[0][0] == -dirs[1][0] && dirs[0][1] == -dirs[1][1];
-                if !dirs.is_empty() && !straight {
-                    out.push([gx as f32 * TILE, gy as f32 * TILE]);
-                }
+                out.extend(corner_at(&solid, gx, gy));
             }
         }
         out
@@ -1176,71 +1505,54 @@ impl Layer {
     }
 
     fn find_edges(&self) -> Vec<Edge> {
-        let px = |x: i32, y: i32| [x as f32 * TILE, y as f32 * TILE];
+        let solid = |x: i32, y: i32| self.solid(x, y);
+        let (cols, rows) = (self.cols as i32, self.rows as i32);
         let mut out = Vec::new();
-        for y in 0..=self.rows as i32 {
-            for x in 0..=self.cols as i32 {
-                let here = self.solid(x, y);
-                // Top and left sides of each position (covering the bottom
-                // and right of the level via the extra row and column),
-                // oriented with the solid side on the right.
-                let (above, left) = (self.solid(x, y - 1), self.solid(x - 1, y));
-                match (here.covers(Side::N), above.covers(Side::S)) {
-                    (true, false) => out.push(Edge {
-                        a: px(x, y),
-                        b: px(x + 1, y),
-                        solid: [x, y],
-                    }),
-                    (false, true) => out.push(Edge {
-                        a: px(x + 1, y),
-                        b: px(x, y),
-                        solid: [x, y - 1],
-                    }),
-                    _ => {}
-                }
-                match (here.covers(Side::W), left.covers(Side::E)) {
-                    (true, false) => out.push(Edge {
-                        a: px(x, y + 1),
-                        b: px(x, y),
-                        solid: [x, y],
-                    }),
-                    (false, true) => out.push(Edge {
-                        a: px(x, y),
-                        b: px(x, y + 1),
-                        solid: [x - 1, y],
-                    }),
-                    _ => {}
-                }
-                if let Solid::Slope(c) = here
-                    && x < self.cols as i32
-                    && y < self.rows as i32
-                {
-                    // The face joins the two corners beside the solid one;
-                    // orient it so the solid corner is on its right.
-                    let corner = |k: Corner| {
-                        let [dx, dy] = k.offset();
-                        px(x + dx, y + dy)
-                    };
-                    let [mut a, mut b] = c.face_ends().map(corner);
-                    let s = corner(c);
-                    let (e, to_solid) = ([b[0] - a[0], b[1] - a[1]], [s[0] - a[0], s[1] - a[1]]);
-                    if -e[1] * to_solid[0] + e[0] * to_solid[1] < 0.0 {
-                        std::mem::swap(&mut a, &mut b);
-                    }
-                    out.push(Edge {
-                        a,
-                        b,
-                        solid: [x, y],
-                    });
-                }
+        for y in 0..=rows {
+            for x in 0..=cols {
+                edges_at(&solid, x, y, x < cols && y < rows, &mut out);
             }
         }
         out
     }
 
     /// The outline of solid space as closed loops, straight runs merged.
-    pub fn outlines(&self) -> &[Outline] {
-        &self.outlines
+    pub fn outlines(&self) -> Vec<Outline> {
+        let mut used = vec![false; self.edges.len()];
+        let mut out = Vec::new();
+        for first in 0..self.edges.len() {
+            if used[first] {
+                continue;
+            }
+            // Walk the loop edge by edge.
+            let mut chain = vec![first];
+            used[first] = true;
+            let mut at = self.next[first] as usize;
+            while at != first {
+                used[at] = true;
+                chain.push(at);
+                at = self.next[at] as usize;
+            }
+
+            // Start at a turn, then merge runs of edges going the same way.
+            let dir = |k: usize| heading(&self.edges[chain[k]]);
+            let n = chain.len();
+            let start = (0..n).find(|&k| dir(k) != dir((k + n - 1) % n));
+            chain.rotate_left(start.unwrap_or(0));
+            let mut outline = Outline {
+                points: Vec::new(),
+                runs: Vec::new(),
+            };
+            for (k, &i) in chain.iter().enumerate() {
+                if k == 0 || heading(&self.edges[i]) != heading(&self.edges[chain[k - 1]]) {
+                    outline.points.push(self.edges[i].a);
+                    outline.runs.push(Vec::new());
+                }
+                outline.runs.last_mut().unwrap().push(i);
+            }
+            out.push(outline);
+        }
+        out
     }
 
     /// Indices into [`Layer::outline_edges`] of every edge reaching
@@ -1263,7 +1575,7 @@ impl Layer {
 
     /// Indices of the outline edges lying on `line`.
     pub fn edges_on(&self, line: Line) -> &[usize] {
-        self.edges_by_line.get(&line).map_or(&[], Vec::as_slice)
+        self.edges_by_line.on(line)
     }
 
     /// Inside corners of the outline.
@@ -1274,104 +1586,59 @@ impl Layer {
     /// With solid on the right, a left turn (counter-clockwise on screen)
     /// bends away from the solid.
     fn find_concave_corners(&self) -> Vec<ConcaveCorner> {
-        let mut out = Vec::new();
-        for o in &self.outlines {
-            let n = o.points.len();
-            for k in 0..n {
-                let (prev, here, next) = (
-                    o.points[(k + n - 1) % n],
-                    o.points[k],
-                    o.points[(k + 1) % n],
-                );
-                let (d0, d1) = (
-                    [here[0] - prev[0], here[1] - prev[1]],
-                    [next[0] - here[0], next[1] - here[1]],
-                );
-                if d0[0] * d1[1] - d0[1] * d1[0] < 0.0 {
-                    out.push(ConcaveCorner {
-                        at: here,
-                        before: inward_normal(prev, here),
-                        after: inward_normal(here, next),
-                    });
-                }
-            }
-        }
-        out
+        let normal = |e: &Edge| inward_normal(e.a, e.b);
+        (0..self.edges.len())
+            .filter_map(|i| {
+                let (before, here) = (&self.edges[self.prev[i] as usize], &self.edges[i]);
+                (turn(heading(before), heading(here)) < 0).then(|| ConcaveCorner {
+                    at: here.a,
+                    before: normal(before),
+                    after: normal(here),
+                })
+            })
+            .collect()
     }
 
-    /// Chain the outline edges into loops. Each edge's end is the start of
-    /// another; where several start at one vertex (solids touching only at
-    /// a corner), take the sharpest right turn, which keeps the solid on the
-    /// right the same and so keeps each solid's loop to itself.
-    fn find_outlines(&self) -> Vec<Outline> {
-        let key = |p: [f32; 2]| [(p[0] / TILE).round() as i32, (p[1] / TILE).round() as i32];
-        let dir = |e: &Edge| {
-            let [a, b] = [key(e.a), key(e.b)];
-            [b[0] - a[0], b[1] - a[1]]
+    /// For each outline edge, the next along its loop: each edge's end is
+    /// the start of another; where several start at one vertex (solids
+    /// touching only at a corner), the sharpest right turn, which keeps the
+    /// solid on the right the same and so keeps each solid's loop to
+    /// itself.
+    fn link_edges(&self) -> Vec<u32> {
+        // The edges by the vertex they start at.
+        let across = self.cols + 1;
+        let at = |p: [f32; 2]| {
+            let [x, y] = vertex(p);
+            y as usize * across + x as usize
         };
-        let mut starting: std::collections::HashMap<[i32; 2], Vec<usize>> = Default::default();
+        let mut starts = vec![0u32; across * (self.rows + 1) + 1];
+        for e in &self.edges {
+            starts[at(e.a) + 1] += 1;
+        }
+        for k in 1..starts.len() {
+            starts[k] += starts[k - 1];
+        }
+        let mut next = starts.clone();
+        let mut items = vec![0u32; self.edges.len()];
         for (i, e) in self.edges.iter().enumerate() {
-            starting.entry(key(e.a)).or_default().push(i);
+            let v = at(e.a);
+            items[next[v] as usize] = i as u32;
+            next[v] += 1;
         }
-
-        let mut used = vec![false; self.edges.len()];
-        let mut out = Vec::new();
-        for first in 0..self.edges.len() {
-            if used[first] {
-                continue;
-            }
-            // Walk the loop edge by edge.
-            let mut chain = vec![first];
-            used[first] = true;
-            loop {
-                let last = *chain.last().unwrap();
-                let d = dir(&self.edges[last]);
-                let next = starting[&key(self.edges[last].b)]
+        let headings: Vec<i32> = self.edges.iter().map(heading).collect();
+        self.edges
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let v = at(e.b);
+                let from = &items[starts[v] as usize..starts[v + 1] as usize];
+                // An outline is closed: something starts where each ends.
+                *from
                     .iter()
-                    .copied()
-                    .filter(|&i| !used[i] || i == first)
-                    .max_by(|&i, &j| {
-                        // Clockwise turn angle (cross > 0 is clockwise on
-                        // screen, with y down).
-                        let turn = |k: usize| {
-                            let n = dir(&self.edges[k]);
-                            let cross = (d[0] * n[1] - d[1] * n[0]) as f32;
-                            let dot = (d[0] * n[0] + d[1] * n[1]) as f32;
-                            cross.atan2(dot)
-                        };
-                        turn(i).total_cmp(&turn(j))
-                    });
-                match next {
-                    Some(i) if i == first => break,
-                    Some(i) => {
-                        used[i] = true;
-                        chain.push(i);
-                    }
-                    None => break, // Can't happen for a closed outline.
-                }
-            }
-
-            // Start at a turn, then merge runs of edges going the same way.
-            let turns_at = |k: usize| {
-                dir(&self.edges[chain[k]])
-                    != dir(&self.edges[chain[(k + chain.len() - 1) % chain.len()]])
-            };
-            let start = (0..chain.len()).find(|&k| turns_at(k)).unwrap_or(0);
-            chain.rotate_left(start);
-            let mut outline = Outline {
-                points: Vec::new(),
-                runs: Vec::new(),
-            };
-            for (k, &i) in chain.iter().enumerate() {
-                if k == 0 || dir(&self.edges[i]) != dir(&self.edges[chain[k - 1]]) {
-                    outline.points.push(self.edges[i].a);
-                    outline.runs.push(Vec::new());
-                }
-                outline.runs.last_mut().unwrap().push(i);
-            }
-            out.push(outline);
-        }
-        out
+                    .max_by_key(|&&j| turn(headings[i], headings[j as usize]))
+                    .unwrap()
+            })
+            .collect()
     }
 
     /// Points which, if seen, mean part of tile `(x, y)` has been seen: in
@@ -1639,42 +1906,34 @@ impl Layer {
             };
             reaches(0) && reaches(1) && self.in_bounds(e.solid) && !fringed() && bevel(i)
         };
-        for o in &self.outlines {
-            if !o.runs.iter().flatten().any(|&i| drawn(i)) {
+        let normal = |i: usize| inward_normal(self.edges[i].a, self.edges[i].b);
+        for i in self.edge_buckets.over(within, width) {
+            if !drawn(i) {
                 continue;
             }
-            let n = o.points.len();
-            let normals: Vec<[f32; 2]> = (0..n)
-                .map(|k| inward_normal(o.points[k], o.points[(k + 1) % n]))
-                .collect();
-            let inset: Vec<[f32; 2]> = (0..n)
-                .map(|k| inset_corner(o.points[k], normals[(k + n - 1) % n], normals[k], width))
-                .collect();
-            for (k, run) in o.runs.iter().enumerate() {
-                let normal = [normals[k][0] * width, normals[k][1] * width];
-                let lit = faces_light(normals[k]);
-                let (start, end) = (o.points[k], o.points[(k + 1) % n]);
-                // Inside a run the strip edge is just `width` in; at the run's
-                // ends it's the mitered corner.
-                let inner = |p: [f32; 2], corner: [f32; 2], mitered: [f32; 2]| {
-                    if p == corner {
-                        mitered
-                    } else {
-                        [p[0] + normal[0], p[1] + normal[1]]
-                    }
-                };
-                for &i in run {
-                    let e = self.edges[i];
-                    if drawn(i) {
-                        let wall = self.tile(e.solid[0], e.solid[1]).wall_id().unwrap_or(0);
-                        let wall = &tileset.walls[wall as usize];
-                        let color = if lit { wall.light } else { wall.dark };
-                        let a = inner(e.a, start, inset[k]);
-                        let b = inner(e.b, end, inset[(k + 1) % n]);
-                        canvas.poly(&[e.a, e.b, b, a], color);
-                    }
+            let e = self.edges[i];
+            let n = normal(i);
+            // Along a straight run the strip's inner edge is just `width`
+            // in; where the loop turns it's mitered with the next run's.
+            let inner = |p: [f32; 2], other: usize, before: bool| {
+                if heading(&self.edges[other]) == heading(&e) {
+                    [p[0] + n[0] * width, p[1] + n[1] * width]
+                } else if before {
+                    inset_corner(p, normal(other), n, width)
+                } else {
+                    inset_corner(p, n, normal(other), width)
                 }
-            }
+            };
+            let a = inner(e.a, self.prev[i] as usize, true);
+            let b = inner(e.b, self.next[i] as usize, false);
+            let wall = self.tile(e.solid[0], e.solid[1]).wall_id().unwrap_or(0);
+            let wall = &tileset.walls[wall as usize];
+            let color = if faces_light(n) {
+                wall.light
+            } else {
+                wall.dark
+            };
+            canvas.poly(&[e.a, e.b, b, a], color);
         }
     }
 
@@ -2079,7 +2338,7 @@ mod tests {
         check_outlines(&level);
         let mut areas: Vec<f32> = level
             .outlines()
-            .iter()
+            .into_iter()
             .map(|o| area2(&o.points) / 2.0)
             .collect();
         areas.sort_by(f32::total_cmp);
@@ -2094,7 +2353,7 @@ mod tests {
         check_outlines(&l);
         let solid: Vec<_> = l
             .outlines()
-            .iter()
+            .into_iter()
             .filter(|o| area2(&o.points) > 0.0)
             .collect();
         assert_eq!(solid.len(), 1);
@@ -2105,7 +2364,7 @@ mod tests {
         check_outlines(&pinch);
         let solid: Vec<_> = pinch
             .outlines()
-            .iter()
+            .into_iter()
             .filter(|o| area2(&o.points) > 0.0)
             .collect();
         assert_eq!(solid.len(), 2);
@@ -2119,7 +2378,7 @@ mod tests {
         check_outlines(&bar);
         let solid: Vec<_> = bar
             .outlines()
-            .iter()
+            .into_iter()
             .filter(|o| area2(&o.points) > 0.0)
             .collect();
         assert_eq!(solid.len(), 1);
@@ -2128,6 +2387,237 @@ mod tests {
 
         for seed in 0..30 {
             check_outlines(&Layer::soup(seed, 32, 20));
+        }
+    }
+
+    /// How outlines were found before edges were linked: chained edge by
+    /// edge, each the sharpest right turn among those not yet used.
+    fn traced_outlines(level: &Layer) -> Vec<Outline> {
+        let key = |p: [f32; 2]| [(p[0] / TILE).round() as i32, (p[1] / TILE).round() as i32];
+        let edges = level.outline_edges();
+        let dir = |e: &Edge| {
+            let [a, b] = [key(e.a), key(e.b)];
+            [b[0] - a[0], b[1] - a[1]]
+        };
+        let mut starting: std::collections::HashMap<[i32; 2], Vec<usize>> = Default::default();
+        for (i, e) in edges.iter().enumerate() {
+            starting.entry(key(e.a)).or_default().push(i);
+        }
+        let mut used = vec![false; edges.len()];
+        let mut out = Vec::new();
+        for first in 0..edges.len() {
+            if used[first] {
+                continue;
+            }
+            let mut chain = vec![first];
+            used[first] = true;
+            loop {
+                let last = *chain.last().unwrap();
+                let d = dir(&edges[last]);
+                let next = starting[&key(edges[last].b)]
+                    .iter()
+                    .copied()
+                    .filter(|&i| !used[i] || i == first)
+                    .max_by(|&i, &j| {
+                        let turn = |k: usize| {
+                            let n = dir(&edges[k]);
+                            let cross = (d[0] * n[1] - d[1] * n[0]) as f32;
+                            let dot = (d[0] * n[0] + d[1] * n[1]) as f32;
+                            cross.atan2(dot)
+                        };
+                        turn(i).total_cmp(&turn(j))
+                    });
+                match next {
+                    Some(i) if i == first => break,
+                    Some(i) => {
+                        used[i] = true;
+                        chain.push(i);
+                    }
+                    None => panic!("an open outline"),
+                }
+            }
+            let turns_at = |k: usize| {
+                dir(&edges[chain[k]]) != dir(&edges[chain[(k + chain.len() - 1) % chain.len()]])
+            };
+            let start = (0..chain.len()).find(|&k| turns_at(k)).unwrap_or(0);
+            chain.rotate_left(start);
+            let mut outline = Outline {
+                points: Vec::new(),
+                runs: Vec::new(),
+            };
+            for (k, &i) in chain.iter().enumerate() {
+                if k == 0 || dir(&edges[i]) != dir(&edges[chain[k - 1]]) {
+                    outline.points.push(edges[i].a);
+                    outline.runs.push(Vec::new());
+                }
+                outline.runs.last_mut().unwrap().push(i);
+            }
+            out.push(outline);
+        }
+        out
+    }
+
+    /// Bevel strips as they were drawn from whole loops, each a quad of
+    /// points.
+    fn traced_bevels(level: &Layer, width: f32) -> Vec<[[f32; 2]; 4]> {
+        let mut out = Vec::new();
+        for o in traced_outlines(level) {
+            let n = o.points.len();
+            let normals: Vec<[f32; 2]> = (0..n)
+                .map(|k| inward_normal(o.points[k], o.points[(k + 1) % n]))
+                .collect();
+            let inset: Vec<[f32; 2]> = (0..n)
+                .map(|k| inset_corner(o.points[k], normals[(k + n - 1) % n], normals[k], width))
+                .collect();
+            for (k, run) in o.runs.iter().enumerate() {
+                let normal = [normals[k][0] * width, normals[k][1] * width];
+                let (start, end) = (o.points[k], o.points[(k + 1) % n]);
+                let inner = |p: [f32; 2], corner: [f32; 2], mitered: [f32; 2]| {
+                    if p == corner {
+                        mitered
+                    } else {
+                        [p[0] + normal[0], p[1] + normal[1]]
+                    }
+                };
+                for &i in run {
+                    let e = level.outline_edges()[i];
+                    if level.in_bounds(e.solid) {
+                        let a = inner(e.a, start, inset[k]);
+                        let b = inner(e.b, end, inset[(k + 1) % n]);
+                        out.push([e.a, e.b, b, a]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn linked_edges_make_the_loops_tracing_did() {
+        let close =
+            |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4;
+        let mut levels: Vec<Layer> = (0..40).map(|seed| Layer::soup(seed, 40, 30)).collect();
+        // Pinches: lone full tiles touching at corners, a checkerboard.
+        levels.push(Layer::from_ascii(&["#.#.", ".#.#", "#.#.", ".#.#"]));
+        levels.push(Layer::from_ascii(&["....", ".#..", "..#.", "...."]));
+        for level in &levels {
+            check_outlines(level);
+            let traced = traced_outlines(level);
+            assert_eq!(level.outlines(), traced);
+            // Concave corners: where a loop turns left.
+            let mut concave = Vec::new();
+            for o in &traced {
+                let n = o.points.len();
+                for k in 0..n {
+                    let (prev, here, next) = (
+                        o.points[(k + n - 1) % n],
+                        o.points[k],
+                        o.points[(k + 1) % n],
+                    );
+                    let (d0, d1) = (
+                        [here[0] - prev[0], here[1] - prev[1]],
+                        [next[0] - here[0], next[1] - here[1]],
+                    );
+                    if d0[0] * d1[1] - d0[1] * d1[0] < 0.0 {
+                        concave.push((here, inward_normal(prev, here), inward_normal(here, next)));
+                    }
+                }
+            }
+            assert_eq!(level.concave_corners().len(), concave.len());
+            for c in level.concave_corners() {
+                assert!(
+                    concave.iter().any(|&(at, b, a)| close(at, c.at)
+                        && close(b, c.before)
+                        && close(a, c.after)),
+                    "{c:?}"
+                );
+            }
+            // Bevels: the same strips.
+            let tileset = crate::tileset::testing::tileset();
+            let mut canvas = Canvas::new(&tileset);
+            level.draw_bevels(
+                &tileset,
+                &mut canvas,
+                |_| true,
+                1.5,
+                crate::camera::EVERYWHERE,
+            );
+            let traced = traced_bevels(level, 1.5);
+            let drawn = canvas.vertices.len();
+            assert_eq!(drawn, traced.len() * 6, "two triangles a strip");
+            let strips: Vec<[[f32; 2]; 3]> = canvas
+                .vertices
+                .chunks(3)
+                .map(|t| [t[0].pos, t[1].pos, t[2].pos])
+                .collect();
+            for quad in &traced {
+                let [a, b, c, d] = *quad;
+                let has = |t: [[f32; 2]; 3]| {
+                    strips
+                        .iter()
+                        .any(|s| s.iter().zip(&t).all(|(p, q)| close(*p, *q)))
+                };
+                assert!(has([a, b, c]) && has([a, c, d]), "{quad:?}");
+            }
+        }
+    }
+
+    /// Everything two layers know about their shape, compared.
+    #[track_caller]
+    fn assert_same_shape(a: &Layer, b: &Layer) {
+        assert_eq!((a.cols, a.rows), (b.cols, b.rows));
+        assert!(a.solids == b.solids, "solids");
+        assert_eq!(a.corners, b.corners);
+        assert_eq!(a.edges, b.edges);
+        assert_eq!((&a.next, &a.prev), (&b.next, &b.prev));
+        assert_eq!(a.concave, b.concave);
+        for y in 0..a.rows as i32 {
+            for x in 0..a.cols as i32 {
+                assert!(identical_tile(a.tile(x, y), b.tile(x, y)), "({x}, {y})");
+            }
+        }
+    }
+
+    fn identical_tile(a: Tile, b: Tile) -> bool {
+        crate::chunk::identical(a, b)
+    }
+
+    #[test]
+    fn layers_from_pieces_are_layers_from_tiles() {
+        // Not whole chunks: the last are cut short, one to a single column.
+        for (seed, [cols, rows]) in [(1, [100, 70]), (2, [64, 64]), (3, [97, 33]), (4, [20, 9])] {
+            let soup = Layer::soup(seed, cols, rows);
+            let tiles: Vec<Tile> = (0..cols * rows)
+                .map(|i| soup.tile((i % cols) as i32, (i / cols) as i32))
+                .collect();
+            let chunks = Chunks::from_tiles(cols, rows, &tiles);
+            let [across, down] = chunks.size();
+            let size =
+                |cx: usize, cy: usize| [CHUNK.min(cols - cx * CHUNK), CHUNK.min(rows - cy * CHUNK)];
+            let pieces: Vec<Arc<Piece>> = (0..across * down)
+                .map(|c| {
+                    let [cx, cy] = [c % across, c / across];
+                    Arc::new(Piece::new(chunks.chunk(cx, cy).clone(), size(cx, cy)))
+                })
+                .collect();
+            let whole = Layer::from_chunks(chunks.clone());
+            assert_same_shape(&Layer::from_pieces(cols, rows, &pieces), &whole);
+            // And shaped by solids alone.
+            let solids: Vec<Solid> = tiles.iter().map(|t| t.wall()).collect();
+            let pieces: Vec<Arc<Piece>> = (0..across * down)
+                .map(|c| {
+                    let [cx, cy] = [c % across, c / across];
+                    let [w, h] = size(cx, cy);
+                    let solids = (0..w * h)
+                        .map(|i| solids[(cy * CHUNK + i / w) * cols + cx * CHUNK + i % w])
+                        .collect();
+                    Arc::new(Piece::from_solids([w, h], solids))
+                })
+                .collect();
+            assert_same_shape(
+                &Layer::from_pieces(cols, rows, &pieces),
+                &Layer::from_solids(cols, rows, solids),
+            );
         }
     }
 

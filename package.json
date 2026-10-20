@@ -1,5 +1,5 @@
 {
-    "name": "goblin_nightclub",
+    "name": "goblin-nightclub",
     "version": "0.1.0",
     "description": "A 2D WebAssembly + WebGPU game",
     "private": true,

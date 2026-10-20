@@ -457,6 +457,7 @@ impl App {
             },
             Mode::Game(game) => {
                 game.update(dt);
+                self.renderer.preload(game.upcoming());
                 self.renderer.draw(&game.frame());
             }
             Mode::Editor => {
