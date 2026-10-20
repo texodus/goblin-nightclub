@@ -14,6 +14,9 @@
 //              flower clump, pebbles, foam)
 //   rows 5-14  every variant of one material a row: plain, planks, dirt,
 //              grate, grass, sand, stone, rock, brick, metal
+//   rows 15-16 props (things standing on tiles): trees, each two cells
+//              square, seen from above (columns 0-5), then rocks, a cell
+//              each, on row 15 (from column 6)
 //
 // Natural textures are tileable across variants: near a cell's edges each
 // variant shows a field all of its material's variants share, and only
@@ -36,7 +39,7 @@ const OUT = path.join(ROOT, "www", "assets", "tiles.png");
 
 export const CELL = 16;
 const COLS = 16;
-const ROWS = 15;
+const ROWS = 17;
 
 // --- Colors ---------------------------------------------------------------
 
@@ -777,6 +780,95 @@ function trim(art) {
     });
 }
 
+// --- Props ----------------------------------------------------------------
+// Things standing on tiles, seen from straight above, lit from the top
+// left, each over its shadow (down and right): drawn as one picture, then
+// cut into cells.
+
+// A shape of round clumps (`[x, y, r]`, in pixels), `size` pixels square:
+// each pixel's height (0 outside, up to 1 at a clump's middle), as a dome
+// over each clump.
+function clumps(size, list) {
+    return (x, y) => {
+        let best = 0;
+        for (const [cx, cy, r] of list) {
+            const d2 = (x - cx) ** 2 + (y - cy) ** 2;
+            if (d2 < r * r) best = Math.max(best, Math.sqrt(1 - d2 / (r * r)));
+        }
+        return x < 0 || y < 0 || x >= size || y >= size ? 0 : best;
+    };
+}
+
+// A picture `size` pixels square of the shape with heights `h`: shaded on
+// ramp `r` around step `mid` by how it faces the light, roughened by
+// `grain` (0 to 1) of noise, outlined in the ramp's darkest, over its
+// shadow `drop` pixels down and right.
+function shaded(size, h, r, { mid, grain, seed, drop }) {
+    const px = new Array(size * size).fill(null);
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+            const [cx, cy] = [x + 0.5, y + 0.5];
+            const here = h(cx, cy);
+            if (here <= 0) {
+                if (h(cx - drop, cy - drop) > 0) px[y * size + x] = [0, 0, 0, Math.round(SHADOW * 255)];
+                continue;
+            }
+            const edge = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dy]) => h(cx + dx, cy + dy) <= 0);
+            if (edge) {
+                px[y * size + x] = r[0];
+                continue;
+            }
+            const lit = (h(cx - 1, cy - 1) - h(cx + 1, cy + 1)) * -4 + here * 1.5;
+            const rough = (hash(x >> 1, y >> 1, seed) - 0.5) * 2 * grain;
+            px[y * size + x] = pick(r, mid + lit + rough);
+        }
+    }
+    return px;
+}
+
+// The cells of a picture `n` cells square, row by row.
+function cells(px, n) {
+    const size = n * CELL;
+    const out = [];
+    for (let j = 0; j < n; j++) {
+        for (let i = 0; i < n; i++) {
+            out.push(fill((x, y) => px[(j * CELL + y) * size + i * CELL + x]));
+        }
+    }
+    return out;
+}
+
+const LEAVES = ramp("#0f2a22", "#163a2d", "#1f5439", "#2c7040", "#449046", "#69b04f", "#9bcb5c");
+
+// A tree, variant `v`: a round canopy of leafy clumps, two cells square,
+// centered on its tile (a cell in from each side).
+function tree(v) {
+    const size = 2 * CELL;
+    const next = rng(seedOf("tree") + v * 7919);
+    const c = size / 2;
+    const list = [[c, c, 9 + next() * 2]];
+    const around = 6 + Math.floor(next() * 3);
+    for (let i = 0; i < around; i++) {
+        const a = (i / around + next() * 0.1) * Math.PI * 2;
+        const d = 6 + next() * 2.5;
+        list.push([c + Math.cos(a) * d, c + Math.sin(a) * d, 4.5 + next() * 2]);
+    }
+    const h = clumps(size, list);
+    return cells(shaded(size, h, LEAVES, { mid: 2.6, grain: 0.9, seed: seedOf("leaves") + v, drop: 2 }), 2);
+}
+
+// A rock, variant `v`: a boulder or two, a cell square.
+function boulder(v) {
+    const next = rng(seedOf("boulder") + v * 104729);
+    const c = CELL / 2;
+    const list = [[c - 0.5 + next() * 1.5, c + next() * 1.5, 4.5 + next() * 1.5]];
+    if (next() < 0.6) list.push([c - 3 + next() * 6, c - 3 + next() * 6, 2.5 + next() * 1.5]);
+    const h = clumps(CELL, list);
+    return shaded(CELL, h, R.rock, { mid: 2.6, grain: 0.5, seed: seedOf("boulder") + v, drop: 1 });
+}
+
+export const PROPS = { trees: 3, rocks: 4 };
+
 export const SPRITES = { player: [PLAYER, PLAYER_LEGEND], npc: [NPC, NPC_LEGEND] };
 export { sprite };
 
@@ -819,6 +911,10 @@ export function sheet() {
     put(0, 3, sprite(PLAYER, PLAYER_LEGEND));
     put(1, 3, sprite(NPC, NPC_LEGEND));
     TRIMS.forEach((art, i) => put(2 + i, 3, trim(art)));
+    for (let v = 0; v < PROPS.trees; v++) {
+        tree(v).forEach((t, i) => put(2 * v + (i % 2), 15 + Math.floor(i / 2), t));
+    }
+    for (let v = 0; v < PROPS.rocks; v++) put(2 * PROPS.trees + v, 15, boulder(v));
     return { width: W, height: H, pixels };
 }
 

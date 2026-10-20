@@ -1,12 +1,14 @@
 //! A layer's tiles, stored in square chunks of [`CHUNK`] tiles a side. Each
 //! chunk keeps only the distinct tiles it uses (its palette) and an index
 //! into it per tile, so uniform stretches, like solid rock underground or
-//! open sky above, cost next to nothing. Chunks are the unit levels are to
+//! open sky above, cost next to nothing; and the props standing on its
+//! tiles (see [`crate::prop`]), a short list. Chunks are the unit levels are to
 //! be loaded, generated and saved in.
 
 use std::sync::Arc;
 
 use crate::layer::Tile;
+use crate::prop::{Prop, PropId};
 
 /// Tiles a side of a chunk.
 pub const CHUNK: usize = 32;
@@ -21,6 +23,9 @@ pub struct Chunk {
     /// The distinct tiles, in order of first use.
     palette: Vec<Tile>,
     cells: Cells,
+    /// The props on its tiles: each one's tile (its index, row by row)
+    /// and kind, in order of tile, one a tile at most.
+    props: Vec<(u16, PropId)>,
 }
 
 /// Each tile's index into the palette, row by row: none when it has one
@@ -38,6 +43,7 @@ impl Chunk {
         Self {
             palette: vec![tile],
             cells: Cells::Uniform,
+            props: Vec::new(),
         }
     }
 
@@ -61,7 +67,11 @@ impl Chunk {
             ..=256 => Cells::Narrow(Box::new(indices.map(|i| i as u8))),
             _ => Cells::Wide(Box::new(indices)),
         };
-        Self { palette, cells }
+        Self {
+            palette,
+            cells,
+            props: Vec::new(),
+        }
     }
 
     /// The tile at `(x, y)` in the chunk.
@@ -105,18 +115,47 @@ impl Chunk {
             ..=256 => Cells::Narrow(Box::new(std::array::from_fn(|i| indices[i] as u8))),
             _ => Cells::Wide(Box::new(std::array::from_fn(|i| indices[i]))),
         };
-        Some(Self { palette, cells })
+        Some(Self {
+            palette,
+            cells,
+            props: Vec::new(),
+        })
+    }
+
+    /// The prop on tile `(x, y)`, if there's one.
+    pub fn prop(&self, x: usize, y: usize) -> Option<PropId> {
+        let i = (y * CHUNK + x) as u16;
+        let at = self.props.binary_search_by_key(&i, |&(t, _)| t).ok()?;
+        Some(self.props[at].1)
+    }
+
+    /// Its props: each one's tile (its index, row by row) and kind, in
+    /// order of tile.
+    pub fn props(&self) -> &[(u16, PropId)] {
+        &self.props
+    }
+
+    /// The same chunk with `props` on its tiles instead (each one's tile,
+    /// its index row by row, and kind): of several on one tile, the last.
+    pub fn with_props(mut self, mut props: Vec<(u16, PropId)>) -> Self {
+        props.retain(|&(t, _)| (t as usize) < CELLS);
+        props.reverse();
+        props.sort_by_key(|&(t, _)| t);
+        props.dedup_by_key(|&mut (t, _)| t);
+        self.props = props;
+        self
     }
 
     /// Are the two the same tiles, written the same way (see
     /// [`identical`])?
     pub fn same(&self, other: &Chunk) -> bool {
-        (0..CELLS).all(|i| {
-            identical(
-                self.get(i % CHUNK, i / CHUNK),
-                other.get(i % CHUNK, i / CHUNK),
-            )
-        })
+        self.props == other.props
+            && (0..CELLS).all(|i| {
+                identical(
+                    self.get(i % CHUNK, i / CHUNK),
+                    other.get(i % CHUNK, i / CHUNK),
+                )
+            })
     }
 }
 
@@ -202,6 +241,43 @@ impl Chunks {
     /// The chunk `(cx, cy)` chunks from the top left.
     pub fn chunk(&self, cx: usize, cy: usize) -> &Arc<Chunk> {
         &self.chunks[cy * self.across + cx]
+    }
+
+    /// The prop on tile `(x, y)`, which must be inside the grid, if there's
+    /// one.
+    pub fn prop(&self, x: usize, y: usize) -> Option<PropId> {
+        self.chunks[y / CHUNK * self.across + x / CHUNK].prop(x % CHUNK, y % CHUNK)
+    }
+
+    /// Every prop, by chunk, then in order of tile.
+    pub fn props(&self) -> impl Iterator<Item = Prop> + '_ {
+        self.chunks.iter().enumerate().flat_map(move |(c, chunk)| {
+            let [x0, y0] = [c % self.across * CHUNK, c / self.across * CHUNK];
+            chunk.props().iter().map(move |&(t, kind)| {
+                let at = [x0 + t as usize % CHUNK, y0 + t as usize / CHUNK];
+                Prop { at, kind }
+            })
+        })
+    }
+
+    /// The same grid with `props` on its tiles instead (those outside it
+    /// left out; of several on a tile, the last).
+    pub fn with_props(mut self, props: &[Prop]) -> Self {
+        let mut by_chunk: Vec<Vec<(u16, PropId)>> = vec![Vec::new(); self.chunks.len()];
+        for p in props
+            .iter()
+            .filter(|p| p.at[0] < self.cols && p.at[1] < self.rows)
+        {
+            let [x, y] = p.at;
+            let t = (y % CHUNK * CHUNK + x % CHUNK) as u16;
+            by_chunk[y / CHUNK * self.across + x / CHUNK].push((t, p.kind));
+        }
+        for (chunk, props) in self.chunks.iter_mut().zip(by_chunk) {
+            if !props.is_empty() || !chunk.props().is_empty() {
+                *chunk = Arc::new(Chunk::clone(chunk).with_props(props));
+            }
+        }
+        self
     }
 
     /// Chunks across and down.

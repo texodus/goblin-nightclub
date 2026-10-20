@@ -1,7 +1,8 @@
 //! Levels saved as JSON: the size, where the player starts, the ground
 //! level, which sprites the player and NPCs wear, the tileset (see
-//! [`crate::tileset`]), and each layer's tiles, bottom layer first, row by
-//! row. A level file is everything a level needs but the sheet image,
+//! [`crate::tileset`]), each layer's tiles, bottom layer first, row by
+//! row, and the props standing on them (see [`crate::prop`]), each its
+//! tile and kind's name, if there are any. A level file is everything a level needs but the sheet image,
 //! which [`Tileset::image`] points to.
 //!
 //! Each tile is a short string, naming floor, wall and liquid types from
@@ -18,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::entity::PLAYER_SIZE;
 use crate::layer::{Corner, Dir, Layer, Part, TILE, Tile};
 use crate::level::{Level, MAX_LAYERS, MAX_TILES, can_stand};
+use crate::path;
+use crate::prop::Prop;
 use crate::tileset::Tileset;
 
 /// The version written. Earlier formats (1: before tilesets were data; 2:
@@ -41,6 +44,8 @@ pub struct LevelFile {
     pub tileset: Tileset,
     /// Bottom first; each a list of rows, each a list of tiles.
     pub layers: Vec<Vec<Vec<Tile>>>,
+    /// Each layer's props, bottom first, one a tile at most.
+    pub props: Vec<Vec<Prop>>,
 }
 
 /// Where the player starts: the center of their box, in world units
@@ -133,6 +138,16 @@ struct Raw {
     npc: Character,
     tileset: Tileset,
     layers: Vec<Vec<Vec<String>>>,
+    /// Bottom first, as many as there are layers or fewer.
+    #[serde(default)]
+    props: Vec<Vec<RawProp>>,
+}
+
+/// A prop as the file has it: its tile, and its kind's name.
+#[derive(Serialize, Deserialize)]
+struct RawProp {
+    at: [usize; 2],
+    kind: String,
 }
 
 impl LevelFile {
@@ -163,7 +178,16 @@ impl LevelFile {
                 .iter()
                 .map(|tiles| tiles.chunks(cols).map(<[Tile]>::to_vec).collect())
                 .collect(),
+            props: vec![Vec::new(); layers.len()],
         }
+    }
+
+    /// The same level with `props` on its layers instead, bottom first
+    /// (missing layers having none).
+    pub fn with_props(mut self, mut props: Vec<Vec<Prop>>) -> Self {
+        props.resize(self.layers.len(), Vec::new());
+        self.props = props;
+        self
     }
 
     /// A blank level: `depth` layers of `cols` x `rows` of the tileset's
@@ -212,7 +236,7 @@ impl LevelFile {
             })
             .collect();
         format!(
-            "{{\n  \"format\": {},\n  \"cols\": {},\n  \"rows\": {},\n  \"spawn\": {},\n  \"ground\": {},\n  \"player\": {},\n  \"npc\": {},\n  \"tileset\": {},\n  \"layers\": [\n{}\n  ]\n}}\n",
+            "{{\n  \"format\": {},\n  \"cols\": {},\n  \"rows\": {},\n  \"spawn\": {},\n  \"ground\": {},\n  \"player\": {},\n  \"npc\": {},\n  \"tileset\": {},\n  \"layers\": [\n{}\n  ]{}\n}}\n",
             self.format,
             self.cols,
             self.rows,
@@ -221,8 +245,35 @@ impl LevelFile {
             compact(&self.player),
             compact(&self.npc),
             pretty_tileset(&self.tileset),
-            layers.join(",\n")
+            layers.join(",\n"),
+            self.props_json(),
         )
+    }
+
+    /// `,` and the props, as JSON: each layer's on a line; nothing if
+    /// there are none.
+    fn props_json(&self) -> String {
+        if self.props.iter().all(Vec::is_empty) {
+            return String::new();
+        }
+        let layers: Vec<String> = self
+            .props
+            .iter()
+            .map(|props| {
+                let props: Vec<String> = props
+                    .iter()
+                    .map(|p| {
+                        let kind = &self.tileset.props[p.kind as usize].name;
+                        compact(&RawProp {
+                            at: p.at,
+                            kind: kind.clone(),
+                        })
+                    })
+                    .collect();
+                format!("    [{}]", props.join(","))
+            })
+            .collect();
+        format!(",\n  \"props\": [\n{}\n  ]", layers.join(",\n"))
     }
 
     /// Parse and check a level: its format, sizes, spawn, tileset and the
@@ -268,8 +319,33 @@ impl LevelFile {
         if raw.spawn.layer >= raw.layers.len() || !in_bounds {
             return Err("the spawn is outside the level".into());
         }
+        if raw.props.len() > layers.len() {
+            return Err("there are props on more layers than there are".into());
+        }
+        let mut props = Vec::with_capacity(layers.len());
+        for (k, layer) in raw.props.iter().enumerate() {
+            let mut placed = Vec::with_capacity(layer.len());
+            for p in layer {
+                let Some(kind) = raw.tileset.prop(&p.kind) else {
+                    return Err(format!("layer {k}: no prop {:?} in the tileset", p.kind));
+                };
+                if p.at[0] >= raw.cols || p.at[1] >= raw.rows {
+                    return Err(format!("layer {k}: a prop at {:?} is outside it", p.at));
+                }
+                placed.push(Prop { at: p.at, kind });
+            }
+            props.push(placed);
+        }
+        props.resize(layers.len(), Vec::new());
         let tiles: Vec<Tile> = layers[raw.spawn.layer].concat();
-        if !can_stand(&tiles, raw.cols, raw.rows, raw.spawn.pos, PLAYER_SIZE) {
+        let blocked = path::tiles_under(raw.spawn.pos, PLAYER_SIZE)
+            .into_iter()
+            .any(|[x, y]| {
+                props[raw.spawn.layer].iter().any(|p| {
+                    p.at == [x as usize, y as usize] && raw.tileset.props[p.kind as usize].blocks
+                })
+            });
+        if blocked || !can_stand(&tiles, raw.cols, raw.rows, raw.spawn.pos, PLAYER_SIZE) {
             return Err("the player doesn't fit at the spawn".into());
         }
         if raw.ground >= raw.layers.len() {
@@ -293,6 +369,7 @@ impl LevelFile {
             npc: raw.npc,
             tileset: raw.tileset,
             layers,
+            props,
         })
     }
 
@@ -322,6 +399,7 @@ impl LevelFile {
             player: meta.player,
             npc: meta.npc,
             tileset: meta.tileset,
+            props: vec![Vec::new(); tiles.len()],
             layers: tiles
                 .into_iter()
                 .map(|t| t.chunks(meta.cols).map(<[Tile]>::to_vec).collect())
@@ -338,7 +416,10 @@ impl LevelFile {
         Level::new(
             self.tiles()
                 .into_iter()
-                .map(|tiles| Layer::from_tiles(self.cols, self.rows, tiles))
+                .zip(&self.props)
+                .map(|(tiles, props)| {
+                    Layer::from_tiles(self.cols, self.rows, tiles).with_props(props)
+                })
                 .collect(),
             self.tileset.clone(),
         )
@@ -364,6 +445,12 @@ fn pretty_tileset(t: &Tileset) -> String {
             .collect();
         format!("    {}: {{\n{}\n    }}", compact(&key), entries.join(",\n"))
     };
+    let props = (!raw.props.is_empty()).then(|| {
+        table(
+            "props",
+            raw.props.iter().map(|(n, e)| (n, compact(e))).collect(),
+        )
+    });
     let lines = [
         format!("    \"cell\": {}", raw.cell),
         format!("    \"image\": {}", compact(&raw.image)),
@@ -386,6 +473,7 @@ fn pretty_tileset(t: &Tileset) -> String {
             raw.sprites.iter().map(|(n, e)| (n, compact(e))).collect(),
         ),
     ];
+    let lines: Vec<String> = lines.into_iter().chain(props).collect();
     format!("{{\n{}\n  }}", lines.join(",\n"))
 }
 
@@ -516,6 +604,57 @@ mod tests {
         assert!(Tile::from_text("wall:nonsense", &t).is_err());
         assert!(Tile::from_text("water", &t).is_err(), "format 1 spelling");
         assert!(Tile::from_text("XX/void/void", &t).is_err());
+    }
+
+    #[test]
+    fn props_round_trip_and_are_checked() {
+        let t = tileset();
+        let (tree, rock) = (t.prop("tree").unwrap(), t.prop("rock").unwrap());
+        let layers = vec![vec![Tile::FLOOR; 5 * 4]; 2];
+        let file = LevelFile::new(5, 4, &layers, Spawn::at_tile(1, [0, 0]), t, "player", "npc")
+            .with_props(vec![
+                vec![Prop {
+                    at: [1, 1],
+                    kind: tree,
+                }],
+                vec![
+                    Prop {
+                        at: [4, 3],
+                        kind: rock,
+                    },
+                    Prop {
+                        at: [2, 0],
+                        kind: tree,
+                    },
+                ],
+            ]);
+        let json = file.to_json();
+        assert!(json.contains(r#"{"at":[4,3],"kind":"rock"}"#), "{json}");
+        assert_eq!(LevelFile::from_json(&json).unwrap(), file);
+        // And on a layer, and in its chunks.
+        let level = file.level();
+        assert_eq!(level.layer(1).prop(4, 3), Some(rock));
+        assert_eq!(level.layer(0).prop(1, 1), Some(tree));
+        assert_eq!(level.layer(0).prop(4, 3), None);
+        assert_eq!(level.layer(1).props().count(), 2);
+        // A level without props says nothing of them.
+        let bare = LevelFile::new(
+            5,
+            4,
+            &layers,
+            Spawn::at_tile(1, [0, 0]),
+            tileset(),
+            "player",
+            "npc",
+        );
+        assert!(!bare.to_json().contains("\"props\": ["));
+
+        let refused =
+            |from: &str, to: &str| LevelFile::from_json(&json.replace(from, to)).unwrap_err();
+        assert!(refused(r#""kind":"rock""#, r#""kind":"shrub""#).contains("no prop"));
+        assert!(refused("[4,3]", "[5,3]").contains("outside"));
+        // Where the player starts, a prop in the way.
+        assert!(refused("[2,0]", "[0,0]").contains("doesn't fit"));
     }
 
     #[test]

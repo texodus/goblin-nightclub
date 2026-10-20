@@ -23,6 +23,9 @@ pub struct Mesh {
     chunks: [usize; 2],
     /// Where each chunk's vertices start, row by row, then the end.
     starts: Vec<u32>,
+    /// How far past its chunk a chunk's triangles may reach, in world
+    /// units.
+    reach: f32,
 }
 
 impl Mesh {
@@ -53,7 +56,16 @@ impl Mesh {
             vertices: canvas.vertices,
             chunks,
             starts,
+            reach: TILE / 2.0,
         }
+    }
+
+    /// The same mesh, its triangles reaching up to `reach` (world units)
+    /// past their chunks instead of half a tile: props' art, which
+    /// overhangs the tiles around its own.
+    pub fn reaching(mut self, reach: f32) -> Self {
+        self.reach = self.reach.max(reach);
+        self
     }
 
     /// The parts of each tile that `quarters(x, y)` picks (see
@@ -114,8 +126,8 @@ impl Mesh {
     pub fn ranges(&self, rect: Rect) -> Vec<Range<u32>> {
         let size = CHUNK as f32 * TILE;
         let span = |axis: usize| {
-            let lo = ((rect[0][axis] - TILE / 2.0) / size).floor().max(0.0);
-            let hi = ((rect[1][axis] + TILE / 2.0) / size)
+            let lo = ((rect[0][axis] - self.reach) / size).floor().max(0.0);
+            let hi = ((rect[1][axis] + self.reach) / size)
                 .ceil()
                 .min(self.chunks[axis] as f32);
             lo as usize..(hi as usize).max(lo as usize)

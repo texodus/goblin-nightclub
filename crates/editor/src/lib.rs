@@ -27,6 +27,8 @@ use goblin_nightclub_core::layer::{Corner, Dir, Layer, Part, TILE, Tile};
 use goblin_nightclub_core::level::{Level, MAX_LAYERS, can_stand};
 use goblin_nightclub_core::level_file::{Character, LevelFile, Spawn};
 use goblin_nightclub_core::palette::{self, Color};
+use goblin_nightclub_core::path;
+use goblin_nightclub_core::prop::{Prop, PropId};
 use goblin_nightclub_core::tileset::Tileset;
 
 /// Steps of undo kept.
@@ -51,11 +53,21 @@ pub enum BrushShape {
     Split(Corner),
 }
 
-/// Something to paint with, as listed in the palette.
+/// Something to paint with, as listed in the palette: a tile's part or
+/// stairs, or a prop (or none) standing on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Brush {
     Part(Part),
     Stairs(Dir),
+    Prop(PropId),
+    NoProp,
+}
+
+/// What a brush paints: a tile, or what stands on one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Paint {
+    Tile(Tile),
+    Prop(Option<PropId>),
 }
 
 /// A palette entry as the interface shows it.
@@ -86,16 +98,19 @@ pub struct State {
 }
 
 /// Every brush `tileset` offers, in palette order: floors, walls, void,
-/// liquids, stairs.
+/// liquids, stairs, props and none.
 pub fn palette(tileset: &Tileset) -> Vec<Brush> {
     let floors = (0..tileset.floors.len()).map(|f| Brush::Part(Part::Floor(f as u8)));
     let walls = (0..tileset.walls.len()).map(|w| Brush::Part(Part::Wall(w as u8)));
     let liquids = (0..tileset.liquids.len()).map(|l| Brush::Part(Part::Liquid(l as u8)));
+    let props = (0..tileset.props.len()).map(|p| Brush::Prop(p as PropId));
     floors
         .chain(walls)
         .chain([Brush::Part(Part::Void)])
         .chain(liquids)
         .chain([Brush::Stairs(Dir::Up), Brush::Stairs(Dir::Down)])
+        .chain(props)
+        .chain([Brush::NoProp])
         .collect()
 }
 
@@ -136,6 +151,20 @@ pub fn swatches(tileset: &Tileset) -> Vec<Swatch> {
                 name: "stairs down".into(),
                 cell: Some(tileset.stairs[1]),
             },
+            Brush::Prop(p) => {
+                let prop = &tileset.props[p as usize];
+                // Its tile's cell of its art.
+                let [x, y] = prop.cells[0];
+                let at = prop.anchor.map(|a| a.floor() as u16);
+                Swatch {
+                    name: prop.name.clone(),
+                    cell: Some([x + at[0], y + at[1]]),
+                }
+            }
+            Brush::NoProp => Swatch {
+                name: "no prop".into(),
+                cell: None,
+            },
         })
         .collect()
 }
@@ -151,6 +180,7 @@ struct Stroke {
 #[derive(Clone, PartialEq)]
 struct Snapshot {
     layers: Vec<Vec<Tile>>,
+    props: Vec<Vec<Option<PropId>>>,
     spawn: Spawn,
 }
 
@@ -160,6 +190,8 @@ pub struct Editor {
     rows: usize,
     /// Bottom first, each row by row.
     layers: Vec<Vec<Tile>>,
+    /// What stands on each tile of each layer, likewise.
+    props: Vec<Vec<Option<PropId>>>,
     spawn: Spawn,
     /// The ground level (kept from the file; see
     /// [`LevelFile::ground`]).
@@ -190,14 +222,35 @@ pub struct Editor {
     redo: Vec<Snapshot>,
 }
 
-fn build(cols: usize, rows: usize, layers: &[Vec<Tile>], tileset: &Tileset) -> Level {
+fn build(
+    cols: usize,
+    rows: usize,
+    layers: &[Vec<Tile>],
+    props: &[Vec<Option<PropId>>],
+    tileset: &Tileset,
+) -> Level {
     Level::new(
         layers
             .iter()
-            .map(|tiles| Layer::from_tiles(cols, rows, tiles.clone()))
+            .zip(props)
+            .map(|(tiles, props)| {
+                Layer::from_tiles(cols, rows, tiles.clone()).with_props(&listed(cols, props))
+            })
             .collect(),
         tileset.clone(),
     )
+}
+
+/// Props tile by tile, row by row, `cols` across, as a list.
+fn listed(cols: usize, props: &[Option<PropId>]) -> Vec<Prop> {
+    (props.iter().enumerate())
+        .filter_map(|(i, p)| {
+            p.map(|kind| Prop {
+                at: [i % cols, i / cols],
+                kind,
+            })
+        })
+        .collect()
 }
 
 impl Editor {
@@ -207,7 +260,18 @@ impl Editor {
     pub fn from_file(file: &LevelFile, view: [f32; 2]) -> Self {
         let (cols, rows) = (file.cols, file.rows);
         let layers = file.tiles();
-        let level = build(cols, rows, &layers, &file.tileset);
+        let props: Vec<Vec<Option<PropId>>> = file
+            .props
+            .iter()
+            .map(|list| {
+                let mut props = vec![None; cols * rows];
+                for p in list {
+                    props[p.at[1] * cols + p.at[0]] = Some(p.kind);
+                }
+                props
+            })
+            .collect();
+        let level = build(cols, rows, &layers, &props, &file.tileset);
         let palette = palette(&file.tileset);
         let index = |b: Brush| palette.iter().position(|p| *p == b).unwrap();
         let mut editor = Self {
@@ -216,6 +280,7 @@ impl Editor {
             rows,
             layer: file.spawn.layer,
             layers,
+            props,
             spawn: file.spawn,
             ground: file.ground,
             tileset: file.tileset.clone(),
@@ -250,6 +315,7 @@ impl Editor {
             &self.npc.sprite,
         )
         .with_ground(self.ground.min(self.layers.len() - 1))
+        .with_props(self.props.iter().map(|p| listed(self.cols, p)).collect())
     }
 
     /// The art the level is drawn with.
@@ -322,6 +388,7 @@ impl Editor {
             .unwrap_or(0);
         let tiles = vec![Tile::Whole(Part::Floor(floor)); self.cols * self.rows];
         self.layers.insert(at, tiles);
+        self.props.insert(at, vec![None; self.cols * self.rows]);
         if self.spawn.layer >= at {
             self.spawn.layer += 1;
         }
@@ -337,6 +404,7 @@ impl Editor {
         }
         self.checkpoint();
         self.layers.remove(self.layer);
+        self.props.remove(self.layer);
         if self.spawn.layer > self.layer {
             self.spawn.layer -= 1;
         }
@@ -356,7 +424,13 @@ impl Editor {
     pub fn update(&mut self, dt: f32) {
         self.camera.pan(&self.input, dt);
         if self.dirty {
-            self.level = build(self.cols, self.rows, &self.layers, &self.tileset);
+            self.level = build(
+                self.cols,
+                self.rows,
+                &self.layers,
+                &self.props,
+                &self.tileset,
+            );
             self.dirty = false;
         }
     }
@@ -364,12 +438,14 @@ impl Editor {
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             layers: self.layers.clone(),
+            props: self.props.clone(),
             spawn: self.spawn,
         }
     }
 
     fn restore(&mut self, s: Snapshot) {
         self.layers = s.layers;
+        self.props = s.props;
         self.spawn = s.spawn;
         self.layer = self.layer.min(self.layers.len() - 1);
         self.dirty = true;
@@ -415,7 +491,7 @@ impl Editor {
 
     /// What the brushes paint: with `swap` (the right button), the
     /// secondary takes the primary's place.
-    fn brush_tile(&self, swap: bool) -> Tile {
+    fn brush_paint(&self, swap: bool) -> Paint {
         let palette = &self.palette;
         let (a, b) = if swap {
             (palette[self.secondary], palette[self.primary])
@@ -427,32 +503,46 @@ impl Editor {
             _ => 0,
         };
         match a {
-            Brush::Stairs(dir) => Tile::Stairs(dir, floor),
-            Brush::Part(p) => match self.shape {
+            Brush::Prop(p) => Paint::Prop(Some(p)),
+            Brush::NoProp => Paint::Prop(None),
+            Brush::Stairs(dir) => Paint::Tile(Tile::Stairs(dir, floor)),
+            Brush::Part(p) => Paint::Tile(match self.shape {
                 BrushShape::Whole => Tile::Whole(p),
                 BrushShape::Split(c) => {
                     let rest = match b {
                         Brush::Part(q) => q,
-                        Brush::Stairs(_) => Part::Floor(floor),
+                        _ => Part::Floor(floor),
                     };
                     Tile::split(c, p, rest)
                 }
-            },
+            }),
         }
     }
 
-    fn paint(&mut self, t: [i32; 2], tile: Tile) {
+    /// What's at tile `t` of the layer of the kind `like` paints.
+    fn painted(&self, t: [i32; 2], like: Paint) -> Paint {
         let i = self.index(t);
-        let layer = &mut self.layers[self.layer];
-        if layer[i] != tile {
-            layer[i] = tile;
-            self.dirty = true;
+        match like {
+            Paint::Tile(_) => Paint::Tile(self.layers[self.layer][i]),
+            Paint::Prop(_) => Paint::Prop(self.props[self.layer][i]),
         }
+    }
+
+    fn paint(&mut self, t: [i32; 2], paint: Paint) {
+        if self.painted(t, paint) == paint {
+            return;
+        }
+        let i = self.index(t);
+        match paint {
+            Paint::Tile(tile) => self.layers[self.layer][i] = tile,
+            Paint::Prop(prop) => self.props[self.layer][i] = prop,
+        }
+        self.dirty = true;
     }
 
     /// Paint every tile on the line from `a` to `b`, so fast drags leave
     /// no gaps.
-    fn paint_line(&mut self, a: [i32; 2], b: [i32; 2], tile: Tile) {
+    fn paint_line(&mut self, a: [i32; 2], b: [i32; 2], tile: Paint) {
         let (dx, dy) = ((b[0] - a[0]).abs(), -(b[1] - a[1]).abs());
         let (sx, sy) = ((b[0] - a[0]).signum(), (b[1] - a[1]).signum());
         let (mut p, mut err) = (a, dx + dy);
@@ -473,7 +563,7 @@ impl Editor {
         }
     }
 
-    fn fill_rect(&mut self, a: [i32; 2], b: [i32; 2], tile: Tile) {
+    fn fill_rect(&mut self, a: [i32; 2], b: [i32; 2], tile: Paint) {
         for y in a[1].min(b[1])..=a[1].max(b[1]) {
             for x in a[0].min(b[0])..=a[0].max(b[0]) {
                 self.paint([x, y], tile);
@@ -481,19 +571,19 @@ impl Editor {
         }
     }
 
-    /// Flood fill from `start`: every tile like it, joined to it across
+    /// Flood fill from `start`: every tile like it (in what `tile`
+    /// paints: the tile, or what stands on it), joined to it across
     /// sides.
-    fn flood(&mut self, start: [i32; 2], tile: Tile) {
-        let layer = &self.layers[self.layer];
-        let like = layer[self.index(start)];
+    fn flood(&mut self, start: [i32; 2], tile: Paint) {
+        let like = self.painted(start, tile);
         if like == tile {
             return;
         }
         let mut stack = vec![start];
-        let mut seen = vec![false; layer.len()];
+        let mut seen = vec![false; self.cols * self.rows];
         let mut region = Vec::new();
         while let Some(t) = stack.pop() {
-            if !self.in_bounds(t) || seen[self.index(t)] || layer[self.index(t)] != like {
+            if !self.in_bounds(t) || seen[self.index(t)] || self.painted(t, tile) != like {
                 continue;
             }
             seen[self.index(t)] = true;
@@ -511,6 +601,11 @@ impl Editor {
     /// tile's part goes to the secondary brush.
     fn pick(&mut self, t: [i32; 2], swap: bool) {
         let index = |b: Brush| self.palette.iter().position(|p| *p == b).unwrap();
+        // What stands on it first, if anything does.
+        if let Some(p) = self.props[self.layer][self.index(t)] {
+            self.set_brush(index(Brush::Prop(p)), swap);
+            return;
+        }
         match self.layers[self.layer][self.index(t)] {
             Tile::Whole(p) => {
                 let i = index(Brush::Part(p));
@@ -545,7 +640,7 @@ impl Editor {
             return;
         };
         let swap = button == 2;
-        let tile = self.brush_tile(swap);
+        let tile = self.brush_paint(swap);
         match self.tool {
             Tool::Pick => self.pick(t, swap),
             Tool::Spawn => {
@@ -554,7 +649,15 @@ impl Editor {
                 let zoom = self.tileset.zoom();
                 let pos = self.camera.to_world(p).map(|v| (v * zoom).round() / zoom);
                 let tiles = &self.layers[self.layer];
-                if can_stand(tiles, self.cols, self.rows, pos, PLAYER_SIZE) {
+                let props = &self.props[self.layer];
+                let blocked = path::tiles_under(pos, PLAYER_SIZE)
+                    .into_iter()
+                    .any(|[x, y]| {
+                        let i = y as usize * self.cols + x as usize;
+                        let p = props.get(i).copied().flatten();
+                        p.is_some_and(|p| self.tileset.props[p as usize].blocks)
+                    });
+                if !blocked && can_stand(tiles, self.cols, self.rows, pos, PLAYER_SIZE) {
                     self.checkpoint();
                     self.spawn = Spawn {
                         layer: self.layer,
@@ -601,7 +704,7 @@ impl Editor {
         };
         let (last, swap) = (stroke.last, stroke.swap);
         if self.tool == Tool::Pencil {
-            let tile = self.brush_tile(swap);
+            let tile = self.brush_paint(swap);
             self.paint_line(last, t, tile);
         }
         if let Some(stroke) = &mut self.stroke {
@@ -631,7 +734,7 @@ impl Editor {
         };
         if self.tool == Tool::Rect {
             self.checkpoint();
-            let tile = self.brush_tile(stroke.swap);
+            let tile = self.brush_paint(stroke.swap);
             self.fill_rect(stroke.start, stroke.last, tile);
         }
         self.drop_unchanged_checkpoint();
@@ -712,6 +815,7 @@ impl Editor {
                 LayerFrame {
                     index: k,
                     meshes: meshes.clone(),
+                    props_seen: Canvas::new(&self.tileset),
                     remembered: visible.clone(),
                     visible,
                     unknown: Canvas::new(&self.tileset),
@@ -929,7 +1033,48 @@ mod tests {
         let names: Vec<String> = e.swatches().into_iter().map(|s| s.name).collect();
         assert!(names.contains(&"grate floor".to_string()));
         assert!(names.contains(&"water".to_string()));
-        assert_eq!(e.swatches().len(), 4 + 3 + 1 + 1 + 2);
+        // Floors, walls, void, water, stairs, props and none.
+        assert_eq!(e.swatches().len(), 4 + 3 + 1 + 1 + 2 + 2 + 1);
+    }
+
+    #[test]
+    fn props_are_painted_picked_undone_and_saved() {
+        let mut e = editor();
+        let tree = tileset().prop("tree").unwrap();
+        e.set_brush(brush(Brush::Prop(tree)), false);
+        e.set_tool(Tool::Rect);
+        let (a, b) = (at(&e, [1, 1]), at(&e, [3, 2]));
+        e.mouse_down(a, 0);
+        e.pointer(b);
+        e.mouse_up(b, 0);
+        let on = |e: &Editor, t: [i32; 2]| e.props[e.state().layer][e.index(t)];
+        assert_eq!(on(&e, [2, 2]), Some(tree));
+        assert_eq!(on(&e, [4, 2]), None);
+        // The tiles under them stay as they were.
+        assert_eq!(e.layers[1][e.index([2, 2])], Tile::FLOOR);
+        // Picked from where one stands; erased with none.
+        e.set_brush(brush(Brush::NoProp), false);
+        e.set_tool(Tool::Pick);
+        click(&mut e, [1, 1], 0);
+        assert_eq!(e.state().primary, brush(Brush::Prop(tree)));
+        e.set_brush(brush(Brush::NoProp), false);
+        e.set_tool(Tool::Pencil);
+        click(&mut e, [1, 1], 0);
+        assert_eq!(on(&e, [1, 1]), None);
+        e.undo();
+        assert_eq!(on(&e, [1, 1]), Some(tree));
+        // Saved and loaded: there, and drawn.
+        let file = LevelFile::from_json(&e.to_file().to_json()).unwrap();
+        assert_eq!(file.props[1].len(), 6);
+        let loaded = Editor::from_file(&file, VIEW);
+        assert_eq!(loaded.props, e.props);
+        e.update(0.0);
+        let pieces = &e.level.meshes(1).pieces;
+        assert!(pieces.iter().any(|p| !p.props.vertices.is_empty()));
+        // The spawn can't be put where a prop's in the way.
+        e.set_tool(Tool::Spawn);
+        click(&mut e, [2, 2], 0);
+        assert_ne!(e.spawn, Spawn::at_tile(1, [2, 2]));
     }
 
     #[test]

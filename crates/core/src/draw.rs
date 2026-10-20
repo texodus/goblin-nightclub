@@ -26,6 +26,11 @@ pub struct Vertex {
     /// For a fringe, how far it may reach past the edge, in world units;
     /// 0 for anything else.
     pub reach: f32,
+    /// How far up it is from its layer toward the one above, in layers: so
+    /// drawn that much larger, as layers are drawn smaller the deeper they
+    /// are (parallax). 0 for the ground; a prop's art may be a little
+    /// higher (see [`crate::tileset::PropKind::height`]).
+    pub z: f32,
 }
 
 /// Triangles drawn in order, later ones on top.

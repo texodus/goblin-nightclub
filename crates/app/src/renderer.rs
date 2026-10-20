@@ -74,7 +74,9 @@ struct Transform {
     scale: f32,
     zoom: f32,
     cell: f32,
-    _pad: f32,
+    /// How much smaller each layer is drawn than the one above it: so how
+    /// much larger anything up from its layer (see `Vertex::z`) is.
+    parallax: f32,
     /// Where world point (0, 0) is in the whole level.
     offset: [f32; 2],
 }
@@ -518,7 +520,10 @@ pub struct Renderer {
     queue: wgpu::Queue,
     shape_pipeline: wgpu::RenderPipeline,
     mask_pipeline: wgpu::RenderPipeline,
+    /// The same, but only where a sprite is opaque: the props seen.
+    mask_cutout_pipeline: wgpu::RenderPipeline,
     seen_pipeline: wgpu::RenderPipeline,
+    seen_cutout_pipeline: wgpu::RenderPipeline,
     seen_shaft_pipeline: wgpu::RenderPipeline,
     fill_pipeline: wgpu::RenderPipeline,
     water_pipeline: wgpu::RenderPipeline,
@@ -686,6 +691,7 @@ impl Renderer {
                 3 => Float32x4,
                 4 => Float32x4,
                 5 => Float32,
+                7 => Float32,
             ],
         };
         // And where each draw moves them to (see `Renderer::shifts`).
@@ -734,7 +740,21 @@ impl Renderer {
             1,
         );
         let mask_pipeline = triangles("mask", plain, "fs_mask", MASK_FORMAT.into(), MASK_SAMPLES);
+        let mask_cutout_pipeline = triangles(
+            "mask cutout",
+            plain,
+            "fs_mask_cutout",
+            MASK_FORMAT.into(),
+            MASK_SAMPLES,
+        );
         let seen_pipeline = triangles("seen", plain, "fs_mask", MASK_FORMAT.into(), 1);
+        let seen_cutout_pipeline = triangles(
+            "seen cutout",
+            plain,
+            "fs_mask_cutout",
+            MASK_FORMAT.into(),
+            1,
+        );
         let seen_shaft_pipeline = triangles(
             "seen in shaft",
             &shaft_pipeline_layout,
@@ -824,7 +844,9 @@ impl Renderer {
             queue,
             shape_pipeline,
             mask_pipeline,
+            mask_cutout_pipeline,
             seen_pipeline,
+            seen_cutout_pipeline,
             seen_shaft_pipeline,
             fill_pipeline,
             water_pipeline,
@@ -1206,6 +1228,7 @@ impl Renderer {
         struct Ranges {
             canvases: [Range<u32>; 3],
             visible: Range<u32>,
+            props_seen: Range<u32>,
             standing: Range<u32>,
         }
         let ranges: Vec<Ranges> = layers
@@ -1230,10 +1253,12 @@ impl Renderer {
                     });
                 mask_vertices.extend(fan);
                 let visible = start..mask_vertices.len() as u32;
+                let props_seen = push(&mut mask_vertices, &l.props_seen.vertices);
                 let standing = push(&mut mask_vertices, &l.standing.vertices);
                 Ranges {
                     canvases,
                     visible,
+                    props_seen,
                     standing,
                 }
             })
@@ -1366,7 +1391,7 @@ impl Renderer {
                 scale: frame.scale(l.index),
                 zoom,
                 cell,
-                _pad: 0.0,
+                parallax: frame.parallax(),
                 offset,
             };
             let buffer = &self.layer_transforms[slot(l.index)].buffer;
@@ -1379,7 +1404,7 @@ impl Renderer {
             scale: 1.0,
             zoom,
             cell,
-            _pad: 0.0,
+            parallax: 1.0,
             offset,
         };
         let pages_drawn = draws.iter().map(Vec::len).sum();
@@ -1527,6 +1552,8 @@ impl Renderer {
             ]
             .concat();
             tiles.extend(edging.iter().cloned());
+            // Props over all of it, and whoever's about too.
+            let props = pieces(l, first, |p| &p.props, view);
             for (i, range) in r.canvases.iter().enumerate() {
                 let attachment = wgpu::RenderPassColorAttachment {
                     view: &screen_textures.canvases.layers[3 * s + i],
@@ -1537,10 +1564,16 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 };
-                // The tiles under the visible and remembered canvases.
-                let under = if i < 2 { tiles.as_slice() } else { &[] };
+                // The tiles under the visible and remembered canvases, and
+                // the props over them.
+                let (under, over) = if i < 2 {
+                    (tiles.as_slice(), props.as_slice())
+                } else {
+                    (&[][..], &[][..])
+                };
                 let mut draws = under.to_vec();
                 draws.push((canvas, range.clone(), 0));
+                draws.extend(over.iter().cloned());
                 pass(
                     &mut encoder,
                     attachment,
@@ -1568,14 +1601,15 @@ impl Renderer {
                 None,
                 &pieces(l, first, |p| &p.liquid, view),
             );
-            // Fringes and trims cover the void and water they reach over.
+            // Fringes, trims and props cover the void and water they reach
+            // over.
             pass(
                 &mut encoder,
                 keep(voids),
                 &self.unmask_pipeline,
                 transform,
                 None,
-                &edging,
+                &[edging, props].concat(),
             );
             // Then clear it again under whatever stands on the layer.
             pass(
@@ -1586,15 +1620,27 @@ impl Renderer {
                 None,
                 &[(masks, r.standing.clone(), 0)],
             );
+            // What's visible now: the polygon (and lit solid), and the props
+            // seen where their art is opaque.
             let now = screen_textures.now_msaa[s].attachment(&screen_textures.now.layers[s], true);
-            pass(
-                &mut encoder,
-                now,
-                &self.mask_pipeline,
-                transform,
-                None,
-                &[(masks, r.visible.clone(), 0)],
-            );
+            {
+                let mut now = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("now"),
+                    color_attachments: &[Some(now)],
+                    ..Default::default()
+                });
+                now.set_bind_group(0, transform, &[]);
+                now.set_vertex_buffer(0, masks.slice(..));
+                now.set_vertex_buffer(1, shift_buffer.slice(..));
+                let draws = [
+                    (&self.mask_pipeline, r.visible.clone()),
+                    (&self.mask_cutout_pipeline, r.props_seen.clone()),
+                ];
+                for (pipeline, range) in draws.into_iter().filter(|(_, r)| !r.is_empty()) {
+                    now.set_pipeline(pipeline);
+                    now.draw(range, 0..1);
+                }
+            }
             // What's visible, into each page of `seen` it covers.
             for d in page_draws {
                 let onto = &page_transforms.next().unwrap().bind_group;
@@ -1616,14 +1662,26 @@ impl Renderer {
                         let pipeline = &self.seen_shaft_pipeline;
                         pass(&mut encoder, page, pipeline, onto, group, &visible);
                     }
-                    None => pass(
-                        &mut encoder,
-                        page,
-                        &self.seen_pipeline,
-                        onto,
-                        None,
-                        &visible,
-                    ),
+                    None => {
+                        pass(
+                            &mut encoder,
+                            page,
+                            &self.seen_pipeline,
+                            onto,
+                            None,
+                            &visible,
+                        );
+                        if !r.props_seen.is_empty() {
+                            pass(
+                                &mut encoder,
+                                keep(&seen.atlas.layers[d.slot as usize]),
+                                &self.seen_cutout_pipeline,
+                                onto,
+                                None,
+                                &[(masks, r.props_seen.clone(), 0)],
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -33,7 +33,9 @@ use crate::fringe;
 use crate::layer::{Layer, Piece, QUARTERS, Solid, TILE, Tile};
 use crate::mesh::Mesh;
 use crate::path;
+use crate::prop::draw_prop;
 use crate::tileset::Tileset;
+use crate::vision::Circle;
 use crate::world::{PieceOf, Pieces};
 
 /// Layers a level may have: a bound on what a file may ask for.
@@ -45,17 +47,32 @@ pub const MAX_LAYERS: usize = 1024;
 pub const MAX_VISIBLE: usize = 8;
 
 /// What blocks movement in `tile`: wall and void (liquid included); a part
-/// of a tile no shape can be rounds up to the whole tile.
-pub fn movement_solid(tile: Tile) -> Solid {
+/// of a tile no shape can be rounds up to the whole tile. All of it, if
+/// a prop in the way stands on it (`blocked`).
+pub fn movement_solid(tile: Tile, blocked: bool) -> Solid {
+    if blocked {
+        return Solid::Full;
+    }
     Solid::from_quarters(tile.wall().quarters() | tile.void_quarters(), true)
 }
 
-/// Where `layer` blocks movement (see [`movement_solid`]), as a layer of
-/// its own.
-pub fn movement_layer(layer: &Layer) -> Layer {
+/// Is a prop in the way of walking on `layer`'s tile `(x, y)`, its kinds
+/// `tileset`'s?
+pub fn prop_blocks(layer: &Layer, tileset: &Tileset, x: i32, y: i32) -> bool {
+    layer
+        .prop(x, y)
+        .is_some_and(|k| tileset.props[k as usize].blocks)
+}
+
+/// Where `layer` blocks movement (see [`movement_solid`]), its props'
+/// kinds `tileset`'s, as a layer of its own.
+pub fn movement_layer(layer: &Layer, tileset: &Tileset) -> Layer {
     let (cols, rows) = (layer.cols, layer.rows);
     let solids = (0..cols * rows)
-        .map(|t| movement_solid(layer.tile((t % cols) as i32, (t / cols) as i32)))
+        .map(|t| {
+            let (x, y) = ((t % cols) as i32, (t / cols) as i32);
+            movement_solid(layer.tile(x, y), prop_blocks(layer, tileset, x, y))
+        })
         .collect();
     Layer::from_solids(cols, rows, solids)
 }
@@ -74,7 +91,7 @@ pub fn can_stand(
     path::tiles_under(center, size).into_iter().all(|t| {
         let inside = t[0] >= 0 && t[1] >= 0 && (t[0] as usize) < cols && (t[1] as usize) < rows;
         let solid = if inside {
-            movement_solid(tiles[t[1] as usize * cols + t[0] as usize])
+            movement_solid(tiles[t[1] as usize * cols + t[0] as usize], false)
         } else {
             Solid::Full
         };
@@ -96,6 +113,8 @@ pub struct Level {
     /// Per layer, the most of `open_above` anywhere on it: how many layers
     /// up it shows through to, at most.
     deepest: Vec<u8>,
+    /// Per layer, made when first asked for; see [`Level::circles`].
+    circles: Vec<OnceLock<Vec<Circle>>>,
     /// Per layer, made when first asked for; see [`Level::meshes`].
     meshes: Vec<OnceLock<Arc<LayerMeshes>>>,
     /// By `(top, k)`, made when first asked for and dropped once the viewer
@@ -196,6 +215,9 @@ pub struct MeshPiece {
     pub voids: Mesh,
     /// Where it's liquid.
     pub liquid: Mesh,
+    /// Its props' art (see [`crate::prop`]), drawn over everything else
+    /// on the layer, characters too, and reaching over the tiles around.
+    pub props: Mesh,
 }
 
 impl MeshPiece {
@@ -224,17 +246,26 @@ impl MeshPiece {
             liquid: Mesh::quarters(size[0], size[1], canvas(), |x, y| {
                 tile(x, y).liquid_quarters()
             }),
+            props: Mesh::build(size[0], size[1], canvas(), |xs, ys, canvas| {
+                for y in ys {
+                    for x in xs.clone() {
+                        draw_prop(chunk, tileset, canvas, x, y);
+                    }
+                }
+            })
+            .reaching(tileset.prop_reach()),
         }
     }
 
     /// All of its meshes.
-    pub fn all(&self) -> [&Mesh; 5] {
+    pub fn all(&self) -> [&Mesh; 6] {
         [
             &self.tiles,
             &self.fringes,
             &self.trims,
             &self.voids,
             &self.liquid,
+            &self.props,
         ]
     }
 }
@@ -255,7 +286,7 @@ impl Level {
             cols * rows <= MAX_TILES,
             "at most {MAX_TILES} tiles a layer"
         );
-        let movement = layers.iter().map(movement_layer).collect();
+        let movement = layers.iter().map(|l| movement_layer(l, &tileset)).collect();
         Self::from_parts(layers, movement, tileset)
     }
 
@@ -294,6 +325,7 @@ impl Level {
             open_above,
             deepest,
             meshes: (0..depth).map(|_| OnceLock::new()).collect(),
+            circles: (0..depth).map(|_| OnceLock::new()).collect(),
             views: Default::default(),
             shafts: Default::default(),
             shaft_meshes: Default::default(),
@@ -477,6 +509,25 @@ impl Level {
         })
     }
 
+    /// The circles sight can't pass on layer `k`: its props' (those that
+    /// hide anything; see [`crate::tileset::PropKind::sight`]).
+    pub fn circles(&self, k: usize) -> &[Circle] {
+        self.circles[k].get_or_init(|| {
+            let zoom = self.tileset.zoom();
+            self.layers[k]
+                .props()
+                .filter_map(|p| {
+                    let kind = &self.tileset.props[p.kind as usize];
+                    let [x, y] = p.at.map(|t| t as f32);
+                    (kind.sight > 0.0).then_some(Circle {
+                        center: [(x + 0.5) * TILE, (y + 0.5) * TILE],
+                        radius: kind.sight / zoom,
+                    })
+                })
+                .collect()
+        })
+    }
+
     /// Where layer `k` shows through to layer `top` (see
     /// [`Level::shaft`]), as a mesh of whole tiles.
     pub fn shaft_mesh(&self, top: usize, k: usize) -> Arc<Mesh> {
@@ -511,6 +562,7 @@ impl Level {
 mod tests {
     use super::*;
     use crate::layer::Corner;
+    use crate::prop::Prop;
 
     fn level(layers: &[&[&str]]) -> Level {
         Level::new(
@@ -709,6 +761,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn props_in_the_way_are_solid_to_walking() {
+        let t = crate::tileset::testing::tileset();
+        let mut t2 = t.clone();
+        t2.props[1].blocks = false;
+        let tree = t.prop("tree").unwrap();
+        let rock = t.prop("rock").unwrap();
+        let props = [
+            Prop {
+                at: [1, 1],
+                kind: tree,
+            },
+            Prop {
+                at: [2, 1],
+                kind: rock,
+            },
+        ];
+        let layer = || Layer::from_ascii(&["....", "....", "...."]).with_props(&props);
+        let l = Level::new(vec![layer()], t);
+        assert_eq!(l.movement(0).solid(1, 1), Solid::Full);
+        assert_eq!(l.movement(0).solid(2, 1), Solid::Full);
+        assert_eq!(l.movement(0).solid(3, 1), Solid::None);
+        // Not to the layer's own shape: they're no walls.
+        assert_eq!(l.layer(0).solid(1, 1), Solid::None);
+        // A prop that's not in the way isn't.
+        let l = Level::new(vec![layer()], t2);
+        assert_eq!(l.movement(0).solid(1, 1), Solid::Full);
+        assert_eq!(l.movement(0).solid(2, 1), Solid::None);
     }
 
     #[test]

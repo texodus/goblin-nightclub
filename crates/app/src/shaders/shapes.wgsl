@@ -20,7 +20,9 @@ struct Globals {
     zoom: f32,
     // Edge of a cell of the sheet, in pixels.
     cell: f32,
-    _pad: f32,
+    // How much smaller each layer is drawn than the one above it: so how
+    // much larger anything up from its layer is (see `z` in `vs_main`).
+    parallax: f32,
     // Where world point (0, 0) is in the whole level (for a level drawn a
     // window at a time), so patterns pinned to the world stay put.
     offset: vec2<f32>,
@@ -57,11 +59,15 @@ fn vs_main(
     // Where the draw moves its vertices to: a chunk's piece of a layer
     // from its chunk's corner to where that is (see `Renderer::shifts`).
     @location(6) shift: vec2<f32>,
+    // How far up from its layer it is, in layers (a prop's art): drawn
+    // that much larger, as layers further down are drawn smaller.
+    @location(7) z: f32,
 ) -> VsOut {
     let at = world + shift;
+    let scale = globals.scale * pow(1.0 / globals.parallax, z);
     // World -> target pixels (camera and zoom, then scale about the
     // center) -> clip space (origin top-left, y down).
-    let px = globals.center + ((at - globals.camera) * globals.zoom - globals.center) * globals.scale;
+    let px = globals.center + ((at - globals.camera) * globals.zoom - globals.center) * scale;
     let ndc = vec2(px.x / globals.screen.x * 2.0 - 1.0, 1.0 - px.y / globals.screen.y * 2.0);
     var out: VsOut;
     out.clip = vec4(ndc, 0.0, 1.0);
@@ -211,6 +217,16 @@ fn fs_unmask(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     return vec4(0.0);
+}
+
+// Like `fs_mask`, but only where a sprite is opaque: the props seen, shown
+// whole where their art is, not just as far as the polygon reaches.
+@fragment
+fn fs_mask_cutout(in: VsOut) -> @location(0) vec4<f32> {
+    if texel(in.uv).a < 0.5 {
+        discard;
+    }
+    return vec4(1.0);
 }
 
 // Like `fs_mask`, but only where `shaft` is set: a layer below the viewer's

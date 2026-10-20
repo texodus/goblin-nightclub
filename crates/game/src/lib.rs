@@ -18,6 +18,7 @@ use goblin_nightclub_core::memory::Memory;
 use goblin_nightclub_core::mesh::Mesh;
 use goblin_nightclub_core::palette;
 use goblin_nightclub_core::path;
+use goblin_nightclub_core::prop::draw_prop;
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::tileset::{Cell, Tileset};
 use goblin_nightclub_core::vision::Vision;
@@ -863,7 +864,15 @@ impl Game {
                 let underground = self.outdoors() && k < self.local_ground();
                 self.visions[k].set_radius(view_radius(base, self.top - k, underground));
                 let own = self.level.layer(k);
-                self.visions[k].update_through(&view, own, shaft.as_deref(), above, origin);
+                // Props block sight on the viewer's own layer; below, seen
+                // from above, they don't.
+                let circles = if k == self.top {
+                    self.level.circles(k)
+                } else {
+                    &[]
+                };
+                let vision = &mut self.visions[k];
+                vision.update_through(&view, own, shaft.as_deref(), above, origin, circles);
             }
             let here = self.npcs.iter().filter(|n| n.layer == k);
             self.memories[k].update(&view, &self.visions[k], here, self.time);
@@ -953,9 +962,16 @@ impl Game {
                     standing.sprite(at, cell, palette::WHITE);
                 }
 
+                // The props seen, whole where their art is.
+                let mut props_seen = Canvas::new(tileset);
+                for &[x, y] in vision.props_seen() {
+                    draw_prop(layer, tileset, &mut props_seen, x as usize, y as usize);
+                }
+
                 LayerFrame {
                     index: k,
                     meshes: meshes.clone(),
+                    props_seen,
                     visible,
                     remembered,
                     unknown: Canvas::new(tileset),
@@ -1099,6 +1115,7 @@ mod tests {
     use goblin_nightclub_core::layer::Layer;
     use goblin_nightclub_core::layer::Tile;
     use goblin_nightclub_core::level_file::Spawn;
+    use goblin_nightclub_core::prop::Prop;
     use std::sync::Arc;
 
     const VIEW: [f32; 2] = [320.0, 200.0];
@@ -1500,6 +1517,36 @@ mod tests {
         assert_eq!(game.layer(), 0);
         click_and_run(&mut game, [4, 1], 600);
         assert_eq!(game.layer(), 1);
+    }
+
+    #[test]
+    fn props_hide_whats_behind_them_and_are_walked_around() {
+        let rows = ["..........", "..........", ".........."];
+        let rock = tileset().prop("rock").unwrap();
+        let with_rock = |rock: Option<u8>| {
+            let props: Vec<Prop> = rock
+                .map(|kind| Prop { at: [4, 1], kind })
+                .into_iter()
+                .collect();
+            Level::new(vec![Layer::from_ascii(&rows).with_props(&props)], tileset())
+        };
+        // An NPC straight past the rock from the player: hidden by it.
+        for (rock, seen) in [(Some(rock), false), (None, true)] {
+            let mut game = game(with_rock(rock), [1, 1]);
+            game.npcs.push(Entity::npc(7, [72.0, 12.0]));
+            game.observed = None;
+            game.observe();
+            assert_eq!(game.memories[0].is_visible(7), seen, "rock {rock:?}");
+            // The rock, seen, shown whole: its art, a quad.
+            let shown = game.frame().layers[0].props_seen.vertices.len();
+            assert_eq!(shown, if rock.is_some() { 6 } else { 0 });
+        }
+        // Walking through where it stands: around it.
+        let mut game = game(with_rock(Some(rock)), [1, 1]);
+        click_and_run(&mut game, [7, 1], 600);
+        assert_eq!(player_tile(&game), [7, 1]);
+        let route_ok = game.level.movement(0).solid(4, 1) == Solid::Full;
+        assert!(route_ok, "solid to walking");
     }
 
     #[test]

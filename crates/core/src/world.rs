@@ -189,7 +189,8 @@ impl FileSource {
             tileset: file.tileset.clone(),
             layers: tiles
                 .iter()
-                .map(|t| Chunks::from_tiles(cols, rows, t))
+                .zip(&file.props)
+                .map(|(t, props)| Chunks::from_tiles(cols, rows, t).with_props(props))
                 .collect(),
             roofs: roofs(cols, rows, &tiles),
         }
@@ -416,8 +417,13 @@ impl Build {
             let (mut tiles, mut movement) = (Vec::new(), Vec::new());
             for (i, (key, chunk)) in keys.into_iter().zip(chunks).enumerate() {
                 let [w, h] = w.chunk_size(i % w.chunks[0], i / w.chunks[0]);
+                let props = &self.source.tileset().props;
                 movement.push(kept.get(PieceOf::Movement, key, || {
-                    let at = |t: usize| movement_solid(chunk.get(t % w, t / w));
+                    let at = |t: usize| {
+                        let (x, y) = (t % w, t / w);
+                        let blocked = chunk.prop(x, y).is_some_and(|k| props[k as usize].blocks);
+                        movement_solid(chunk.get(x, y), blocked)
+                    };
                     Piece::from_solids([w, h], (0..w * h).map(at).collect())
                 }));
                 tiles.push(kept.get(PieceOf::Tiles, key, || Piece::new(chunk, [w, h])));
@@ -474,6 +480,7 @@ mod tests {
     use crate::level::MeshPiece;
     use crate::level_file::Spawn;
     use crate::mesh::Mesh;
+    use crate::prop::{Prop, draw_prop};
     use crate::rng::Rng;
 
     /// Triangles of `vertices` moved `by` (as the renderer moves them),
@@ -489,7 +496,7 @@ mod tests {
                 [0.0; 4]
             };
             let at = [v.pos[0] + by[0], v.pos[1] + by[1]];
-            [&at[..], &v.uv, &v.cell, &v.color, &edge, &[v.reach]]
+            [&at[..], &v.uv, &v.cell, &v.color, &edge, &[v.reach, v.z]]
                 .concat()
                 .into_iter()
                 .map(r)
@@ -532,6 +539,24 @@ mod tests {
             crate::tileset::testing::tileset(),
             "player",
             "npc",
+        )
+        // And props here and there (not where the player starts).
+        .with_props(
+            (0..depth)
+                .map(|_| {
+                    let mut props = Vec::new();
+                    for t in 1..cols * rows {
+                        if rng.unit() < 0.05 {
+                            let kind = rng.range(0, 1) as u8;
+                            props.push(Prop {
+                                at: [t % cols, t / cols],
+                                kind,
+                            });
+                        }
+                    }
+                    props
+                })
+                .collect(),
         )
     }
 
@@ -696,11 +721,29 @@ mod tests {
                         let [x, y] = [(t % b.cols) as i32 + x0, (t / b.cols) as i32 + y0];
                         whole.layer(b.base + k).tile(x, y)
                     };
+                    // Its props, those in the window, where they are in it.
+                    let props: Vec<Prop> = whole
+                        .layer(b.base + k)
+                        .props()
+                        .filter_map(|p| {
+                            let [x, y] = [p.at[0] as i32 - x0, p.at[1] as i32 - y0];
+                            let inside =
+                                (0..b.cols as i32).contains(&x) && (0..b.rows as i32).contains(&y);
+                            inside.then_some(Prop {
+                                at: [x as usize, y as usize],
+                                kind: p.kind,
+                            })
+                        })
+                        .collect();
                     Layer::from_tiles(b.cols, b.rows, (0..b.cols * b.rows).map(tile).collect())
                         .at([x0, y0])
+                        .with_props(&props)
                 })
                 .collect();
-            let movement = layers.iter().map(movement_layer).collect();
+            let movement = layers
+                .iter()
+                .map(|l| movement_layer(l, &file.tileset))
+                .collect();
             let fresh = Level::from_parts(layers, movement, file.tileset.clone());
             let same = |a: &Layer, b: &Layer, what: &str| {
                 assert_eq!(a.corners(), b.corners(), "{what}");
@@ -774,6 +817,7 @@ mod tests {
                         quarters(|t| t.liquid_quarters()),
                         "liquid",
                     ),
+                    (pieces(|p| &p.props, None), whole(draw_prop), "props"),
                 ];
                 for (drawn, mut expected, what) in pairs {
                     expected.sort();

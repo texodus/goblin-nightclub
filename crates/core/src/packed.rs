@@ -17,8 +17,12 @@
 //! - the bytes: each chunk and roof, deflated. A chunk is its palette's
 //!   length (u16), its palette (6 bytes a tile: see [`encode_tile`]), and
 //!   each tile's index into it, row by row: none if it holds one tile, a
-//!   byte each while it holds up to 256, else two. A roof is each tile's
+//!   byte each while it holds up to 256, else two; then (from version 2)
+//!   how many props stand on it (u16) and each one's tile, its index row
+//!   by row (u16), and kind (u8), in order of tile. A roof is each tile's
 //!   per quarter (u16), row by row.
+//!
+//! Version 1, without props, is read too: as if none stood anywhere.
 
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
@@ -32,11 +36,12 @@ use crate::chunk::{CHUNK, Chunk, ChunkKey, Chunks};
 use crate::layer::{Corner, Dir, Part, Tile};
 use crate::level::MAX_TILES;
 use crate::level_file::{LevelFile, LevelMeta};
+use crate::prop::Prop;
 use crate::tileset::Tileset;
 use crate::world::{ChunkSource, FileSource, Roof, roofs};
 
 const MAGIC: &[u8; 4] = b"GNPK";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Bytes of an index entry: a chunk's, a roof's.
 const CHUNK_ENTRY: usize = 24;
 const ROOF_ENTRY: usize = 20;
@@ -271,26 +276,58 @@ fn encode_chunk(chunk: &Chunk) -> Vec<u8> {
         ..=256 => raw.extend(chunk.indices().map(|i| i as u8)),
         _ => raw.extend(chunk.indices().flat_map(u16::to_le_bytes)),
     }
+    let props = chunk.props();
+    raw.extend((props.len() as u16).to_le_bytes());
+    for &(t, kind) in props {
+        raw.extend(t.to_le_bytes());
+        raw.push(kind);
+    }
     compress_to_vec(&raw, 6)
 }
 
-fn decode_chunk(bytes: &[u8], tileset: &Tileset) -> Option<Chunk> {
-    let raw = decompress_to_vec_with_limit(bytes, 2 + 6 * 1024 + 2 * CHUNK * CHUNK).ok()?;
+/// A chunk from its bytes, as packed in format `version`.
+fn decode_chunk(bytes: &[u8], tileset: &Tileset, version: u32) -> Option<Chunk> {
+    const CELLS: usize = CHUNK * CHUNK;
+    let most = 2 + 6 * 1024 + 2 * CELLS + 2 + 3 * CELLS;
+    let raw = decompress_to_vec_with_limit(bytes, most).ok()?;
     let n = u16::from_le_bytes(raw.get(0..2)?.try_into().ok()?) as usize;
     let (palette, rest) = raw.get(2..)?.split_at_checked(6 * n)?;
     let palette: Option<Vec<Tile>> = palette
         .chunks_exact(6)
         .map(|b| decode_tile(b.try_into().unwrap(), tileset))
         .collect();
-    let indices: Vec<u16> = match n {
-        1 => vec![0; CHUNK * CHUNK],
-        ..=256 => rest.iter().map(|&i| i as u16).collect(),
-        _ => rest
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect(),
+    let (indices, rest): (Vec<u16>, &[u8]) = match n {
+        1 => (vec![0; CELLS], rest),
+        ..=256 => {
+            let (indices, rest) = rest.split_at_checked(CELLS)?;
+            (indices.iter().map(|&i| i as u16).collect(), rest)
+        }
+        _ => {
+            let (indices, rest) = rest.split_at_checked(2 * CELLS)?;
+            let indices = indices.chunks_exact(2);
+            (
+                indices.map(|b| u16::from_le_bytes([b[0], b[1]])).collect(),
+                rest,
+            )
+        }
     };
-    Chunk::from_parts(palette?, &indices)
+    let chunk = Chunk::from_parts(palette?, &indices)?;
+    if version < 2 {
+        return rest.is_empty().then_some(chunk);
+    }
+    let count = u16::from_le_bytes(rest.get(0..2)?.try_into().ok()?) as usize;
+    let entries = rest.get(2..)?;
+    if entries.len() != 3 * count {
+        return None;
+    }
+    let props: Option<Vec<_>> = entries
+        .chunks_exact(3)
+        .map(|b| {
+            let (t, kind) = (u16::from_le_bytes([b[0], b[1]]), b[2]);
+            ((t as usize) < CELLS && (kind as usize) < tileset.props.len()).then_some((t, kind))
+        })
+        .collect();
+    Some(chunk.with_props(props?))
 }
 
 fn encode_roof(roof: &Roof) -> Vec<u8> {
@@ -320,18 +357,24 @@ pub fn to_level_file(meta: &LevelMeta, source: &dyn ChunkSource) -> Result<Level
         ));
     }
     let mut layers = Vec::with_capacity(meta.depth);
+    let mut props = Vec::with_capacity(meta.depth);
     for k in 0..meta.depth {
         let mut tiles = Vec::with_capacity(meta.cols * meta.rows);
+        let mut on = Vec::new();
         for y in 0..meta.rows {
             for x in 0..meta.cols {
                 let key = (k, (x / CHUNK) as i32, (y / CHUNK) as i32);
                 let chunk = source.chunk(key).ok_or("it isn't all loaded")?;
                 tiles.push(chunk.get(x % CHUNK, y % CHUNK));
+                if let Some(kind) = chunk.prop(x % CHUNK, y % CHUNK) {
+                    on.push(Prop { at: [x, y], kind });
+                }
             }
         }
         layers.push(tiles);
+        props.push(on);
     }
-    Ok(LevelFile::from_meta(meta.clone(), layers))
+    Ok(LevelFile::from_meta(meta.clone(), layers).with_props(props))
 }
 
 /// A level opened from files (see [`open_files`]).
@@ -407,6 +450,8 @@ impl Bytes for Arc<[u8]> {
 /// A packed level (or diff), read from `B` a piece at a time.
 pub struct Packed<B> {
     bytes: B,
+    /// Its format's version.
+    version: u32,
     header: Header,
     chunks: HashMap<ChunkKey, (u64, u32)>,
     roofs: HashMap<(i32, i32), (u64, u32)>,
@@ -446,9 +491,9 @@ impl<B: Bytes> Packed<B> {
             return Err("that isn't a packed level".into());
         }
         let version = u32::from_le_bytes(head[4..8].try_into().unwrap());
-        if version != VERSION {
+        if !(1..=VERSION).contains(&version) {
             return Err(format!(
-                "packed level version {version} isn't supported; this version reads {VERSION}"
+                "packed level version {version} isn't supported; this version reads up to {VERSION}"
             ));
         }
         let len = u32::from_le_bytes(head[8..12].try_into().unwrap()) as usize;
@@ -494,6 +539,7 @@ impl<B: Bytes> Packed<B> {
             .collect();
         Ok(Some(Self {
             bytes,
+            version,
             header,
             chunks,
             roofs,
@@ -544,10 +590,12 @@ impl<B: Bytes> ChunkSource for Packed<B> {
             return Some(chunk.clone());
         }
         let bytes = self.read(*self.chunks.get(&key)?)?;
-        let chunk = Arc::new(decode_chunk(&bytes, self.tileset()).unwrap_or_else(|| {
-            self.trouble(format!("chunk {key:?} won't read"));
-            Chunk::filled(Tile::WALL)
-        }));
+        let chunk = Arc::new(
+            decode_chunk(&bytes, self.tileset(), self.version).unwrap_or_else(|| {
+                self.trouble(format!("chunk {key:?} won't read"));
+                Chunk::filled(Tile::WALL)
+            }),
+        );
         let mut kept = self.kept.lock().unwrap();
         kept.chunks.insert(key, chunk.clone());
         kept.keep(Ok(key));
@@ -643,6 +691,7 @@ mod tests {
     use super::*;
     use crate::chunk::identical;
     use crate::level_file::Spawn;
+    use crate::prop::Prop;
     use crate::rng::Rng;
 
     /// A level of random tiles, every kind, `cols` x `rows` x `depth`.
@@ -755,14 +804,61 @@ mod tests {
     }
 
     #[test]
+    fn props_pack_and_older_packs_read_without() {
+        let file = file(8, 70, 40, 2);
+        let (tree, rock) = (
+            file.tileset.prop("tree").unwrap(),
+            file.tileset.prop("rock").unwrap(),
+        );
+        let props = vec![
+            vec![
+                Prop {
+                    at: [1, 2],
+                    kind: tree,
+                },
+                Prop {
+                    at: [69, 39],
+                    kind: rock,
+                },
+            ],
+            vec![Prop {
+                at: [33, 5],
+                kind: rock,
+            }],
+        ];
+        let file = file.with_props(props.clone());
+        let packed = Packed::open(Arc::<[u8]>::from(pack_file(&file)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(packed.to_level_file().unwrap().props, props);
+        assert_eq!(packed.chunk((1, 1, 0)).unwrap().prop(1, 5), Some(rock));
+        // Version 1's chunks end with their tiles: read, they've no props.
+        let chunk = Chunk::filled(Tile::FLOOR);
+        let mut v1 = 1u16.to_le_bytes().to_vec();
+        v1.extend(encode_tile(Tile::FLOOR));
+        let v1 = compress_to_vec(&v1, 6);
+        let read = decode_chunk(&v1, &file.tileset, 1).unwrap();
+        assert!(read.same(&chunk) && read.props().is_empty());
+        // Version 2's must say how many props they have; and no more.
+        assert!(decode_chunk(&v1, &file.tileset, 2).is_none());
+        let with = chunk.with_props(vec![(7, rock)]);
+        assert!(
+            decode_chunk(&encode_chunk(&with), &file.tileset, 2)
+                .unwrap()
+                .same(&with)
+        );
+        assert!(decode_chunk(&encode_chunk(&with), &file.tileset, 1).is_none());
+    }
+
+    #[test]
     fn bad_files_are_refused_and_bad_chunks_reported() {
         let file = file(3, 40, 40, 2);
         let bytes = pack_file(&file);
         let refused = |b: Vec<u8>| Packed::open(Arc::<[u8]>::from(b)).err().unwrap();
         assert!(refused(b"not a level at all".to_vec()).contains("isn't a packed level"));
         let mut newer = bytes.clone();
-        newer[4] = 2;
-        assert!(refused(newer).contains("version 2"));
+        newer[4] = 3;
+        assert!(refused(newer).contains("version 3"));
         assert!(refused(bytes[..40].to_vec()).contains("header"));
         // A chunk's bytes spoiled: a wall stands in, and it's reported.
         let packed = Packed::open(Arc::<[u8]>::from(bytes.clone()))

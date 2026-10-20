@@ -2,6 +2,22 @@
 //! plus point queries and tile exploration (for game logic). Both derive
 //! from [`Layer::los`]/[`Layer::raycast`], so what is drawn as visible and
 //! what the game treats as visible agree.
+//!
+//! Props can block sight too (see [`crate::prop`]), each as a small circle
+//! around its tile's center ([`Circle`]): the polygon follows the near side
+//! of each, with a ray to either side of it and a few across it, and its
+//! shadow behind. Circles are found by the angle they span from the
+//! viewer, so each ray tests only the few it might hit; so a forest costs
+//! about as much as its circles in view, a few rays each.
+//!
+//! A cheaper alternative, if circles in the polygon cost too much: leave
+//! props out of it, and have the renderer draw each one's shadow (a wedge
+//! from its circle's tangents outward) into the visible mask, an instanced
+//! draw per chunk of each chunk's circles, kept on the GPU. That's next to
+//! nothing per frame however many there are, and shadows could be partial
+//! (a tree dims what's behind it; several hide it). What's seen of NPCs
+//! and what's remembered would then need a matching test here: how much
+//! light gets through the circles along a line.
 
 use std::f32::consts::TAU;
 
@@ -30,6 +46,11 @@ struct Ray {
     angle: f32,
     /// Corners lying on this ray (several when collinear with the origin).
     corners: Vec<[f32; 2]>,
+    /// Where it grazes a circle's side: how far the circle is along it,
+    /// whether that's where the circle's shadow starts (the boundary comes
+    /// in from beyond it) or ends (and it goes back out), and the circle's
+    /// center.
+    tangent: Option<(f32, bool, [f32; 2])>,
 }
 
 impl Ray {
@@ -37,6 +58,7 @@ impl Ray {
         Self {
             angle: angle.rem_euclid(TAU),
             corners,
+            tangent: None,
         }
     }
 }
@@ -130,6 +152,129 @@ fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
     crate::length([b[0] - a[0], b[1] - a[1]])
 }
 
+/// A circle sight can't pass: a prop's (see [`crate::prop`]), around its
+/// tile's center.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Circle {
+    pub center: [f32; 2],
+    pub radius: f32,
+}
+
+/// Bins the circles in reach are sorted into, by the angles they span
+/// from the viewer.
+const CIRCLE_BINS: usize = 256;
+
+/// The circles in reach of the viewer, by the angles they span.
+#[derive(Default)]
+struct Circles {
+    origin: [f32; 2],
+    circles: Vec<Circle>,
+    /// Where each bin's indices into `circles` start in `items`, then the
+    /// end.
+    starts: Vec<u32>,
+    items: Vec<u32>,
+}
+
+impl Circles {
+    /// Those of `circles` within `radius` of `origin`, which mustn't be in
+    /// one.
+    fn gather(&mut self, origin: [f32; 2], radius: f32, circles: &[Circle]) {
+        self.origin = origin;
+        self.circles.clear();
+        self.circles.extend(circles.iter().filter(|c| {
+            let d = distance(origin, c.center);
+            d > c.radius && d - c.radius <= radius
+        }));
+        // Each one's bins, then sorted into them (counted, then placed).
+        let bins = |c: &Circle| {
+            let d = distance(origin, c.center);
+            // A hair wider, against rounding between this and a ray's angle.
+            let half = (c.radius / d).asin() + 1e-4;
+            let a = angle(origin, c.center);
+            let step = TAU / CIRCLE_BINS as f32;
+            let (lo, hi) = (
+                ((a - half) / step).floor() as i32,
+                ((a + half) / step).floor() as i32,
+            );
+            (lo..=hi).map(|b| b.rem_euclid(CIRCLE_BINS as i32) as usize)
+        };
+        let mut starts = vec![0u32; CIRCLE_BINS + 1];
+        for c in &self.circles {
+            for b in bins(c) {
+                starts[b + 1] += 1;
+            }
+        }
+        for b in 1..starts.len() {
+            starts[b] += starts[b - 1];
+        }
+        let mut next = starts.clone();
+        self.items = vec![0; *starts.last().unwrap() as usize];
+        for (i, c) in self.circles.iter().enumerate() {
+            for b in bins(c) {
+                self.items[next[b] as usize] = i as u32;
+                next[b] += 1;
+            }
+        }
+        self.starts = starts;
+    }
+
+    /// The circles a ray at `angle` might hit.
+    fn near(&self, angle: f32) -> impl Iterator<Item = &Circle> {
+        let b = ((angle.rem_euclid(TAU) / TAU * CIRCLE_BINS as f32) as usize).min(CIRCLE_BINS - 1);
+        let items = match self.starts.get(b + 1) {
+            Some(&end) => &self.items[self.starts[b] as usize..end as usize],
+            None => &[],
+        };
+        items.iter().map(|&i| &self.circles[i as usize])
+    }
+
+    /// How far a ray from the origin at `angle`, heading `dir` (a unit
+    /// vector), goes before a circle stops it: at most `max`.
+    fn cast(&self, angle: f32, dir: [f32; 2], max: f32) -> f32 {
+        self.near(angle)
+            .filter_map(|c| hit(self.origin, dir, c))
+            .fold(max, f32::min)
+    }
+
+    /// The same, but for the circle centered at `skip`.
+    fn cast_except(&self, angle: f32, dir: [f32; 2], max: f32, skip: [f32; 2]) -> f32 {
+        self.near(angle)
+            .filter(|c| c.center != skip)
+            .filter_map(|c| hit(self.origin, dir, c))
+            .fold(max, f32::min)
+    }
+
+    /// Does no circle stand between the origin and `p` (but any `p` is in:
+    /// a prop's own tile is seen at its center)?
+    fn clear(&self, p: [f32; 2]) -> bool {
+        let d = distance(self.origin, p);
+        if d == 0.0 || self.circles.is_empty() {
+            return true;
+        }
+        let dir = [(p[0] - self.origin[0]) / d, (p[1] - self.origin[1]) / d];
+        self.near(angle(self.origin, p))
+            .filter(|c| distance(p, c.center) > c.radius)
+            .all(|c| hit(self.origin, dir, c).is_none_or(|t| t >= d))
+    }
+}
+
+/// How far along a ray from `origin` (outside `c`) heading `dir` (a unit
+/// vector) it meets circle `c`, if it does.
+fn hit(origin: [f32; 2], dir: [f32; 2], c: &Circle) -> Option<f32> {
+    // How far along the ray its center is, and how far to one side: worked
+    // out directly (not as a difference of squares, which rounding swamps
+    // for a ray that grazes it), so which side of it a ray passes is
+    // decided as finely as rays are aimed.
+    let to = [c.center[0] - origin[0], c.center[1] - origin[1]];
+    let along = to[0] * dir[0] + to[1] * dir[1];
+    let aside = (to[0] * dir[1] - to[1] * dir[0]).abs();
+    if aside >= c.radius {
+        return None;
+    }
+    let t = along - (c.radius * c.radius - aside * aside).sqrt();
+    (t >= 0.0).then_some(t)
+}
+
 pub struct Vision {
     origin: [f32; 2],
     /// View distance in pixels; `f32::INFINITY` for unlimited.
@@ -149,6 +294,10 @@ pub struct Vision {
     /// Where this layer shows through to the viewer's (see
     /// [`crate::level::Level::shaft`]); everywhere when `None`.
     shaft: Option<Vec<bool>>,
+    /// The circles of props in the way, from the last update.
+    blocking: Circles,
+    /// The tiles of the props among them seen (see [`Vision::props_seen`]).
+    props_seen: Vec<[i32; 2]>,
 }
 
 impl Vision {
@@ -163,6 +312,8 @@ impl Vision {
             cols: level.cols,
             explored: vec![false; level.cols * level.rows],
             shaft: None,
+            blocking: Circles::default(),
+            props_seen: Vec::new(),
         }
     }
 
@@ -181,6 +332,13 @@ impl Vision {
 
     pub fn polygon(&self) -> &[[f32; 2]] {
         &self.polygon
+    }
+
+    /// The tiles of the props in the way of sight that are seen (any of
+    /// their circles): each shown whole, wherever its art is opaque, since
+    /// the polygon itself stops at the near side of its circle.
+    pub fn props_seen(&self) -> &[[i32; 2]] {
+        &self.props_seen
     }
 
     /// Solid within one tile of the visible stretches of wall, as convex
@@ -202,7 +360,7 @@ impl Vision {
 
     /// Recompute visibility from `origin` (a pixel-space point in open space).
     pub fn update(&mut self, level: &Layer, origin: [f32; 2]) {
-        self.update_through(level, level, None, None, origin);
+        self.update_through(level, level, None, None, origin, &[]);
     }
 
     /// Recompute visibility of a layer `own` seen from above: through the
@@ -215,6 +373,9 @@ impl Vision {
     /// walls of just the layers above `own`, which is then also `sight`)
     /// each wall tile whose top is in view lights up whole, instead of a
     /// band behind visible faces.
+    ///
+    /// Sight can't pass `circles` either (props in the way: see
+    /// [`Circle`]), and each seen lights up whole.
     pub fn update_through(
         &mut self,
         sight: &Layer,
@@ -222,8 +383,10 @@ impl Vision {
         shaft: Option<&[bool]>,
         above: Option<&Layer>,
         origin: [f32; 2],
+        circles: &[Circle],
     ) {
         self.origin = origin;
+        self.blocking.gather(origin, self.radius, circles);
         // Kept (it's read until the next update), but rarely changes.
         match (&mut self.shaft, shaft) {
             (Some(mine), Some(shaft)) if mine.as_slice() != shaft => mine.clone_from_slice(shaft),
@@ -235,7 +398,36 @@ impl Vision {
         if let Some(above) = above {
             self.find_wall_tops(own, above);
         }
+        self.light_circles(sight);
         self.mark_explored(sight, own);
+    }
+
+    /// Note each circle any of which is seen (its near side, just in
+    /// front of it), and explore its tile.
+    fn light_circles(&mut self, sight: &Layer) {
+        let origin = self.origin;
+        self.props_seen.clear();
+        for i in 0..self.blocking.circles.len() {
+            let c = self.blocking.circles[i];
+            let d = distance(origin, c.center);
+            let toward = [(origin[0] - c.center[0]) / d, (origin[1] - c.center[1]) / d];
+            let front = c.radius + 0.5;
+            let p = [
+                c.center[0] + toward[0] * front,
+                c.center[1] + toward[1] * front,
+            ];
+            if !self.can_see(sight, p) {
+                continue;
+            }
+            let tile = c.center.map(|v| (v / TILE).floor() as i32);
+            self.props_seen.push(tile);
+            if tile[0] >= 0 && tile[1] >= 0 && (tile[0] as usize) < self.cols {
+                let i = tile[1] as usize * self.cols + tile[0] as usize;
+                if let Some(e) = self.explored.get_mut(i) {
+                    *e = true;
+                }
+            }
+        }
     }
 
     /// Light each of `own`'s wall tiles whose top is in view: in the shaft,
@@ -351,7 +543,10 @@ impl Vision {
     pub fn can_see(&self, level: &Layer, p: [f32; 2]) -> bool {
         let d = [p[0] - self.origin[0], p[1] - self.origin[1]];
         let tile = [(p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32];
-        crate::length(d) <= self.radius && self.in_shaft(tile) && level.los(self.origin, p)
+        crate::length(d) <= self.radius
+            && self.in_shaft(tile)
+            && level.los(self.origin, p)
+            && self.blocking.clear(p)
     }
 
     /// Has any part of tile `(x, y)` ever been visible?
@@ -414,6 +609,23 @@ impl Vision {
                 Ray::new(a + eps, vec![]),
             ]);
         }
+        // Each circle: along its sides (where its shadow starts and ends),
+        // and across its near side, more the nearer (the wider) it is.
+        for c in &self.blocking.circles {
+            let (a, d) = (angle(origin, c.center), distance(origin, c.center));
+            let half = (c.radius / d).asin();
+            let near = (d * d - c.radius * c.radius).max(0.0).sqrt();
+            for (side, starts) in [(-half, true), (half, false)] {
+                let mut ray = Ray::new(a + side, vec![]);
+                ray.tangent = Some((near, starts, c.center));
+                rays.push(ray);
+            }
+            let across = ((2.0 * half / 0.15).ceil() as usize).max(3);
+            rays.extend(
+                (1..across)
+                    .map(|i| Ray::new(a - half + 2.0 * half * i as f32 / across as f32, vec![])),
+            );
+        }
         if self.radius.is_finite() {
             rays.extend(
                 (0..ARC_SAMPLES).map(|i| Ray::new(i as f32 * TAU / ARC_SAMPLES as f32, vec![])),
@@ -450,7 +662,7 @@ impl Vision {
                     .any(|&(center, half)| (a - center).abs() < half)
             })
         };
-        rays.retain(|r| !r.corners.is_empty() || !in_zone(r.angle));
+        rays.retain(|r| !r.corners.is_empty() || r.tangent.is_some() || !in_zone(r.angle));
 
         // Rays closer together than float precision can resolve may sort in
         // an order that disagrees with their actual directions, so merge
@@ -472,6 +684,7 @@ impl Vision {
             let merge = close(prev, next, next.angle - prev.angle);
             if merge {
                 prev.corners.append(&mut next.corners);
+                prev.tangent = prev.tangent.or(next.tangent);
             }
             merge
         });
@@ -483,7 +696,12 @@ impl Vision {
             }
         }
 
-        let cast = |angle: f32| level.raycast(origin, dir(angle), self.radius);
+        let blocking = &self.blocking;
+        let cast = |angle: f32| {
+            let d = dir(angle);
+            let walls = level.raycast(origin, d, self.radius);
+            blocking.cast(angle, d, walls)
+        };
         // Plain rays contribute their hit point. At a corner ray the
         // boundary can jump along the ray: it arrives from just before the
         // ray at some distance, runs out as far as the ray reaches, and
@@ -493,6 +711,25 @@ impl Vision {
         // itself so they stay in angular order.
         self.polygon.clear();
         for ray in &rays {
+            if let (Some((near, starts, center)), true) = (ray.tangent, ray.corners.is_empty()) {
+                // Beyond the circle: as far as this ray goes, but for the
+                // circle it grazes, and no further than a cast just past
+                // it. Where its shadow starts the boundary comes in from
+                // there to the circle; where it ends, it goes back out.
+                let side = if starts { -1.0 } else { 1.0 };
+                let d = dir(ray.angle);
+                let walls = level.raycast(origin, d, self.radius);
+                let exact = blocking.cast_except(ray.angle, d, walls, center);
+                let far = exact.min(cast(ray.angle + side * corner_eps(near)));
+                if far <= near + SAME_POINT {
+                    self.polygon.push(at(origin, ray.angle, far));
+                    continue;
+                }
+                let [first, then] = if starts { [far, near] } else { [near, far] };
+                self.polygon.push(at(origin, ray.angle, first));
+                self.polygon.push(at(origin, ray.angle, then));
+                continue;
+            }
             if ray.corners.is_empty() {
                 self.polygon.push(at(origin, ray.angle, cast(ray.angle)));
                 continue;
@@ -519,8 +756,8 @@ impl Vision {
             // farther corner merged in.
             let base = angle(origin, nearest);
             let (before, after) = (cast(base - side), cast(base + side));
-            let reach = level
-                .raycast(origin, aim, self.radius)
+            let reach = blocking
+                .cast(base, aim, level.raycast(origin, aim, self.radius))
                 .min(before.max(after));
             let along = |d: f32| [origin[0] + aim[0] * d, origin[1] + aim[1] * d];
 
@@ -821,10 +1058,15 @@ pub mod testing {
         // Conversely, visible points lie inside the polygon. With a finite
         // radius the arc is approximated by chords, so stay clear of it.
         let limit = vision.radius() * 0.99;
+        // Inside a circle is the prop itself, seen whole when its near side
+        // is (see `Vision::light_circles`), not by the polygon.
+        let in_circle = |p: [f32; 2]| {
+            (vision.blocking.circles.iter()).any(|c| distance(p, c.center) <= c.radius)
+        };
         for _ in 0..200 {
             let p = rng.open_point(level);
             let d = (p[0] - origin[0]).hypot(p[1] - origin[1]);
-            if d < limit && visible_with_margin(level, vision, p) {
+            if d < limit && !in_circle(p) && visible_with_margin(level, vision, p) {
                 let q = [
                     origin[0] + 0.995 * (p[0] - origin[0]),
                     origin[1] + 0.995 * (p[1] - origin[1]),
@@ -920,6 +1162,91 @@ mod tests {
                 for radius in [f32::INFINITY, 80.0] {
                     let mut vision = Vision::new(&level, radius);
                     vision.update(&level, origin);
+                    check_polygon(&level, &vision, &mut rng);
+                }
+            }
+        }
+    }
+
+    /// A circle around tile `t`'s center, radius `r`.
+    fn circle_at(t: [usize; 2], r: f32) -> Circle {
+        let [x, y] = t.map(|v| v as f32 * TILE);
+        Circle {
+            center: [x + TILE / 2.0, y + TILE / 2.0],
+            radius: r,
+        }
+    }
+
+    #[test]
+    fn circles_cast_shadows_and_light_up_seen() {
+        let rows: Vec<String> = (0..20).map(|_| ".".repeat(30)).collect();
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let level = Layer::from_ascii(&rows);
+        let rock = circle_at([15, 10], 4.0);
+        let origin = [50.0, 105.0];
+        let mut v = Vision::new(&level, f32::INFINITY);
+        v.update_through(&level, &level, None, None, origin, &[rock]);
+        // Behind it, hidden; beside it, and its own tile, seen.
+        let (behind, beside) = ([250.0, 105.0], [250.0, 140.0]);
+        assert!(!v.can_see(&level, behind));
+        assert!(v.can_see(&level, beside));
+        assert!(v.can_see(&level, rock.center));
+        assert!(!inside(v.polygon(), behind));
+        assert!(inside(v.polygon(), beside));
+        // Its shadow widens with distance: just past it, a little off the
+        // line through it is seen; far behind, hidden.
+        assert!(v.can_see(&level, [170.0, 112.0]));
+        assert!(!v.can_see(&level, [290.0, 112.0]));
+        // Seen (to be shown whole), and explored.
+        assert_eq!(v.props_seen(), &[[15, 10]]);
+        assert!(v.is_explored(15, 10));
+        // Without it, nothing's hidden.
+        v.update(&level, origin);
+        assert!(v.can_see(&level, behind));
+
+        // Behind a wall it isn't seen.
+        let mut rows: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+        rows[10].replace_range(10..11, "#");
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let walled = Layer::from_ascii(&rows);
+        let mut v = Vision::new(&walled, f32::INFINITY);
+        v.update_through(
+            &walled,
+            &walled,
+            None,
+            None,
+            origin,
+            &[circle_at([12, 10], 2.0)],
+        );
+        assert!(v.props_seen().is_empty());
+    }
+
+    #[test]
+    fn polygon_matches_los_around_circles() {
+        let mut rng = Rng::new(17);
+        for (level, spawn) in levels() {
+            // Circles of every size a prop may have, on open tiles.
+            let circles: Vec<Circle> = (0..60)
+                .filter_map(|_| {
+                    let t = [rng.range(0, level.cols - 1), rng.range(0, level.rows - 1)];
+                    let open = level.solid(t[0] as i32, t[1] as i32) == crate::layer::Solid::None;
+                    open.then(|| circle_at(t, 1.0 + rng.unit() * 3.9))
+                })
+                .collect();
+            let outside = |o: [f32; 2]| {
+                circles
+                    .iter()
+                    .all(|c| distance(o, c.center) > c.radius + 0.5)
+            };
+            let mut origins = vec![spawn];
+            origins.extend((0..5).map(|_| rng.open_point(&level)));
+            for origin in origins
+                .into_iter()
+                .filter(|o| is_open_point(&level, *o) && outside(*o))
+            {
+                for radius in [f32::INFINITY, 80.0] {
+                    let mut vision = Vision::new(&level, radius);
+                    vision.update_through(&level, &level, None, None, origin, &circles);
                     check_polygon(&level, &vision, &mut rng);
                 }
             }
@@ -1104,7 +1431,7 @@ mod tests {
             let mut v = Vision::new(&below, f32::INFINITY);
             let sight = deck_sight(&below, deck);
             let shaft = vec![true; 18];
-            v.update_through(&sight, &below, Some(&shaft), Some(deck), [5.0, 15.0]);
+            v.update_through(&sight, &below, Some(&shaft), Some(deck), [5.0, 15.0], &[]);
             band_area(&v)
         };
         // Nothing above: all three wall tops, though the far block's faces
@@ -1126,7 +1453,7 @@ mod tests {
         let mut v = Vision::new(&below, f32::INFINITY);
         let sight = deck_sight(&below, &deck);
         let shaft = [false, true, true, true, false, false];
-        v.update_through(&sight, &below, Some(&shaft), Some(&deck), [45.0, 5.0]);
+        v.update_through(&sight, &below, Some(&shaft), Some(&deck), [45.0, 5.0], &[]);
         // The left wall, next to the hole, lights up; the right one, next
         // to floor, doesn't.
         assert!((band_area(&v) - 100.0).abs() < 1e-2, "{}", band_area(&v));
@@ -1134,7 +1461,7 @@ mod tests {
         assert!(!v.is_explored(5, 0));
         // Out of range of the hole's edge, it stays dark.
         let mut near = Vision::new(&below, 20.0);
-        near.update_through(&sight, &below, Some(&shaft), Some(&deck), [45.0, 5.0]);
+        near.update_through(&sight, &below, Some(&shaft), Some(&deck), [45.0, 5.0], &[]);
         assert_eq!(band_area(&near), 0.0);
     }
 

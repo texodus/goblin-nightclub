@@ -23,6 +23,7 @@ pub mod mesh;
 pub mod packed;
 pub mod palette;
 pub mod path;
+pub mod prop;
 pub mod rng;
 pub mod tileset;
 pub mod vision;

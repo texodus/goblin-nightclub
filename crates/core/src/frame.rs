@@ -30,6 +30,11 @@ pub struct LayerFrame {
     /// Convex pieces of solid lit along with the polygon (which stops at
     /// wall faces): the band one tile behind the visible stretches of wall.
     pub lit_shapes: Vec<Vec<[f32; 2]>>,
+    /// The art of the props seen in the way of sight (see
+    /// [`crate::vision::Vision::props_seen`]): wherever it's opaque, it's
+    /// visible, though the polygon stops at the near side of each one's
+    /// circle.
+    pub props_seen: Canvas,
     /// Sprites of things standing on this layer: wherever they're opaque,
     /// the layer is drawn over any void beneath them rather than letting
     /// the layer below show through.

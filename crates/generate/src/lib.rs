@@ -34,6 +34,7 @@
 
 use std::sync::OnceLock;
 
+mod props;
 mod regions;
 pub use regions::{Generated, Plan, REGION, generated_meta, region_part};
 
@@ -209,16 +210,29 @@ pub fn world(seed: u32, cols: usize, rows: usize, spawn: [f32; 2], params: &Para
     let world = World::new(seed, cols, rows, spawn, params, None);
     let (spawn, params) = (world.spawn, world.params.clone());
     let layers = world.build();
+    let [top, ground] =
+        [spawn_layer(&params), ground_layer(&params)].map(|k| k.min(layers.len() - 1));
+    let all = [[0, 0], [cols as i32, rows as i32]];
+    let props = props::place(
+        seed,
+        &layers,
+        [cols, rows],
+        [0, 0],
+        all,
+        ground,
+        (top, spawn),
+    );
     LevelFile::new(
         cols,
         rows,
         &layers,
-        Spawn::at_tile(spawn_layer(&params).min(layers.len() - 1), spawn),
+        Spawn::at_tile(top, spawn),
         tileset().clone(),
         PLAYER_SPRITE,
         NPC_SPRITE,
     )
-    .with_ground(ground_layer(&params).min(layers.len() - 1))
+    .with_ground(ground)
+    .with_props(props)
 }
 
 /// The spawn's layer: the plains, the second overworld layer up.
@@ -2230,6 +2244,89 @@ mod tests {
 
     fn water() -> Tile {
         Tile::Whole(Part::Liquid(tileset().liquid(WATER).unwrap()))
+    }
+
+    #[test]
+    fn props_stand_alone_and_close_no_way() {
+        let t = tileset();
+        let (tree, rock) = (t.prop("tree").unwrap(), t.prop("rock").unwrap());
+        let (grass, cave) = (t.floor(PLAINS).unwrap(), t.floor(CAVE_FLOOR).unwrap());
+        let (mut trees, mut rocks) = (0, 0);
+        for seed in 0..3 {
+            let params = Params::default();
+            let file = super::world(seed, 160, 100, [805.0, 505.0], &params);
+            let ground = file.ground;
+            let tiles = file.tiles();
+            let at = |k: usize, x: i32, y: i32| {
+                let inside = (0..160).contains(&x) && (0..100).contains(&y);
+                inside.then(|| tiles[k][y as usize * 160 + x as usize])
+            };
+            for (k, props) in file.props.iter().enumerate() {
+                let here: std::collections::HashSet<[usize; 2]> =
+                    props.iter().map(|p| p.at).collect();
+                for p in props {
+                    let [x, y] = p.at.map(|v| v as i32);
+                    // Trees on the grass above ground, rocks on caves' floor
+                    // below.
+                    let (kind, on) = if k >= ground {
+                        (tree, grass)
+                    } else {
+                        (rock, cave)
+                    };
+                    assert_eq!(p.kind, kind, "seed {seed} layer {k} at {:?}", p.at);
+                    assert_eq!(at(k, x, y), Some(Tile::Whole(Part::Floor(on))));
+                    // Open floor all round, nothing else standing there.
+                    for (dx, dy) in (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dx, dy))) {
+                        if (dx, dy) == (0, 0) {
+                            continue;
+                        }
+                        assert!(matches!(
+                            at(k, x + dx, y + dy),
+                            Some(Tile::Whole(Part::Floor(_)))
+                        ));
+                        let n = [(x + dx) as usize, (y + dy) as usize];
+                        assert!(
+                            !here.contains(&n),
+                            "seed {seed} layer {k}: props side by side at {n:?}"
+                        );
+                    }
+                    // Clear of the spawn.
+                    let s = spawn_tile_of(&file);
+                    assert!(
+                        k != file.spawn.layer
+                            || (x - s[0]).abs().max((y - s[1]).abs()) > SPAWN_CLEARANCE
+                    );
+                }
+                if k >= ground {
+                    trees += props.len();
+                } else {
+                    rocks += props.len();
+                }
+            }
+            // Everywhere walkable without them is walkable with them, but
+            // where they stand.
+            let s = spawn_tile_of(&file);
+            let with = reachable_across(&file.level(), file.spawn.layer, s);
+            let bare = file.clone().with_props(Vec::new());
+            let without = reachable_across(&bare.level(), file.spawn.layer, s);
+            for k in 0..with.len() {
+                let stands: std::collections::HashSet<usize> = file.props[k]
+                    .iter()
+                    .map(|p| p.at[1] * 160 + p.at[0])
+                    .collect();
+                for i in 0..with[k].len() {
+                    assert!(
+                        with[k][i] || !without[k][i] || stands.contains(&i),
+                        "seed {seed}: layer {k} tile {i} cut off"
+                    );
+                }
+            }
+        }
+        assert!(trees > 50 && rocks > 50, "{trees} trees, {rocks} rocks");
+    }
+
+    fn spawn_tile_of(file: &LevelFile) -> [i32; 2] {
+        file.spawn.pos.map(|v| (v / TILE).floor() as i32)
     }
 
     fn spawn_tile() -> [i32; 2] {

@@ -11,6 +11,7 @@ use crate::camera::Rect;
 use crate::chunk::{CHUNK, Chunk, Chunks};
 use crate::draw::{Canvas, faces_light, inset_corner, inward_normal};
 use crate::palette;
+use crate::prop::{Prop, PropId};
 #[cfg(any(test, feature = "test-util"))]
 use crate::rng::Rng;
 use crate::tileset::{self, Tileset};
@@ -1254,6 +1255,26 @@ impl Layer {
             return Tile::WALL;
         }
         self.tiles.get(x as usize, y as usize)
+    }
+
+    /// The prop on tile `(x, y)`, if there's one (see [`crate::prop`]).
+    pub fn prop(&self, x: i32, y: i32) -> Option<PropId> {
+        self.in_bounds([x, y])
+            .then(|| self.tiles.prop(x as usize, y as usize))
+            .flatten()
+    }
+
+    /// Every prop on it.
+    pub fn props(&self) -> impl Iterator<Item = Prop> + '_ {
+        self.tiles.props()
+    }
+
+    /// The same layer with `props` on its tiles instead. Props don't
+    /// change its shape (what's in the way of walking or seeing is
+    /// worked out from them elsewhere: see [`crate::level`]).
+    pub fn with_props(mut self, props: &[Prop]) -> Self {
+        self.tiles = self.tiles.with_props(props);
+        self
     }
 
     /// Where tile `(x, y)` is wall; out of bounds, all of it.

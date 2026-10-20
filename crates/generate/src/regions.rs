@@ -25,10 +25,12 @@ use std::sync::{Arc, Mutex};
 use goblin_nightclub_core::chunk::{CHUNK, Chunk, ChunkKey, Chunks};
 use goblin_nightclub_core::layer::Tile;
 use goblin_nightclub_core::level_file::{Character, LevelMeta, Spawn};
+use goblin_nightclub_core::prop::Prop;
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::tileset::Tileset;
 use goblin_nightclub_core::world::{ChunkSource, Roof, roofs};
 
+use crate::props::place;
 use crate::{
     NPC_SPRITE, PLAYER_SPRITE, Params, World, fbm, ground_layer, spawn_layer, terrain_lines,
     tileset,
@@ -248,13 +250,35 @@ struct Boxed {
 
 /// Region `(rx, ry)`'s own tiles, made: how many across and down (fewer
 /// at the world's far edges), and each layer's, row by row.
+#[cfg(test)]
 pub fn region_tiles(plan: &Arc<Plan>, rx: usize, ry: usize) -> ([usize; 2], Vec<Vec<Tile>>) {
+    let (size, tiles, _) = region_made(plan, rx, ry);
+    (size, tiles)
+}
+
+/// The same, and each layer's props (see [`crate::props`]), where they
+/// are in the region.
+pub fn region_made(
+    plan: &Arc<Plan>,
+    rx: usize,
+    ry: usize,
+) -> ([usize; 2], Vec<Vec<Tile>>, Vec<Vec<Prop>>) {
     let Boxed {
-        size: [w, _],
-        core: [lo, hi],
+        origin,
+        size,
+        core,
         layers,
-        ..
     } = region_box(plan, rx, ry);
+    let props = place(
+        plan.seed,
+        &layers,
+        size,
+        origin,
+        core,
+        ground_layer(&plan.params),
+        (spawn_layer(&plan.params), plan.spawn),
+    );
+    let ([w, _], [lo, hi]) = (size, core);
     let (cw, ch) = ((hi[0] - lo[0]) as usize, (hi[1] - lo[1]) as usize);
     let (ox, oy) = (lo[0] as usize, lo[1] as usize);
     let own = layers
@@ -265,7 +289,7 @@ pub fn region_tiles(plan: &Arc<Plan>, rx: usize, ry: usize) -> ([usize; 2], Vec<
                 .collect()
         })
         .collect();
-    ([cw, ch], own)
+    ([cw, ch], own, props)
 }
 
 /// Region `(rx, ry)` made and packed (see
@@ -273,12 +297,12 @@ pub fn region_tiles(plan: &Arc<Plan>, rx: usize, ry: usize) -> ([usize; 2], Vec<
 /// over them, by where they are in the whole world. To hand over from
 /// wherever it's made (a worker) to the game.
 pub fn region_part(plan: &Arc<Plan>, rx: usize, ry: usize) -> Vec<u8> {
-    let ([cols, rows], tiles) = region_tiles(plan, rx, ry);
+    let ([cols, rows], tiles, props) = region_made(plan, rx, ry);
     let per = (plan.region / CHUNK) as i32;
     let at = |x: usize, y: usize| (rx as i32 * per + x as i32, ry as i32 * per + y as i32);
     let mut chunks = Vec::new();
     for (k, layer) in tiles.iter().enumerate() {
-        let grid = Chunks::from_tiles(cols, rows, layer);
+        let grid = Chunks::from_tiles(cols, rows, layer).with_props(&props[k]);
         let [across, down] = grid.size();
         for (x, y) in (0..down).flat_map(|y| (0..across).map(move |x| (x, y))) {
             let (cx, cy) = at(x, y);
@@ -332,11 +356,12 @@ impl Generated {
         if let Some(made) = self.made.lock().unwrap().0.get(&at) {
             return made.clone();
         }
-        let ([cols, rows], tiles) = region_tiles(&self.plan, at[0], at[1]);
+        let ([cols, rows], tiles, props) = region_made(&self.plan, at[0], at[1]);
         let made = Arc::new(Made {
             chunks: tiles
                 .iter()
-                .map(|t| Chunks::from_tiles(cols, rows, t))
+                .zip(&props)
+                .map(|(t, props)| Chunks::from_tiles(cols, rows, t).with_props(props))
                 .collect(),
             roofs: roofs(cols, rows, &tiles),
         });
@@ -366,12 +391,15 @@ impl Generated {
                         (t..all.len())
                             .step_by(threads)
                             .map(|i| {
-                                let ([cols, rows], tiles) =
-                                    region_tiles(&self.plan, all[i][0], all[i][1]);
+                                let ([cols, rows], tiles, props) =
+                                    region_made(&self.plan, all[i][0], all[i][1]);
                                 let made = Made {
                                     chunks: tiles
                                         .iter()
-                                        .map(|t| Chunks::from_tiles(cols, rows, t))
+                                        .zip(&props)
+                                        .map(|(t, p)| {
+                                            Chunks::from_tiles(cols, rows, t).with_props(p)
+                                        })
                                         .collect(),
                                     roofs: roofs(cols, rows, &tiles),
                                 };
@@ -594,6 +622,50 @@ mod tests {
         // Further in, all but a few: cave pockets the region filled (the
         // apron of the other leaves them, but never needs to know).
         assert!(same as f32 >= 0.995 * all as f32, "{same} of {all}");
+    }
+
+    #[test]
+    fn props_stand_alone_across_region_borders() {
+        let p = plan(5, 192, 128);
+        let layers = stitched(&p);
+        let [cols, rows] = p.size;
+        let [across, down] = p.regions();
+        let mut props: Vec<std::collections::HashSet<[i32; 2]>> =
+            vec![Default::default(); p.depth()];
+        for ry in 0..down {
+            for rx in 0..across {
+                let (_, _, made) = region_made(&p, rx, ry);
+                let [x0, y0] = [rx * p.region, ry * p.region].map(|v| v as i32);
+                for (k, list) in made.iter().enumerate() {
+                    props[k].extend(
+                        list.iter()
+                            .map(|q| [x0 + q.at[0] as i32, y0 + q.at[1] as i32]),
+                    );
+                }
+            }
+        }
+        assert!(props.iter().map(|p| p.len()).sum::<usize>() > 50);
+        let floor = |k: usize, x: i32, y: i32| {
+            let inside = (0..cols as i32).contains(&x) && (0..rows as i32).contains(&y);
+            inside
+                && matches!(
+                    layers[k][y as usize * cols + x as usize],
+                    Tile::Whole(goblin_nightclub_core::layer::Part::Floor(_))
+                )
+        };
+        for (k, here) in props.iter().enumerate() {
+            for &[x, y] in here {
+                for (dx, dy) in (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dx, dy))) {
+                    if (dx, dy) != (0, 0) {
+                        assert!(floor(k, x + dx, y + dy), "layer {k}: around ({x}, {y})");
+                        assert!(
+                            !here.contains(&[x + dx, y + dy]),
+                            "layer {k}: beside ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

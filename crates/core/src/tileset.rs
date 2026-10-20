@@ -1,5 +1,5 @@
 //! Tile sheets: which cells of a sheet image draw which floors, walls,
-//! liquids, stairs and sprites. A tileset is data a level carries (see
+//! liquids, stairs, props and sprites. A tileset is data a level carries (see
 //! [`crate::level_file`]), as JSON with string keys; the sheet image itself
 //! is loaded separately at runtime and handed to the renderer as a
 //! [`Sheet`]. Nothing here knows any material by name: the engine only
@@ -16,6 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::layer::{FloorId, LiquidId, Part, TILE, WallId};
 use crate::palette::{self, Color};
+use crate::prop::PropId;
 
 /// A cell of the sheet: column and row.
 pub type Cell = [u16; 2];
@@ -38,6 +39,8 @@ pub struct Tileset {
     pub floors: Vec<Floor>,
     pub walls: Vec<Wall>,
     pub liquids: Vec<Liquid>,
+    /// Kinds of things standing on tiles (see [`crate::prop`]).
+    pub props: Vec<PropKind>,
     pub sprites: Vec<Sprite>,
 }
 
@@ -105,6 +108,44 @@ pub struct Trim {
     pub inset: f32,
 }
 
+/// A kind of thing standing on a tile, like a tree or a rock (see
+/// [`crate::prop`]): drawn over the tiles and whoever's on them, and
+/// maybe in the way of walking, or of seeing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropKind {
+    pub name: String,
+    /// Variants, picked per tile: the top-left cell of each one's art.
+    pub cells: Vec<Cell>,
+    /// Cells of art across and down: more than one overhangs the tiles
+    /// around its own.
+    pub size: [u16; 2],
+    /// Where its tile is in its art, in cells from the art's top-left
+    /// corner: a tree two cells square with its trunk at the bottom middle
+    /// is at `[0.5, 1]`.
+    pub anchor: [f32; 2],
+    /// How far up from its layer its art is drawn, in layers (see
+    /// [`crate::draw::Vertex::z`]): a tree's canopy a little nearer the
+    /// viewer than the ground.
+    pub height: f32,
+    /// Whether its tile is solid to walking.
+    pub blocks: bool,
+    /// The radius of a circle around its tile's center that sight can't
+    /// pass, in pixels of the art: less than half a tile. 0 hides nothing.
+    pub sight: f32,
+}
+
+impl PropKind {
+    /// How far from its tile its art reaches, in tiles: on each side, the
+    /// most of left, top, right and bottom.
+    pub fn overhang(&self) -> f32 {
+        let [w, h] = self.size.map(f32::from);
+        let [ax, ay] = self.anchor;
+        [ax, ay, w - ax - 1.0, h - ay - 1.0]
+            .into_iter()
+            .fold(0.0, f32::max)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sprite {
     pub name: String,
@@ -134,6 +175,23 @@ impl Tileset {
             .iter()
             .position(|l| l.name == name)
             .map(|i| i as LiquidId)
+    }
+
+    /// The prop kind named `name`.
+    pub fn prop(&self, name: &str) -> Option<PropId> {
+        self.props
+            .iter()
+            .position(|p| p.name == name)
+            .map(|i| i as PropId)
+    }
+
+    /// How far any prop's art reaches from its tile, in world units.
+    pub fn prop_reach(&self) -> f32 {
+        self.props
+            .iter()
+            .map(PropKind::overhang)
+            .fold(0.0, f32::max)
+            * TILE
     }
 
     pub fn sprite(&self, name: &str) -> Option<&Sprite> {
@@ -182,12 +240,20 @@ impl Tileset {
             .chain(self.liquids.iter().map(|l| &l.trim))
             .flatten()
             .flat_map(|t| t.cells.iter().copied());
+        // Every cell of each prop's art.
+        let props = self.props.iter().flat_map(|p| {
+            let [w, h] = p.size;
+            p.cells.iter().flat_map(move |&[x, y]| {
+                (0..h).flat_map(move |dy| (0..w).map(move |dx| [x + dx, y + dy]))
+            })
+        });
         self.floors
             .iter()
             .flat_map(|f| f.cells.iter().copied())
             .chain(self.walls.iter().flat_map(|w| w.cells.iter().copied()))
             .chain(self.liquids.iter().flat_map(|l| l.cells.iter().copied()))
             .chain(trims)
+            .chain(props)
             .chain(self.sprites.iter().map(|s| s.cell))
             .chain([self.white, self.stairs[0], self.stairs[1]])
     }
@@ -219,6 +285,7 @@ impl Tileset {
             ("floors", self.floors.len()),
             ("walls", self.walls.len()),
             ("liquids", self.liquids.len()),
+            ("props", self.props.len()),
         ] {
             if len > MAX_ENTRIES {
                 return Err(format!("at most {MAX_ENTRIES} {table}"));
@@ -230,9 +297,22 @@ impl Tileset {
             .map(|f| (&f.name, f.cells.is_empty()))
             .chain(self.walls.iter().map(|w| (&w.name, w.cells.is_empty())))
             .chain(self.liquids.iter().map(|l| (&l.name, l.cells.is_empty())))
+            .chain(self.props.iter().map(|p| (&p.name, p.cells.is_empty())))
             .find(|(_, empty)| *empty);
         if let Some((name, _)) = empty {
             return Err(format!("{name:?} has no cells"));
+        }
+        for p in &self.props {
+            let anchored = (0..2).all(|i| (0.0..f32::from(p.size[i])).contains(&p.anchor[i]));
+            if p.size.contains(&0) || !anchored {
+                return Err(format!("prop {:?}: its tile must be in its art", p.name));
+            }
+            if !(0.0..self.cell as f32 / 2.0).contains(&p.sight) {
+                return Err(format!(
+                    "prop {:?}: what it hides of sight is in its tile",
+                    p.name
+                ));
+            }
         }
         Ok(())
     }
@@ -293,8 +373,29 @@ pub(crate) struct Raw {
     pub(crate) walls: IndexMap<String, RawWall>,
     #[serde(default)]
     pub(crate) liquids: IndexMap<String, RawLiquid>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub(crate) props: IndexMap<String, RawProp>,
     #[serde(default)]
     pub(crate) sprites: IndexMap<String, RawSprite>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RawProp {
+    cells: Vec<Cell>,
+    #[serde(default = "one_cell")]
+    size: [u16; 2],
+    #[serde(default)]
+    anchor: [f32; 2],
+    #[serde(default)]
+    height: f32,
+    #[serde(default)]
+    blocks: bool,
+    #[serde(default)]
+    sight: f32,
+}
+
+fn one_cell() -> [u16; 2] {
+    [1, 1]
 }
 
 #[derive(Serialize, Deserialize)]
@@ -455,6 +556,23 @@ impl Tileset {
                     )
                 })
                 .collect(),
+            props: self
+                .props
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        RawProp {
+                            cells: p.cells.clone(),
+                            size: p.size,
+                            anchor: p.anchor,
+                            height: p.height,
+                            blocks: p.blocks,
+                            sight: p.sight,
+                        },
+                    )
+                })
+                .collect(),
             sprites: self
                 .sprites
                 .iter()
@@ -523,6 +641,19 @@ impl<'de> Deserialize<'de> for Tileset {
                     })
                 })
                 .collect::<Result<_, D::Error>>()?,
+            props: raw
+                .props
+                .into_iter()
+                .map(|(name, p)| PropKind {
+                    name,
+                    cells: p.cells,
+                    size: p.size,
+                    anchor: p.anchor,
+                    height: p.height,
+                    blocks: p.blocks,
+                    sight: p.sight,
+                })
+                .collect(),
             sprites: raw
                 .sprites
                 .into_iter()
@@ -535,8 +666,9 @@ impl<'de> Deserialize<'de> for Tileset {
 }
 
 /// A small tileset for tests: floors `plain`, `planks`, `dirt`, `grate`;
-/// walls `rock`, `brick`, `metal`; liquid `water`; sprites `player`,
-/// `npc`. Cells are laid out like the placeholder sheet's.
+/// walls `rock`, `brick`, `metal`; liquid `water`; props `tree` (art two
+/// cells square, overhanging) and `rock`, in cells free in the sheet's
+/// first rows; sprites `player`, `npc`. Cells are laid out like the placeholder sheet's.
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing {
     use super::*;
@@ -589,6 +721,26 @@ pub mod testing {
                 edge: Edge::default(),
                 trim: None,
             }],
+            props: vec![
+                PropKind {
+                    name: "tree".into(),
+                    cells: vec![[6, 3]],
+                    size: [2, 2],
+                    anchor: [0.5, 1.0],
+                    height: 0.05,
+                    blocks: true,
+                    sight: 3.0,
+                },
+                PropKind {
+                    name: "rock".into(),
+                    cells: vec![[4, 4], [5, 4]],
+                    size: [1, 1],
+                    anchor: [0.0, 0.0],
+                    height: 0.0,
+                    blocks: true,
+                    sight: 6.0,
+                },
+            ],
             sprites: vec![
                 Sprite {
                     name: "player".into(),
