@@ -139,7 +139,8 @@ pub fn draw_fringes(layer: &Layer, tileset: &Tileset, canvas: &mut Canvas, x: us
     let origin = [x as f32 * TILE, y as f32 * TILE];
     for (part, edges) in pieces(layer, x, y) {
         let edge = tileset.edge(part);
-        let (Some(cell), Part::Floor(_) | Part::Wall(_)) = (cell_of(tileset, part, x, y), part)
+        let [ax, ay] = layer.absolute(x, y);
+        let (Some(cell), Part::Floor(_) | Part::Wall(_)) = (cell_of(tileset, part, ax, ay), part)
         else {
             continue;
         };
@@ -232,6 +233,7 @@ pub fn draw_trims(layer: &Layer, tileset: &Tileset, canvas: &mut Canvas, x: usiz
             continue;
         }
         let inset = trim.inset / tileset.zoom();
+        let [ax, ay] = layer.absolute(x, y);
         for (i, e) in edges.iter().enumerate() {
             if e.beyond.is_none_or(|s| s == Surface::Part(part)) {
                 continue;
@@ -240,7 +242,7 @@ pub fn draw_trims(layer: &Layer, tileset: &Tileset, canvas: &mut Canvas, x: usiz
             // split tile differ.
             let key = |k: u32| {
                 let dir = (e.out[0] * 2.0 + 3.0) as u32 * 8 + (e.out[1] * 2.0 + 3.0) as u32;
-                hash([x as u32, y as u32, dir * 4 + i as u32, k])
+                hash([ax as u32, ay as u32, dir * 4 + i as u32, k])
             };
             if key(0) >= trim.density {
                 continue;

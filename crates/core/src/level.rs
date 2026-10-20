@@ -16,23 +16,45 @@
 //!
 //! All of these are ordinary [`Layer`]s, so rays, collision, outlines and
 //! visibility work on them unchanged.
+//!
+//! What sight needs from `top` down is worked out from one summary per
+//! layer, how far up each tile stays void (see [`Level::open_above`]), when
+//! first asked for, and kept only while the viewer is on or next to `top`:
+//! a level keeps a few layers of these whatever its depth, not one for
+//! every pair of layers.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::draw::Canvas;
 use crate::fringe;
-use crate::layer::{Layer, Solid, Tile};
+use crate::layer::{Layer, QUARTERS, Solid, Tile};
 use crate::mesh::Mesh;
 use crate::path;
 use crate::tileset::Tileset;
 
-/// Layers a level may have (the renderer keeps textures for each).
-pub const MAX_LAYERS: usize = 8;
+/// Layers a level may have: a bound on what a file may ask for.
+pub const MAX_LAYERS: usize = 1024;
+
+/// Layers drawn at once: the viewer's and up to this many less one below
+/// it (the renderer keeps textures for each). Further down, under that many
+/// sheets of mist and that much parallax, they'd hardly show.
+pub const MAX_VISIBLE: usize = 8;
 
 /// What blocks movement in `tile`: wall and void (liquid included); a part
 /// of a tile no shape can be rounds up to the whole tile.
 pub fn movement_solid(tile: Tile) -> Solid {
     Solid::from_quarters(tile.wall().quarters() | tile.void_quarters(), true)
+}
+
+/// Where `layer` blocks movement (see [`movement_solid`]), as a layer of
+/// its own.
+pub fn movement_layer(layer: &Layer) -> Layer {
+    let (cols, rows) = (layer.cols, layer.rows);
+    let solids = (0..cols * rows)
+        .map(|t| movement_solid(layer.tile((t % cols) as i32, (t / cols) as i32)))
+        .collect();
+    Layer::from_solids(cols, rows, solids)
 }
 
 /// Can a box of `size` stand centered at `center` on a layer of `tiles`
@@ -57,26 +79,43 @@ pub fn can_stand(
     })
 }
 
-/// Tiles a level may have per layer: the renderer keeps a level-sized mask
-/// of what's been seen on each layer, a byte per pixel.
-pub const MAX_TILES: usize = 128 * 128 * 4;
+/// Tiles a level may have per layer: a bound on what a file may ask for.
+/// Every layer is kept in memory whole, so in practice memory is the limit.
+pub const MAX_TILES: usize = 1 << 20;
 
 pub struct Level {
     layers: Vec<Layer>,
     /// The art its tiles refer to.
     tileset: Tileset,
     movement: Vec<Layer>,
-    /// `views[top][k]` for `k <= top`; see [`Level::view`].
-    views: Vec<Vec<Layer>>,
-    /// `shafts[top][k][tile]`: whether any of the tile is open from layer
-    /// `k` up to `top`.
-    shafts: Vec<Vec<Vec<bool>>>,
-    /// `visible[top]`; see [`Level::visible_layers`].
-    visible: Vec<Vec<usize>>,
+    /// `open_above[k][tile]`, per quarter: see [`Level::open_above`].
+    open_above: Vec<Vec<[u8; 4]>>,
+    /// Per layer, the most of `open_above` anywhere on it: how many layers
+    /// up it shows through to, at most.
+    deepest: Vec<u8>,
     /// Per layer, made when first asked for; see [`Level::meshes`].
     meshes: Vec<OnceLock<LayerMeshes>>,
-    /// `shaft_meshes[top][k]`, made when first asked for.
-    shaft_meshes: Vec<Vec<OnceLock<Arc<Mesh>>>>,
+    /// By `(top, k)`, made when first asked for and dropped once the viewer
+    /// is further than a layer from `top`: [`Level::view`],
+    /// [`Level::shaft`] and [`Level::shaft_mesh`].
+    views: Cache<Arc<Layer>>,
+    shafts: Cache<Arc<[bool]>>,
+    shaft_meshes: Cache<Arc<Mesh>>,
+}
+
+type Cache<T> = Mutex<HashMap<(usize, usize), T>>;
+
+/// `cache`'s entry for `(top, k)`, made by `make` if it hasn't one. Entries
+/// for layers further than one from `top` go: the viewer has left them.
+fn cached<T: Clone>(cache: &Cache<T>, top: usize, k: usize, make: impl FnOnce() -> T) -> T {
+    if let Some(found) = cache.lock().unwrap().get(&(top, k)) {
+        return found.clone();
+    }
+    let made = make();
+    let mut cache = cache.lock().unwrap();
+    cache.retain(|&(t, _), _| t.abs_diff(top) <= 1);
+    cache.insert((top, k), made.clone());
+    made
 }
 
 /// What's drawn of a layer that only changes with its tiles.
@@ -105,84 +144,48 @@ impl Level {
             cols * rows <= MAX_TILES,
             "at most {MAX_TILES} tiles a layer"
         );
+        let movement = layers.iter().map(movement_layer).collect();
+        Self::from_parts(layers, movement, tileset)
+    }
+
+    /// A level from its layers and each one's [`movement_layer`], made
+    /// beforehand (perhaps a little at a time).
+    pub fn from_parts(layers: Vec<Layer>, movement: Vec<Layer>, tileset: Tileset) -> Self {
+        let (cols, rows) = (layers[0].cols, layers[0].rows);
+        assert!(layers.iter().all(|l| l.cols == cols && l.rows == rows));
+        assert_eq!(movement.len(), layers.len());
         let n = cols * rows;
         let pos = |i: usize| ((i % cols) as i32, (i / cols) as i32);
-        let solid = |l: &Layer, i: usize| l.solid(pos(i).0, pos(i).1);
-        let void = |l: &Layer, i: usize| l.tile(pos(i).0, pos(i).1).void_quarters();
 
-        // Blocked where wall or void (see `movement_solid`).
-        let movement = layers
-            .iter()
-            .map(|l| {
-                let solids = (0..n)
-                    .map(|t| movement_solid(l.tile(pos(t).0, pos(t).1)))
-                    .collect();
-                Layer::from_solids(cols, rows, solids)
-            })
-            .collect();
-
-        // What blocks the view of layer `k` from `top`: `top`'s walls, and
-        // the walls of each layer in between where every layer above them
-        // is void. Elsewhere a wall in between is under a floor, which hides
-        // it, so it can't be in the way of anything seen through a hole.
-        let views = (0..layers.len())
-            .map(|top| {
-                (0..=top)
-                    .map(|k| {
-                        let solids = (0..n)
-                            .map(|t| {
-                                let mut q = solid(&layers[top], t).quarters();
-                                for j in k + 1..top {
-                                    let open = layers[j + 1..=top]
-                                        .iter()
-                                        .fold(0b1111, |m, l| m & void(l, t));
-                                    q |= solid(&layers[j], t).quarters() & open;
-                                }
-                                Solid::from_quarters(q, true)
-                            })
-                            .collect();
-                        Layer::from_solids(cols, rows, solids)
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let shafts: Vec<Vec<Vec<bool>>> = (0..layers.len())
-            .map(|top| {
-                (0..=top)
-                    .map(|k| {
-                        (0..n)
-                            .map(|t| {
-                                layers[k + 1..=top]
-                                    .iter()
-                                    .fold(0b1111, |q, l| q & void(l, t))
-                                    != 0
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-        let visible = (0..layers.len())
-            .map(|top| {
-                (0..=top)
-                    .rev()
-                    .filter(|&k| shafts[top][k].iter().any(|s| *s))
-                    .collect()
-            })
-            .collect();
+        // From the top down: open one more layer up than the layer above
+        // is, in each quarter of it that's void.
         let depth = layers.len();
+        let mut open_above = vec![vec![[0u8; 4]; n]; depth];
+        for k in (0..depth.saturating_sub(1)).rev() {
+            let (here, above) = open_above.split_at_mut(k + 1);
+            for (t, open) in here[k].iter_mut().enumerate() {
+                let void = layers[k + 1].tile(pos(t).0, pos(t).1).void_quarters();
+                for (q, bit) in QUARTERS.into_iter().enumerate() {
+                    if void & bit != 0 {
+                        open[q] = above[0][t][q].saturating_add(1);
+                    }
+                }
+            }
+        }
+        let deepest = open_above
+            .iter()
+            .map(|l| l.iter().flatten().copied().max().unwrap_or(0))
+            .collect();
         Self {
             layers,
             tileset,
             movement,
-            views,
-            shafts,
-            visible,
+            open_above,
+            deepest,
             meshes: (0..depth).map(|_| OnceLock::new()).collect(),
-            shaft_meshes: (0..depth)
-                .map(|top| (0..=top).map(|_| OnceLock::new()).collect())
-                .collect(),
+            views: Default::default(),
+            shafts: Default::default(),
+            shaft_meshes: Default::default(),
         }
     }
 
@@ -211,24 +214,68 @@ impl Level {
         &self.movement[i]
     }
 
+    /// For tile `t` (an index, row by row) of layer `k`: per quarter (as
+    /// in [`QUARTERS`]), how many layers straight up from `k` that quarter
+    /// is void, without a break, up to 255. So layer `k` shows through to
+    /// layer `top` in a quarter where it's at least `top - k`.
+    pub fn open_above(&self, k: usize, t: usize) -> [u8; 4] {
+        self.open_above[k][t]
+    }
+
+    /// The quarters of tile `t` of layer `k` open all the way up to `top`,
+    /// as bits; all of them on `top` itself.
+    fn open_to(&self, top: usize, k: usize, t: usize) -> u8 {
+        if k == top {
+            return 0b1111;
+        }
+        let open = self.open_above[k][t];
+        QUARTERS
+            .into_iter()
+            .enumerate()
+            .filter(|&(q, _)| open[q] as usize >= top - k)
+            .fold(0, |bits, (_, bit)| bits | bit)
+    }
+
     /// What blocks the view of layer `k` from layer `top`: `top`'s walls,
     /// and the walls of the layers in between, but only inside holes
-    /// (where every layer above them is void). Not `k`'s own walls, below
-    /// `top`: looking down, you see over them, onto their tops.
-    pub fn view(&self, top: usize, k: usize) -> &Layer {
-        &self.views[top][k]
+    /// (where every layer above them is void). Elsewhere a wall in between
+    /// is under a floor, which hides it, so it can't be in the way of
+    /// anything seen through a hole. Not `k`'s own walls, below `top`:
+    /// looking down, you see over them, onto their tops.
+    pub fn view(&self, top: usize, k: usize) -> Arc<Layer> {
+        cached(&self.views, top, k, || {
+            let (cols, rows) = (self.cols(), self.rows());
+            let solids = (0..cols * rows)
+                .map(|t| {
+                    let (x, y) = ((t % cols) as i32, (t / cols) as i32);
+                    let mut q = self.layers[top].solid(x, y).quarters();
+                    for j in k + 1..top {
+                        q |= self.layers[j].solid(x, y).quarters() & self.open_to(top, j, t);
+                    }
+                    Solid::from_quarters(q, true)
+                })
+                .collect();
+            Arc::new(Layer::from_solids(cols, rows, solids))
+        })
     }
 
     /// For each tile, whether layer `k` shows through to layer `top`
     /// anywhere in it: there's void all the way up.
-    pub fn shaft(&self, top: usize, k: usize) -> &[bool] {
-        &self.shafts[top][k]
+    pub fn shaft(&self, top: usize, k: usize) -> Arc<[bool]> {
+        cached(&self.shafts, top, k, || {
+            (0..self.cols() * self.rows())
+                .map(|t| self.open_to(top, k, t) != 0)
+                .collect()
+        })
     }
 
     /// The layers seen from `top`: itself, and each below it showing
-    /// through any shaft, top first.
-    pub fn visible_layers(&self, top: usize) -> &[usize] {
-        &self.visible[top]
+    /// through any shaft, top first; no more than [`MAX_VISIBLE`].
+    pub fn visible_layers(&self, top: usize) -> Vec<usize> {
+        (top.saturating_sub(MAX_VISIBLE - 1)..=top)
+            .rev()
+            .filter(|&k| k == top || self.deepest[k] as usize >= top - k)
+            .collect()
     }
 
     /// Layer `k`'s tile art, voids and liquid, as meshes.
@@ -272,9 +319,9 @@ impl Level {
 
     /// Where layer `k` shows through to layer `top` (see
     /// [`Level::shaft`]), as a mesh of whole tiles.
-    pub fn shaft_mesh(&self, top: usize, k: usize) -> &Arc<Mesh> {
-        self.shaft_meshes[top][k].get_or_init(|| {
-            let (cols, shaft) = (self.cols(), &self.shafts[top][k]);
+    pub fn shaft_mesh(&self, top: usize, k: usize) -> Arc<Mesh> {
+        cached(&self.shaft_meshes, top, k, || {
+            let (cols, shaft) = (self.cols(), self.shaft(top, k));
             let canvas = Canvas::new(&self.tileset);
             Arc::new(Mesh::quarters(cols, self.rows(), canvas, |x, y| {
                 if shaft[y * cols + x] { 0b1111 } else { 0 }
@@ -316,7 +363,7 @@ mod tests {
         assert_eq!(l.movement(1).solid(0, 0), Solid::Full, "a pit");
         assert_eq!(l.movement(1).solid(1, 0), Solid::None);
         assert_eq!(
-            l.shaft(1, 0),
+            &*l.shaft(1, 0),
             &[true, false, true],
             "shows through like void"
         );
@@ -348,13 +395,13 @@ mod tests {
         let t = true;
         let f = false;
         // Two down, the hole through both is tile 3.
-        assert_eq!(l.shaft(2, 0), &[f, f, f, t, f, f, f, f]);
+        assert_eq!(&*l.shaft(2, 0), &[f, f, f, t, f, f, f, f]);
         // One down, the top's void.
-        assert_eq!(l.shaft(2, 1), &[f, f, t, t, f, f, f, f]);
+        assert_eq!(&*l.shaft(2, 1), &[f, f, t, t, f, f, f, f]);
         assert!(l.shaft(2, 2).iter().all(|s| *s), "own layer: everywhere");
         // Half a tile of void counts.
         let half = level(&[&["..."], &[".▛."]]);
-        assert_eq!(half.shaft(1, 0), &[f, t, f]);
+        assert_eq!(&*half.shaft(1, 0), &[f, t, f]);
     }
 
     #[test]
@@ -509,8 +556,107 @@ mod tests {
         // four.
         assert!((area(&top.voids) - 400.0).abs() < 1e-3);
         assert!((area(&top.liquid) - 100.0).abs() < 1e-3);
-        assert!((area(l.shaft_mesh(1, 0)) - 400.0).abs() < 1e-3);
-        assert!(Arc::ptr_eq(l.shaft_mesh(1, 0), l.shaft_mesh(1, 0)));
+        assert!((area(&l.shaft_mesh(1, 0)) - 400.0).abs() < 1e-3);
+        assert!(Arc::ptr_eq(&l.shaft_mesh(1, 0), &l.shaft_mesh(1, 0)));
+    }
+
+    /// Views, shafts and the layers seen, worked out from `open_above`,
+    /// match working them out directly from every layer in between, on
+    /// random stacks with plenty of void, half void, liquid and walls.
+    #[test]
+    fn summaries_match_looking_through_every_layer() {
+        use crate::layer::{Corner, Part};
+        use crate::rng::Rng;
+        let parts = [Part::Floor(0), Part::Wall(0), Part::Void, Part::Liquid(0)];
+        for seed in 0..12 {
+            let mut rng = Rng::new(seed);
+            let (cols, rows) = (9, 7);
+            let depth = MAX_VISIBLE + 4;
+            let layers: Vec<Layer> = (0..depth)
+                .map(|_| {
+                    let tiles = (0..cols * rows)
+                        .map(|_| {
+                            // Mostly void, so shafts run deep.
+                            let part = |rng: &mut Rng| {
+                                if rng.unit() < 0.6 {
+                                    Part::Void
+                                } else {
+                                    parts[rng.range(0, 3)]
+                                }
+                            };
+                            let (at, rest) = (part(&mut rng), part(&mut rng));
+                            Tile::split(Corner::CLOCKWISE[rng.range(0, 3)], at, rest)
+                        })
+                        .collect();
+                    Layer::from_tiles(cols, rows, tiles)
+                })
+                .collect();
+            let tiles: Vec<Vec<Tile>> = layers
+                .iter()
+                .map(|l| {
+                    (0..cols * rows)
+                        .map(|t| l.tile((t % cols) as i32, (t / cols) as i32))
+                        .collect()
+                })
+                .collect();
+            let level = Level::new(layers, crate::tileset::testing::tileset());
+            let void = |j: usize, t: usize| tiles[j][t].void_quarters();
+            let open =
+                |top: usize, j: usize, t: usize| (j + 1..=top).fold(0b1111, |q, l| q & void(l, t));
+            for top in 0..depth {
+                let mut seen = vec![top];
+                for k in 0..=top {
+                    let (view, shaft) = (level.view(top, k), level.shaft(top, k));
+                    for t in 0..cols * rows {
+                        let (x, y) = ((t % cols) as i32, (t / cols) as i32);
+                        let q = (k + 1..top)
+                            .map(|j| tiles[j][t].wall().quarters() & open(top, j, t))
+                            .fold(tiles[top][t].wall().quarters(), |q, w| q | w);
+                        let why = format!("seed {seed}, {k} from {top}, tile {t}");
+                        assert_eq!(view.solid(x, y), Solid::from_quarters(q, true), "{why}");
+                        assert_eq!(shaft[t], open(top, k, t) != 0, "{why}");
+                    }
+                    if k < top && top - k < MAX_VISIBLE && shaft.iter().any(|s| *s) {
+                        seen.push(k);
+                    }
+                }
+                seen[1..].sort_unstable_by(|a, b| b.cmp(a));
+                assert_eq!(level.visible_layers(top), seen, "seed {seed}, from {top}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_views_near_the_viewer_are_kept() {
+        let l = level(&[&["."], &["~"], &["~"], &["~"], &["~"]]);
+        let near = l.view(4, 0);
+        assert!(Arc::ptr_eq(&near, &l.view(4, 0)), "kept");
+        l.view(3, 0);
+        assert!(
+            Arc::ptr_eq(&near, &l.view(4, 0)),
+            "one layer away: still kept"
+        );
+        l.view(1, 0);
+        assert!(!Arc::ptr_eq(&near, &l.view(4, 0)), "made again");
+        assert!(l.views.lock().unwrap().keys().all(|&(top, _)| top >= 3));
+    }
+
+    #[test]
+    fn no_more_than_max_visible_layers_are_drawn() {
+        let mut rows: Vec<&[&str]> = vec![&["."]];
+        rows.extend(std::iter::repeat_n(&["~"] as &[&str], MAX_VISIBLE + 3));
+        let l = level(&rows);
+        let top = l.depth() - 1;
+        let seen = l.visible_layers(top);
+        assert_eq!(seen.len(), MAX_VISIBLE);
+        assert_eq!(
+            seen,
+            (top + 1 - MAX_VISIBLE..=top).rev().collect::<Vec<_>>()
+        );
+        assert!(
+            l.shaft(top, 0)[0],
+            "the bottom still shows through, undrawn"
+        );
     }
 
     #[test]

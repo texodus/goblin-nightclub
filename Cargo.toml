@@ -18,12 +18,22 @@ goblin-nightclub-editor = { path = "crates/editor" }
 bytemuck = { version = "1.25", features = ["derive"] }
 console_error_panic_hook = "0.1.7"
 indexmap = { version = "2", features = ["serde"] }
+miniz_oxide = "0.8"
 png = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
-web-sys = { version = "0.3.106", features = ["HtmlCanvasElement", "console"] }
+js-sys = "0.3.106"
+web-sys = { version = "0.3.106", features = [
+    "HtmlCanvasElement",
+    "console",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Window",
+] }
 wgpu = { version = "30.0.1", default-features = false, features = [
     "std",
     "webgpu",

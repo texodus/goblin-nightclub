@@ -70,6 +70,18 @@ impl Memory {
         self.visible.contains(&id)
     }
 
+    /// Move every marker by `by` (pixels), as when the level it's on is
+    /// made again offset; those then outside `within` (top-left and size)
+    /// are forgotten.
+    pub fn shift(&mut self, by: [f32; 2], within: [[f32; 2]; 2]) {
+        let [[x0, y0], [w, h]] = within;
+        self.visible.clear();
+        self.markers.retain(|_, m| {
+            m.pos = [m.pos[0] + by[0], m.pos[1] + by[1]];
+            (x0..x0 + w).contains(&m.pos[0]) && (y0..y0 + h).contains(&m.pos[1])
+        });
+    }
+
     /// Markers for entities not currently visible.
     pub fn stale(&self) -> impl Iterator<Item = (EntityId, &StaleMarker)> {
         self.markers

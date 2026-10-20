@@ -722,7 +722,7 @@ impl Editor {
                     voids: meshes.voids.clone(),
                     liquid: meshes.liquid.clone(),
                     standing: Canvas::new(&self.tileset),
-                    shaft: (k < top).then(|| self.level.shaft_mesh(top, k).clone()),
+                    shaft: (k < top).then(|| self.level.shaft_mesh(top, k)),
                 }
             })
             .collect();
@@ -744,6 +744,9 @@ impl Editor {
             outdoors: false,
             ground: 0,
             world: self.world(),
+            offset: [0, 0],
+            base: 0,
+            remember: false,
             overlay: self.overlay(),
             ui: Canvas::new(&self.tileset),
         }

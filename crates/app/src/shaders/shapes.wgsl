@@ -20,9 +20,10 @@ struct Globals {
     zoom: f32,
     // Edge of a cell of the sheet, in pixels.
     cell: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    _pad: f32,
+    // Where world point (0, 0) is in the whole level (for a level drawn a
+    // window at a time), so patterns pinned to the world stay put.
+    offset: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -105,7 +106,7 @@ fn fringe_covers(p: vec2<f32>, edge: vec4<f32>, reach: f32) -> bool {
         d = dot(p - edge.xy, edge.zw);
         foot = p - edge.zw * d;
     }
-    let q = foot * globals.cell / TILE / FRINGE_GRAIN;
+    let q = (foot + globals.offset) * globals.cell / TILE / FRINGE_GRAIN;
     let n = 0.65 * value_noise(q) + 0.35 * value_noise(q * 2.3 + 17.0);
     // Spread out, as the noise mostly stays near its middle: often all
     // the way, sometimes none of it.

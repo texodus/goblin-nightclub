@@ -186,6 +186,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "indexmap",
+ "miniz_oxide 0.8.9",
  "serde",
  "serde_json",
 ]
@@ -226,6 +227,7 @@ dependencies = [
  "goblin-nightclub-editor",
  "goblin-nightclub-game",
  "goblin-nightclub-generate",
+ "js-sys",
  "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",

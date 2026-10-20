@@ -23,8 +23,10 @@
         <button data-action="menu" title="Back to the menu (Esc)">Menu</button>
         <span class="sep"></span>
         <button data-action="new-level" title="Start a blank level">New</button>
-        <button data-action="open" title="Open a level file">Open</button>
+        <button data-action="open" title="Open a level file, or a packed level and any diffs over it">Open</button>
         <button data-action="save" title="Save the level to a file">Save</button>
+        <button data-action="save-pack" title="Save the level packed in chunks, to play a piece at a time">Save packed</button>
+        <button data-action="save-diff" title="Save just what's changed since opening it from a packed level">Save diff</button>
         <span class="sep"></span>
         <button data-action="undo" title="Undo (Ctrl+Z)">Undo</button>
         <button data-action="redo" title="Redo (Ctrl+Shift+Z)">Redo</button>
@@ -73,7 +75,7 @@
       </form>
     </dialog>
 
-    <input id="file" type="file" accept=".json,application/json" hidden />
+    <input id="file" type="file" accept=".json,.pack,application/json,application/octet-stream" multiple hidden />
     <p id="error" hidden></p>
     <script type="module" src="main.js"></script>
   </body>

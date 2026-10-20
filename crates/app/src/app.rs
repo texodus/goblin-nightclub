@@ -2,17 +2,24 @@
 //! HTML interface (the start menu, the editor's toolbar) and forwards them
 //! to [`App`], which runs a game or the editor.
 
+use std::rc::Rc;
+use std::sync::Arc;
+
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
+use crate::generated::{Regions, WorkerSource};
+use crate::http::HttpBytes;
 use crate::renderer::Renderer;
 use goblin_nightclub_core::layer::Corner;
 use goblin_nightclub_core::level_file::LevelFile;
+use goblin_nightclub_core::packed::{self, Opened, Packed};
 use goblin_nightclub_core::tileset::{Sheet, Tileset};
 use goblin_nightclub_core::{HEIGHT, WIDTH};
 use goblin_nightclub_editor::{BrushShape, Editor, Tool};
-use goblin_nightclub_game::Game;
-use goblin_nightclub_generate::Params;
+use goblin_nightclub_game::{Game, NEW_WORLD, Opening};
+use goblin_nightclub_generate::{Params, Plan, generated_meta};
+use std::cell::RefCell;
 
 #[wasm_bindgen(start)]
 fn init() {
@@ -22,8 +29,18 @@ fn init() {
 enum Mode {
     /// The start menu is up; nothing is drawn.
     Menu,
+    /// A game starting on a level from a server (see [`App::open_url`]);
+    /// nothing is drawn yet.
+    Opening(Box<Pending>),
     Game(Box<Game>),
     Editor,
+}
+
+/// A game on a level from a server, starting: its header and index
+/// first, then its first window.
+enum Pending {
+    Header { bytes: HttpBytes, seed: u32 },
+    Window(Box<Opening>),
 }
 
 #[wasm_bindgen]
@@ -32,6 +49,16 @@ pub struct App {
     /// Kept while playing or in the menu, so the editor picks up where it
     /// left off (e.g. after trying the level out).
     editor: Option<Editor>,
+    /// The packed level the editor's level came from, if it did: what a
+    /// diff is saved against.
+    editor_base: Option<Rc<Packed<Arc<[u8]>>>>,
+    /// Files to open (see [`App::stage`]).
+    staged: Vec<Arc<[u8]>>,
+    /// What went wrong starting a game, for JS to show.
+    error: Option<String>,
+    /// For a game on a world generated a region at a time: where the
+    /// regions made in workers go (see [`App::deliver_region`]).
+    regions: Option<Rc<RefCell<Regions>>>,
     renderer: Renderer,
     last_time: Option<f64>,
 }
@@ -55,6 +82,10 @@ impl App {
         Ok(App {
             mode: Mode::Menu,
             editor: None,
+            editor_base: None,
+            staged: Vec::new(),
+            error: None,
+            regions: None,
             renderer,
             last_time: None,
         })
@@ -75,6 +106,10 @@ impl App {
     fn tileset(&self) -> Option<&Tileset> {
         match &self.mode {
             Mode::Menu => None,
+            Mode::Opening(pending) => match pending.as_ref() {
+                Pending::Header { .. } => None,
+                Pending::Window(opening) => Some(opening.tileset()),
+            },
             Mode::Game(game) => Some(game.tileset()),
             Mode::Editor => self.editor.as_ref().map(|e| e.tileset()),
         }
@@ -108,26 +143,90 @@ impl App {
         self.mode = Mode::Menu;
     }
 
-    /// Start a game on a newly generated level, from `seed`, with the
-    /// default generation parameters.
-    pub fn new_game(&mut self, seed: u32) {
-        let [w, h] = self.view();
-        let params = Params::default();
-        web_sys::console::log_1(&serde_json::to_string(&params).unwrap().into());
-        let game = Game::new(w, h, seed, &params);
-        self.switch(Mode::Game(Box::new(game)));
+    /// Add a file to those [`App::load_staged`] or
+    /// [`App::editor_load_staged`] open next: a level file (JSON), a packed
+    /// level, or a diff over one.
+    pub fn stage(&mut self, bytes: &[u8]) {
+        self.staged.push(bytes.into());
     }
 
-    /// Start a game on a newly generated level, from `seed`, with
-    /// generation parameters given as JSON (see [`Params`]; any left out
-    /// take their defaults).
-    pub fn new_game_with(&mut self, seed: u32, params: &str) -> Result<(), JsError> {
-        let params: Params = serde_json::from_str(params).map_err(js_err)?;
-        web_sys::console::log_1(&serde_json::to_string(&params).unwrap().into());
-        let [w, h] = self.view();
-        let game = Game::new(w, h, seed, &params);
+    fn take_staged(&mut self) -> Result<Opened, JsError> {
+        packed::open_files(std::mem::take(&mut self.staged)).map_err(js_err)
+    }
+
+    /// Start a game on the files staged: a level file, or a packed level
+    /// and any diffs over it (played a window at a time if it's big).
+    pub fn load_staged(&mut self, seed: u32) -> Result<(), JsError> {
+        let game = match self.take_staged()? {
+            Opened::File(file) => Game::from_file(&file, self.view(), seed),
+            Opened::Chunks { source, meta, .. } => {
+                Game::from_source(source, &meta, self.view(), seed).map_err(js_err)?
+            }
+        };
         self.switch(Mode::Game(Box::new(game)));
         Ok(())
+    }
+
+    /// Start a game on a packed level at `url`, read a piece at a time by
+    /// range requests as it's played. It starts once the first window
+    /// around the spawn has come (see [`App::opening`]).
+    pub fn open_url(&mut self, url: &str, seed: u32) {
+        let bytes = HttpBytes::new(url);
+        self.switch(Mode::Opening(Box::new(Pending::Header { bytes, seed })));
+    }
+
+    /// Start a game on a newly generated world, `cols` x `rows` tiles a
+    /// layer ([`NEW_WORLD`] without them), with generation parameters
+    /// `params` (JSON; any left out, or all without it, take their
+    /// defaults), made a region at a time as it's played: `request(rx,
+    /// ry)` asks for region `(rx, ry)`, which JS has a worker make (with
+    /// [`crate::generated::generate_region`]) and hands to
+    /// [`App::deliver_region`]. It starts once the regions around the
+    /// spawn have come (see [`App::opening`]). The world's size, `[cols,
+    /// rows]`, for asking the workers.
+    pub fn new_generated_game(
+        &mut self,
+        seed: u32,
+        params: Option<String>,
+        cols: Option<usize>,
+        rows: Option<usize>,
+        request: js_sys::Function,
+    ) -> Result<Vec<usize>, JsError> {
+        let params: Params = match params {
+            Some(json) => serde_json::from_str(&json).map_err(js_err)?,
+            None => Params::default(),
+        };
+        let [cols, rows] = [cols.unwrap_or(NEW_WORLD[0]), rows.unwrap_or(NEW_WORLD[1])];
+        let plan = Plan::new(seed, cols, rows, &params);
+        let meta = generated_meta(&plan);
+        meta.check().map_err(js_err)?;
+        let (source, regions) = WorkerSource::new(plan, request);
+        let opening = Opening::new(Rc::new(source), &meta, self.view(), seed);
+        self.regions = Some(regions);
+        self.switch(Mode::Opening(Box::new(Pending::Window(Box::new(opening)))));
+        Ok(vec![cols, rows])
+    }
+
+    /// Region `(rx, ry)` of the world being played, made in a worker and
+    /// packed (see [`App::new_generated_game`]).
+    pub fn deliver_region(&mut self, rx: usize, ry: usize, bytes: &[u8]) -> Result<(), JsError> {
+        let Some(regions) = &self.regions else {
+            return Ok(());
+        };
+        regions
+            .borrow_mut()
+            .deliver([rx, ry], bytes)
+            .map_err(js_err)
+    }
+
+    /// Whether a game is still starting (see [`App::open_url`]).
+    pub fn opening(&self) -> bool {
+        matches!(self.mode, Mode::Opening(_))
+    }
+
+    /// What went wrong starting a game, if anything has since last asked.
+    pub fn take_error(&mut self) -> Option<String> {
+        self.error.take()
     }
 
     /// Start a game on a saved level (see [`LevelFile`]).
@@ -150,6 +249,7 @@ impl App {
             };
             let world = goblin_nightclub_game::new_world(seed, &params);
             self.editor = Some(Editor::from_file(&world, self.view()));
+            self.editor_base = None;
         }
         self.switch(Mode::Editor);
         Ok(())
@@ -175,6 +275,7 @@ impl App {
     pub fn editor_new(&mut self, cols: usize, rows: usize, layers: usize) {
         let blank = goblin_nightclub_generate::template(cols, rows, layers);
         self.editor = Some(Editor::from_file(&blank, self.view()));
+        self.editor_base = None;
         self.switch(Mode::Editor);
     }
 
@@ -182,8 +283,47 @@ impl App {
     pub fn editor_load(&mut self, json: &str) -> Result<(), JsError> {
         let file = LevelFile::from_json(json).map_err(js_err)?;
         self.editor = Some(Editor::from_file(&file, self.view()));
+        self.editor_base = None;
         self.switch(Mode::Editor);
         Ok(())
+    }
+
+    /// Edit the level in the files staged (see [`App::stage`]), small
+    /// enough to edit whole. From a packed level (and any diffs over it),
+    /// a diff over that level can be saved.
+    pub fn editor_load_staged(&mut self) -> Result<(), JsError> {
+        let (file, base) = match self.take_staged()? {
+            Opened::File(file) => (file, None),
+            Opened::Chunks { source, meta, base } => {
+                let file = packed::to_level_file(&meta, source.as_ref()).map_err(js_err)?;
+                (file, Some(base))
+            }
+        };
+        self.editor = Some(Editor::from_file(&file, self.view()));
+        self.editor_base = base;
+        self.switch(Mode::Editor);
+        Ok(())
+    }
+
+    /// The level being edited, packed (see [`packed`]).
+    pub fn editor_save_packed(&self) -> Option<Vec<u8>> {
+        (self.editor.as_ref()).map(|e| packed::pack_file(&e.to_file()))
+    }
+
+    /// Whether the level being edited came from a packed level, so a diff
+    /// over it can be saved.
+    pub fn editor_has_base(&self) -> bool {
+        self.editor_base.is_some()
+    }
+
+    /// What's changed in the level being edited since it came from a
+    /// packed level, as a diff over that level: with it, the diff opens
+    /// as the level edited.
+    pub fn editor_save_diff(&self) -> Result<Vec<u8>, JsError> {
+        let (Some(editor), Some(base)) = (&self.editor, &self.editor_base) else {
+            return Err(js_err("the level wasn't opened from a packed level"));
+        };
+        packed::diff(base.as_ref(), &base.header().id, &editor.to_file()).map_err(js_err)
     }
 
     /// The level being edited, as JSON (see [`LevelFile`]).
@@ -283,8 +423,38 @@ impl App {
         self.last_time = Some(time_ms);
         // Clamp so a backgrounded tab doesn't produce one giant step.
         let dt = dt.min(0.1);
+        let view = self.view();
         match &mut self.mode {
             Mode::Menu => {}
+            Mode::Opening(pending) => match pending.as_mut() {
+                Pending::Header { bytes, seed } => match Packed::open(bytes.clone()) {
+                    Ok(None) => {}
+                    Ok(Some(packed)) => {
+                        let meta = packed.header().level.clone();
+                        let opening = Opening::new(Rc::new(packed), &meta, view, *seed);
+                        **pending = Pending::Window(Box::new(opening));
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        self.mode = Mode::Menu;
+                    }
+                },
+                Pending::Window(opening) => {
+                    if opening.step() {
+                        let Mode::Opening(pending) = std::mem::replace(&mut self.mode, Mode::Menu)
+                        else {
+                            unreachable!()
+                        };
+                        let Pending::Window(opening) = *pending else {
+                            unreachable!()
+                        };
+                        match opening.finish() {
+                            Ok(game) => self.mode = Mode::Game(Box::new(game)),
+                            Err(e) => self.error = Some(e),
+                        }
+                    }
+                }
+            },
             Mode::Game(game) => {
                 game.update(dt);
                 self.renderer.draw(&game.frame());
@@ -313,7 +483,7 @@ impl App {
                     e.input.set(code, true);
                 }
             }
-            Mode::Menu => {}
+            Mode::Menu | Mode::Opening(_) => {}
         }
     }
 
@@ -325,7 +495,7 @@ impl App {
                     e.input.set(code, false);
                 }
             }
-            Mode::Menu => {}
+            Mode::Menu | Mode::Opening(_) => {}
         }
     }
 
@@ -358,7 +528,7 @@ impl App {
                     e.pointer([x, y]);
                 }
             }
-            Mode::Menu => {}
+            Mode::Menu | Mode::Opening(_) => {}
         }
     }
 
@@ -372,7 +542,7 @@ impl App {
                     e.zoom_by(steps, [x, y]);
                 }
             }
-            Mode::Menu => {}
+            Mode::Menu | Mode::Opening(_) => {}
         }
     }
 

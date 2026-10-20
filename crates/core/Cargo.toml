@@ -16,5 +16,6 @@ test-util = []
 [dependencies]
 bytemuck.workspace = true
 indexmap.workspace = true
+miniz_oxide.workspace = true
 serde.workspace = true
 serde_json.workspace = true

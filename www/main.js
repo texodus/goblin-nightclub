@@ -29,23 +29,27 @@ const seed = () => {
     : (Math.random() * 2 ** 32) >>> 0;
 };
 
-// Let the player pick a file; resolves to its text, or null if cancelled.
-function pickFile() {
+// Let the player pick files (a level file, or a packed level and any
+// diffs over it); resolves to their bytes, or null if cancelled.
+function pickFiles() {
   return new Promise((resolve) => {
     fileInput.value = "";
     fileInput.onchange = async () => {
-      const file = fileInput.files[0];
-      resolve(file ? await file.text() : null);
+      const files = [...fileInput.files];
+      if (files.length === 0) return resolve(null);
+      resolve(
+        await Promise.all(
+          files.map(async (f) => new Uint8Array(await f.arrayBuffer())),
+        ),
+      );
     };
     fileInput.oncancel = () => resolve(null);
     fileInput.click();
   });
 }
 
-function download(name, text) {
-  const url = URL.createObjectURL(
-    new Blob([text], { type: "application/json" }),
-  );
+function download(name, data, type = "application/json") {
+  const url = URL.createObjectURL(new Blob([data], { type }));
   const a = Object.assign(document.createElement("a"), {
     href: url,
     download: name,
@@ -137,23 +141,65 @@ async function main() {
     $("#menu-hint").hidden = mode === null;
   };
 
+  // A game starting on a level that comes in pieces (from a server, or
+  // made in workers): its tile sheet once there's a level to have it of,
+  // and back to the menu if it couldn't be had (see the frame loop).
+  let opening = false;
+
+  // A new game: a big generated world, made a region at a time in workers
+  // as it's played, the regions near the spawn first. ?size=<cols>x<rows>
+  // makes another size; generation parameters may be given as JSON, e.g.
+  // ?params={"water_share":0.2,"ramp_spacing":0}; ?seed=<n> makes the same
+  // world every time. A game's requests carry its number, so regions still
+  // coming for an earlier game are dropped.
+  let workers = null;
+  let world = 0;
+  function newGame() {
+    const query = new URLSearchParams(location.search);
+    const asked = /^(\d+)x(\d+)$/.exec(query.get("size") ?? "");
+    // The default size, if none's asked for, is the app's.
+    let [cols, rows] = asked ? [Number(asked[1]), Number(asked[2])] : [];
+    const params = query.get("params") ?? undefined;
+    workers ??= Array.from(
+      { length: Math.max(1, Math.min(4, (navigator.hardwareConcurrency ?? 2) - 1)) },
+      () => {
+        const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+        worker.onmessage = ({ data }) => {
+          if (data.game !== world) return;
+          if (data.error) return warn(`Couldn't make a region: ${data.error}`);
+          try {
+            app.deliver_region(data.rx, data.ry, data.bytes);
+          } catch (err) {
+            warn(`Couldn't take a region: ${err.message ?? err}`);
+          }
+        };
+        return worker;
+      },
+    );
+    const [game, worldSeed] = [++world, seed()];
+    let next = 0;
+    const request = (rx, ry) => {
+      workers[next++ % workers.length].postMessage({
+        game, seed: worldSeed, params, cols, rows, rx, ry,
+      });
+    };
+    try {
+      [cols, rows] = app.new_generated_game(worldSeed, params, cols, rows, request);
+    } catch (err) {
+      warn(`Couldn't make that world: ${err.message ?? err}`);
+      return false;
+    }
+    show("game");
+    opening = true;
+    return true;
+  }
+
   // The start menu.
   menuEl.addEventListener("click", async (e) => {
     switch (e.target.dataset.action) {
-      case "new": {
-        // Generation parameters may be given in the URL as JSON,
-        // e.g. ?params={"water_share":0.2,"ramp_spacing":0}.
-        const params = new URLSearchParams(location.search).get("params");
-        try {
-          if (params) app.new_game_with(seed(), params);
-          else app.new_game(seed());
-        } catch (err) {
-          warn(`Bad generation parameters: ${err.message ?? err}`);
-          return;
-        }
-        show("game");
+      case "new":
+        newGame();
         break;
-      }
       case "editor": {
         // A new world to edit, as for a new game (see above).
         const params = new URLSearchParams(location.search).get("params");
@@ -167,10 +213,11 @@ async function main() {
         break;
       }
       case "load": {
-        const text = await pickFile();
-        if (text === null) return;
+        const files = await pickFiles();
+        if (files === null) return;
         try {
-          app.load_game(text, seed());
+          for (const bytes of files) app.stage(bytes);
+          app.load_staged(seed());
           show("game");
         } catch (err) {
           warn(`Couldn't load that level: ${err.message ?? err}`);
@@ -179,7 +226,19 @@ async function main() {
       }
     }
   });
-  showMenu();
+  // A packed level on a server, read a piece at a time as it's played:
+  // ?level=<url>.
+  // Straight into a game, with ?level=<url> (a packed level on a server,
+  // read a piece at a time as it's played) or ?size=<cols>x<rows> (a new
+  // game's world that size); else the menu.
+  const levelUrl = new URLSearchParams(location.search).get("level");
+  if (levelUrl) {
+    app.open_url(levelUrl, seed());
+    show("game");
+    opening = true;
+  } else if (!new URLSearchParams(location.search).has("size") || !newGame()) {
+    showMenu();
+  }
 
   // The editor's interface: the palette from the level's tileset, tools,
   // shapes, layers. `buildPalette` makes the swatches for the tileset
@@ -230,6 +289,7 @@ async function main() {
   function refreshEditor() {
     const state = JSON.parse(app.editor_state() ?? "null");
     if (!state) return;
+    $('[data-action="save-diff"]').disabled = !app.editor_has_base();
     for (const b of document.querySelectorAll("[data-tool]")) {
       b.classList.toggle("on", b.dataset.tool === state.tool);
     }
@@ -303,10 +363,11 @@ async function main() {
         dialog.showModal();
         return;
       case "open": {
-        const text = await pickFile();
-        if (text === null) return;
+        const files = await pickFiles();
+        if (files === null) return;
         try {
-          app.editor_load(text);
+          for (const bytes of files) app.stage(bytes);
+          app.editor_load_staged();
           shownDepth = 0;
           syncSheet();
           buildPalette();
@@ -317,6 +378,16 @@ async function main() {
       }
       case "save":
         download("level.json", app.editor_save());
+        break;
+      case "save-pack":
+        download("level.pack", app.editor_save_packed(), "application/octet-stream");
+        break;
+      case "save-diff":
+        try {
+          download("level-diff.pack", app.editor_save_diff(), "application/octet-stream");
+        } catch (err) {
+          warn(`Couldn't save a diff: ${err.message ?? err}`);
+        }
         break;
       case "add-layer-above":
         app.editor_add_layer(true);
@@ -436,6 +507,17 @@ async function main() {
 
   const loop = (t) => {
     app.frame(t);
+    // A level from a server: its tile sheet once its header's come, and
+    // back to the menu if it couldn't be had.
+    if (opening) {
+      syncSheet();
+      const error = app.take_error();
+      if (error) {
+        warn(`Couldn't open ${levelUrl ?? "that world"}: ${error}`);
+        showMenu();
+      }
+      if (!app.opening()) opening = false;
+    }
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);

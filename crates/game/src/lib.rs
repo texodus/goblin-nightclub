@@ -1,20 +1,28 @@
 //! Platform-independent game state. Nothing here touches the browser or GPU.
 
+mod stream;
+
+use std::rc::Rc;
+
 use goblin_nightclub_core::camera::{self, Camera};
+use goblin_nightclub_core::chunk::CHUNK;
 use goblin_nightclub_core::draw::Canvas;
 use goblin_nightclub_core::entity::{Entity, EntityId, Kind, PLAYER_SIZE};
 use goblin_nightclub_core::frame::{Frame, LayerFrame};
 pub use goblin_nightclub_core::input::Input;
-use goblin_nightclub_core::layer::{Dir, Solid, TILE};
+use goblin_nightclub_core::layer::{Dir, QUARTERS, Solid, TILE, quarter_at};
 use goblin_nightclub_core::level::Level;
-use goblin_nightclub_core::level_file::LevelFile;
+use goblin_nightclub_core::level_file::{LevelFile, LevelMeta};
 use goblin_nightclub_core::memory::Memory;
 use goblin_nightclub_core::palette;
 use goblin_nightclub_core::path;
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::tileset::{Cell, Tileset};
 use goblin_nightclub_core::vision::Vision;
+use goblin_nightclub_core::world::{Build, ChunkSource, FileSource, Window};
 use goblin_nightclub_generate::Params;
+
+use stream::Stream;
 
 /// The sheet cells the characters are drawn with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,27 +34,39 @@ pub struct Sprites {
 impl Sprites {
     /// The sprites `file` names, from its tileset.
     pub fn from_file(file: &LevelFile) -> Self {
+        Self::from_meta(&file.meta())
+    }
+
+    /// The sprites a level's `meta` names, from its tileset.
+    pub fn from_meta(meta: &LevelMeta) -> Self {
         let cell = |name: &str| {
-            file.tileset
+            meta.tileset
                 .sprite(name)
                 .unwrap_or_else(|| panic!("no sprite {name:?} in the tileset"))
                 .cell
         };
         Self {
-            player: cell(&file.player.sprite),
-            npc: cell(&file.npc.sprite),
+            player: cell(&meta.player.sprite),
+            npc: cell(&meta.npc.sprite),
         }
     }
 }
 
+/// A game on a level, played whole, or a window at a time if it's too big
+/// (see [`goblin_nightclub_core::world`]). Then everything here, positions
+/// and layers alike, is the window's, but for `ground`.
 pub struct Game {
     pub input: Input,
     level: Level,
+    /// For a level played a window at a time: where the window is, the
+    /// next one, and what's kept between them.
+    stream: Option<Stream>,
     sprites: Sprites,
     /// The player's layer.
     top: usize,
     /// The ground level: the lowest layer under the open sky (see
-    /// [`goblin_nightclub_core::level_file::LevelFile::ground`]).
+    /// [`goblin_nightclub_core::level_file::LevelFile::ground`]), in the
+    /// whole level.
     ground: usize,
     /// Per layer: what's visible of it and remembered about it.
     visions: Vec<Vision>,
@@ -86,9 +106,15 @@ const AUTO_PAUSE: bool = true;
 /// Spacing of the dots marking the way a walk has left, in pixels.
 const ROUTE_DOT: f32 = 4.0;
 
-/// Size of a generated level, in tiles.
+/// Size of a generated level made whole ([`new_world`]: the editor's
+/// fresh worlds, and [`Game::new`]), in tiles.
 const LEVEL_COLS: usize = 96;
 const LEVEL_ROWS: usize = 60;
+
+/// Size of a new game's world, in tiles: made a region at a time as it's
+/// played (see [`goblin_nightclub_generate::Plan`]), so it starts as soon
+/// as the regions around the spawn are made, whatever its size.
+pub const NEW_WORLD: [usize; 2] = [4096, 4096];
 
 /// How far the player can see, in pixels, indoors: under a floor or wall
 /// of some layer above. `f32::INFINITY` is unlimited.
@@ -122,6 +148,8 @@ fn view_radius(base: f32, depth: usize, underground: bool) -> f32 {
 
 /// NPCs per layer per 640 tiles of level.
 const NPC_DENSITY: usize = 4;
+/// The same, per chunk of a level played a window at a time.
+const NPC_PER_CHUNK: usize = (NPC_DENSITY * CHUNK * CHUNK).div_ceil(640);
 /// NPCs spawn at least this far (pixels) from the player.
 const NPC_SPAWN_DIST: f32 = 60.0;
 
@@ -145,15 +173,35 @@ impl Game {
     }
 
     /// A game on a level file (generated or saved), the player at its
-    /// spawn, drawn with the sprites it names. It starts paused.
+    /// spawn, drawn with the sprites it names. It starts paused. A level
+    /// too big for one window is played a window at a time.
     pub fn from_file(file: &LevelFile, view: [f32; 2], seed: u32) -> Self {
         let [x, y] = file.spawn.pos;
-        let player = [x - PLAYER_SIZE[0] / 2.0, y - PLAYER_SIZE[1] / 2.0];
         let sprites = Sprites::from_file(file);
-        let mut game =
-            Self::with_level_at(file.level(), file.spawn.layer, player, sprites, view, seed);
-        game.ground = file.ground.min(game.level.depth() - 1);
-        game
+        let (top, size) = (file.spawn.layer, [file.cols, file.rows, file.layers.len()]);
+        let window = Window::around(size, tile_of([x, y]), top);
+        if window.is_whole(size) {
+            let player = [x - PLAYER_SIZE[0] / 2.0, y - PLAYER_SIZE[1] / 2.0];
+            let mut game = Self::with_level_at(file.level(), top, player, sprites, view, seed);
+            game.ground = file.ground.min(game.level.depth() - 1);
+            return game;
+        }
+        let source: Rc<dyn ChunkSource> = Rc::new(FileSource::new(file));
+        Opening::new(source, &file.meta(), view, seed)
+            .finish()
+            .expect("a level file's spawn fits")
+    }
+
+    /// A game on a level of chunks from `source`, `meta` saying the rest:
+    /// played a window at a time, or whole if it fits in one. Its chunks
+    /// must all be ready (see [`Opening`] for a source that may not be).
+    pub fn from_source(
+        source: Rc<dyn ChunkSource>,
+        meta: &LevelMeta,
+        view: [f32; 2],
+        seed: u32,
+    ) -> Result<Self, String> {
+        Opening::new(source, meta, view, seed).finish()
     }
 
     /// A game on `level`, the player at `player` (top-left, pixels) on
@@ -183,6 +231,20 @@ impl Game {
                 npcs.push(npc);
             }
         }
+        Self::assemble(level, top, player, sprites, view, rng, npcs)
+    }
+
+    /// A game on `level`, as [`Game::with_level_at`], with `npcs`, its
+    /// chances from `rng`.
+    fn assemble(
+        level: Level,
+        top: usize,
+        player: [f32; 2],
+        sprites: Sprites,
+        view: [f32; 2],
+        rng: Rng,
+        npcs: Vec<Entity>,
+    ) -> Self {
         let camera = Camera::new(view, level.tileset().zoom());
         let mut game = Self {
             input: Input::default(),
@@ -191,6 +253,7 @@ impl Game {
                 .collect(),
             memories: (0..level.depth()).map(|_| Memory::default()).collect(),
             level,
+            stream: None,
             sprites,
             top,
             ground: 0,
@@ -224,10 +287,98 @@ impl Game {
         self.time += dt;
         self.observe();
         self.check_route();
+        self.advance_stream();
     }
 
+    /// For a level played a window at a time: once the player has moved
+    /// on from the middle of the window, make the next one around them, a
+    /// piece each update, and swap it in when it's made.
+    fn advance_stream(&mut self) {
+        let Some(stream) = &mut self.stream else {
+            return;
+        };
+        let tile = stream.absolute(tile_of(center(self.player, PLAYER_SIZE)));
+        let top = stream.window.base + self.top;
+        let build = match &mut stream.next {
+            Some(build) => build,
+            None => {
+                let want = Window::around(stream.size(), tile, top);
+                if want == stream.window {
+                    return;
+                }
+                stream
+                    .next
+                    .insert(Build::new(stream.source.clone(), want, top))
+            }
+        };
+        if !build.step() {
+            return;
+        }
+        let build = stream.next.take().unwrap();
+        // Unless the player's left it already (and the next is due).
+        let chunk = tile.map(|t| t.div_euclid(CHUNK as i32));
+        if build.window().local((top, chunk[0], chunk[1])).is_some() {
+            self.swap(build);
+        }
+    }
+
+    /// Move the game onto the window `build` makes: everything moves with
+    /// the level under it, and what's kept between windows is kept.
+    fn swap(&mut self, build: Build) {
+        let stream = self.stream.as_mut().unwrap();
+        let (old, new) = (stream.window, build.window());
+        stream.keep(&self.level, &self.visions);
+        stream.sleep(std::mem::take(&mut self.npcs));
+        let (level, roofs) = build.finish();
+        stream.roofs = roofs;
+        let [ox, oy] = old.tile_origin();
+        let [nx, ny] = new.tile_origin();
+        let tiles = [ox - nx, oy - ny];
+        let by = tiles.map(|t| t as f32 * TILE);
+        let shift = |p: [f32; 2]| [p[0] + by[0], p[1] + by[1]];
+        self.player = shift(self.player);
+        self.camera.pos = shift(self.camera.pos);
+        self.top = old.base + self.top - new.base;
+        if let Some(route) = &mut self.route {
+            for t in &mut route.tiles {
+                *t = [t[0] + tiles[0], t[1] + tiles[1]];
+            }
+            for w in &mut route.waypoints {
+                *w = shift(*w);
+            }
+        }
+        // Each layer's memories go with it, if it's still in the window.
+        let size = [new.cols as f32 * TILE, new.rows as f32 * TILE];
+        let mut memories: Vec<Memory> = (0..new.depth).map(|_| Memory::default()).collect();
+        for (k, mut memory) in std::mem::take(&mut self.memories).into_iter().enumerate() {
+            let at = (old.base + k)
+                .checked_sub(new.base)
+                .filter(|&k| k < new.depth);
+            if let Some(k) = at {
+                memory.shift(by, [[0.0; 2], size]);
+                memories[k] = memory;
+            }
+        }
+        self.memories = memories;
+        stream.window = new;
+        self.visions = stream.visions(&level, VIEW_RADIUS);
+        let avoid = center(self.player, PLAYER_SIZE);
+        self.npcs = stream.wake(&level, NPC_PER_CHUNK, avoid, NPC_SPAWN_DIST);
+        self.level = level;
+        self.observed = None;
+        self.observe();
+    }
+
+    /// The ground level, as a layer of the game's level: 0 if it's below
+    /// the window, its depth if it's above.
+    fn local_ground(&self) -> usize {
+        let base = self.stream.as_ref().map_or(0, |s| s.window.base);
+        self.ground.saturating_sub(base).min(self.level.depth())
+    }
+
+    /// The player's layer, in the whole level.
     pub fn layer(&self) -> usize {
-        self.top
+        self.stream.as_ref().map_or(0, |s| s.window.base) + self.top
     }
 
     /// The art the level is drawn with.
@@ -569,12 +720,22 @@ impl Game {
     /// Underground, even a shaft of daylight from above doesn't count.
     pub fn outdoors(&self) -> bool {
         let c = center(self.player, PLAYER_SIZE);
+        if self.top < self.local_ground() {
+            return false;
+        }
+        // Played a window at a time, the layers above it count too.
+        if let Some(stream) = &self.stream {
+            let (tile, quarter) = quarter_at(c);
+            let q = QUARTERS.iter().position(|&b| b == quarter).unwrap();
+            let roof = stream.roofs.at(stream.absolute(tile))[q];
+            return roof as usize <= stream.window.base + self.top + 1;
+        }
         let [x, y] = tile_of(c);
         let open = |k: usize| {
             let layer = self.level.layer(k);
             layer.is_void_at(c) || layer.tile(x, y).stairs().is_some()
         };
-        self.top >= self.ground && (self.top + 1..self.level.depth()).all(open)
+        (self.top + 1..self.level.depth()).all(open)
     }
 
     /// Recompute what the player sees and remembers, on their layer and on
@@ -588,7 +749,7 @@ impl Game {
             VIEW_RADIUS
         };
         // Others moving doesn't change what's seen, only the player does.
-        let key = Some((origin, self.top, base, self.ground));
+        let key = Some((origin, self.top, base, self.local_ground()));
         let moved = self.observed != key;
         self.observed = key;
         let visible = self.level.visible_layers(self.top);
@@ -602,13 +763,14 @@ impl Game {
             let view = self.level.view(self.top, k);
             if moved {
                 let shaft = (k < self.top).then(|| self.level.shaft(self.top, k));
-                let above = (k < self.top).then_some(view);
-                let underground = self.outdoors() && k < self.ground;
+                let above = (k < self.top).then_some(&*view);
+                let underground = self.outdoors() && k < self.local_ground();
                 self.visions[k].set_radius(view_radius(base, self.top - k, underground));
-                self.visions[k].update_through(view, self.level.layer(k), shaft, above, origin);
+                let own = self.level.layer(k);
+                self.visions[k].update_through(&view, own, shaft.as_deref(), above, origin);
             }
             let here = self.npcs.iter().filter(|n| n.layer == k);
-            self.memories[k].update(view, &self.visions[k], here, self.time);
+            self.memories[k].update(&view, &self.visions[k], here, self.time);
         }
     }
 
@@ -667,7 +829,7 @@ impl Game {
                 }
 
                 let meshes = self.level.meshes(k);
-                let shaft = (k < self.top).then(|| self.level.shaft_mesh(self.top, k).clone());
+                let shaft = (k < self.top).then(|| self.level.shaft_mesh(self.top, k));
                 // Characters drawn on this layer cover any void their
                 // sprites overhang: the player, NPCs in view and last
                 // sightings.
@@ -726,8 +888,14 @@ impl Game {
             cell: tileset.cell,
             ui_scale: self.ui_scale(),
             outdoors: self.outdoors(),
-            ground: self.ground,
+            ground: self.local_ground(),
             world: self.world(),
+            offset: self
+                .stream
+                .as_ref()
+                .map_or([0, 0], |s| s.window.tile_origin()),
+            base: self.stream.as_ref().map_or(0, |s| s.window.base),
+            remember: true,
             overlay: self.overlay(),
             ui: self.ui(),
         }
@@ -740,6 +908,78 @@ impl Game {
         match kind {
             Kind::Npc => self.sprites.npc,
         }
+    }
+}
+
+/// A game on a level of chunks, starting: its first window being made, a
+/// piece at a time, so a slow source (a server) needn't hold anything up.
+pub struct Opening {
+    build: Build,
+    source: Rc<dyn ChunkSource>,
+    meta: LevelMeta,
+    view: [f32; 2],
+    seed: u32,
+}
+
+impl Opening {
+    /// Start a game on a level of chunks from `source`, `meta` saying the
+    /// rest, seen through a view of size `view`.
+    pub fn new(source: Rc<dyn ChunkSource>, meta: &LevelMeta, view: [f32; 2], seed: u32) -> Self {
+        let size = [meta.cols, meta.rows, meta.depth];
+        let window = Window::around(size, tile_of(meta.spawn.pos), meta.spawn.layer);
+        Self {
+            build: Build::new(source.clone(), window, meta.spawn.layer),
+            source,
+            meta: meta.clone(),
+            view,
+            seed,
+        }
+    }
+
+    /// Make a piece more of the first window: whether it's all made.
+    pub fn step(&mut self) -> bool {
+        self.build.step()
+    }
+
+    /// The art the level is drawn with.
+    pub fn tileset(&self) -> &Tileset {
+        &self.meta.tileset
+    }
+
+    /// The game: once [`Opening::step`] says all's made, or right away for
+    /// a source with every chunk ready. A level played whole is as if from
+    /// a level file. Fails if the player doesn't fit at the spawn.
+    pub fn finish(self) -> Result<Game, String> {
+        let meta = &self.meta;
+        let size = [meta.cols, meta.rows, meta.depth];
+        let window = self.build.window();
+        let (level, roofs) = self.build.finish();
+        let o = window.tile_origin().map(|t| t as f32 * TILE);
+        let [x, y] = meta.spawn.pos;
+        let player = [
+            x - o[0] - PLAYER_SIZE[0] / 2.0,
+            y - o[1] - PLAYER_SIZE[1] / 2.0,
+        ];
+        let top = meta.spawn.layer - window.base;
+        if level.movement(top).collides(player, PLAYER_SIZE) {
+            return Err("the player doesn't fit at the spawn".into());
+        }
+        let sprites = Sprites::from_meta(meta);
+        if window.is_whole(size) {
+            let mut game = Game::with_level_at(level, top, player, sprites, self.view, self.seed);
+            game.ground = meta.ground.min(size[2] - 1);
+            return Ok(game);
+        }
+        let mut stream = Stream::new(self.source, window, roofs, self.seed);
+        let avoid = center(player, PLAYER_SIZE);
+        let npcs = stream.wake(&level, NPC_PER_CHUNK, avoid, NPC_SPAWN_DIST);
+        let rng = Rng::new(self.seed ^ 0x9E37_79B9);
+        let mut game = Game::assemble(level, top, player, sprites, self.view, rng, npcs);
+        game.stream = Some(stream);
+        game.ground = meta.ground.min(size[2] - 1);
+        game.observed = None;
+        game.observe();
+        Ok(game)
     }
 }
 
@@ -757,6 +997,7 @@ mod tests {
     use goblin_nightclub_core::layer::Layer;
     use goblin_nightclub_core::layer::Tile;
     use goblin_nightclub_core::level_file::Spawn;
+    use std::sync::Arc;
 
     const VIEW: [f32; 2] = [320.0, 200.0];
     /// The test tileset's default zoom: 16-pixel cells over 10-unit tiles.
@@ -817,6 +1058,263 @@ mod tests {
 
     fn player_tile(game: &Game) -> [i32; 2] {
         tile_of(center(game.player, PLAYER_SIZE))
+    }
+
+    /// A level too big for one window, `depth` layers of floor: here and
+    /// there walls (away from row `ROW`, kept clear to walk along), holes
+    /// in the layers above the spawn's (three from the top, so mostly
+    /// indoors, but not everywhere), and stairs down two tiles east of the
+    /// spawn on every layer but the bottom.
+    fn big_file(cols: usize, rows: usize, depth: usize) -> LevelFile {
+        const ROW: usize = 60;
+        let spawn = [20, ROW as i32];
+        let top = depth - 3;
+        let layers: Vec<Vec<Tile>> = (0..depth)
+            .map(|k| {
+                (0..cols * rows)
+                    .map(|i| {
+                        let (x, y) = (i % cols, i / cols);
+                        let clear = y.abs_diff(ROW) <= 2;
+                        if k > 0 && [x as i32, y as i32] == [spawn[0] + 2, spawn[1]] {
+                            Tile::Stairs(Dir::Down, 0)
+                        } else if !clear && x % 37 == 0 && y % 5 == 0 {
+                            Tile::WALL
+                        } else if k > top && (x / 5 + y / 3) % 4 == 0 {
+                            Tile::VOID
+                        } else {
+                            Tile::FLOOR
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        LevelFile::new(
+            cols,
+            rows,
+            &layers,
+            Spawn::at_tile(top, spawn),
+            tileset(),
+            "player",
+            "npc",
+        )
+    }
+
+    /// Where the player's center is in the whole level, and their layer.
+    fn whereabouts(game: &Game) -> ([f32; 2], usize) {
+        let s = game.stream.as_ref().unwrap();
+        let o = s.window.tile_origin();
+        let c = center(game.player, PLAYER_SIZE);
+        (
+            [c[0] + o[0] as f32 * TILE, c[1] + o[1] as f32 * TILE],
+            game.layer(),
+        )
+    }
+
+    /// Walk to `p` (a point in the whole level) on the player's layer, and
+    /// on until paused, checking the player moves smoothly, windows and
+    /// all, and `each` frame whatever else: how many times the window
+    /// moved.
+    fn walk_far(game: &mut Game, p: [f32; 2], each: &mut dyn FnMut(&Game)) -> usize {
+        let o = game.stream.as_ref().unwrap().window.tile_origin();
+        game.walk_to([p[0] - o[0] as f32 * TILE, p[1] - o[1] as f32 * TILE]);
+        let (mut was, mut moves) = (whereabouts(game).0, 0);
+        let mut window = game.stream.as_ref().unwrap().window;
+        for _ in 0..4000 {
+            if game.paused {
+                break;
+            }
+            game.update(1.0 / 60.0);
+            let (now, _) = whereabouts(game);
+            let step = goblin_nightclub_core::length([now[0] - was[0], now[1] - was[1]]);
+            assert!(
+                step <= PLAYER_SPEED / 60.0 + 0.6,
+                "jumped {step} to {now:?}"
+            );
+            was = now;
+            let w = game.stream.as_ref().unwrap().window;
+            if w != window {
+                moves += 1;
+                window = w;
+            }
+            each(game);
+        }
+        assert!(game.paused, "arrived");
+        moves
+    }
+
+    #[test]
+    fn packed_levels_play_as_their_files_do() {
+        use goblin_nightclub_core::packed::{Packed, pack_file};
+        for file in [big_file(300, 120, 12), new_world(3, &Params::default())] {
+            let packed = Packed::open(Arc::<[u8]>::from(pack_file(&file)))
+                .unwrap()
+                .unwrap();
+            let meta = packed.header().level.clone();
+            let from_pack = Game::from_source(Rc::new(packed), &meta, VIEW, 1).unwrap();
+            let from_file = Game::from_file(&file, VIEW, 1);
+            assert_eq!(from_pack.stream.is_some(), from_file.stream.is_some());
+            assert_eq!(
+                (from_pack.player, from_pack.top),
+                (from_file.player, from_file.top)
+            );
+            assert_eq!(from_pack.npcs.len(), from_file.npcs.len());
+            let at = |g: &Game| g.npcs.iter().map(|n| n.pos).collect::<Vec<_>>();
+            assert_eq!(at(&from_pack), at(&from_file), "the same NPCs");
+            assert_eq!(from_pack.outdoors(), from_file.outdoors());
+        }
+    }
+
+    #[test]
+    fn openings_wait_for_a_slow_source() {
+        use goblin_nightclub_core::chunk::{Chunk, ChunkKey};
+        use goblin_nightclub_core::world::Roof;
+        /// Each chunk and roof ready from the second time it's asked for.
+        struct Slow(
+            FileSource,
+            std::sync::Mutex<std::collections::HashSet<(usize, i32, i32)>>,
+        );
+        impl Slow {
+            fn asked(&self, key: (usize, i32, i32)) -> bool {
+                !self.1.lock().unwrap().insert(key)
+            }
+        }
+        impl ChunkSource for Slow {
+            fn size(&self) -> [usize; 3] {
+                self.0.size()
+            }
+            fn tileset(&self) -> &Tileset {
+                self.0.tileset()
+            }
+            fn chunk(&self, key: ChunkKey) -> Option<Arc<Chunk>> {
+                self.asked(key).then(|| self.0.chunk(key)).flatten()
+            }
+            fn roof(&self, cx: i32, cy: i32) -> Option<Roof> {
+                self.asked((usize::MAX, cx, cy))
+                    .then(|| self.0.roof(cx, cy))
+                    .flatten()
+            }
+        }
+        let file = big_file(300, 120, 12);
+        let slow = Rc::new(Slow(FileSource::new(&file), Default::default()));
+        let mut opening = Opening::new(slow, &file.meta(), VIEW, 1);
+        let mut steps = 1;
+        while !opening.step() {
+            steps += 1;
+        }
+        assert!(steps > 12, "waited, a layer at a time: {steps}");
+        let game = opening.finish().unwrap();
+        assert_eq!(game.player, Game::from_file(&file, VIEW, 1).player);
+    }
+
+    #[test]
+    fn generated_worlds_start_from_their_regions() {
+        use goblin_nightclub_generate::{Generated, Plan, generated_meta};
+        // Small enough to play whole, but made a region at a time.
+        let params = Params {
+            underworld_layers: 3,
+            ..Params::default()
+        };
+        let plan = Plan::new(4, 192, 128, &params).with_region(64);
+        let meta = generated_meta(&plan);
+        let game = Game::from_source(Rc::new(Generated::new(plan)), &meta, VIEW, 4).unwrap();
+        assert!(game.stream.is_none());
+        assert_eq!(game.layer(), meta.spawn.layer);
+        assert!(game.outdoors(), "the spawn's on the plains");
+        assert!(!game.frame().layers.is_empty());
+    }
+
+    #[test]
+    fn small_levels_are_played_whole() {
+        let params = Params {
+            underworld_layers: 3,
+            ..Params::default()
+        };
+        let file = new_world(3, &params);
+        assert!(Game::from_file(&file, VIEW, 3).stream.is_none());
+    }
+
+    #[test]
+    fn big_levels_are_played_a_window_at_a_time() {
+        let file = big_file(300, 120, 12);
+        let whole = file.level();
+        let mut game = Game::from_file(&file, VIEW, 1);
+        let start = whereabouts(&game).0;
+        let w = game.stream.as_ref().expect("too big to play whole").window;
+        assert!(w.cols < 300 && w.depth < 12);
+        // The ground level is the bottom: outdoors only under holes all the
+        // way up, as the whole level has it.
+        let outdoors = |game: &Game| {
+            let (p, top) = whereabouts(game);
+            let [x, y] = tile_of(p);
+            let open = |k: usize| {
+                let layer = whole.layer(k);
+                layer.is_void_at(p) || layer.tile(x, y).stairs().is_some()
+            };
+            (top + 1..12).all(open)
+        };
+        assert_eq!(game.outdoors(), outdoors(&game));
+        // East along the clear row, out of sight of the start.
+        let mut moves = 0;
+        let mut was_outdoors = std::collections::HashSet::new();
+        let mut check = |game: &Game| {
+            assert_eq!(
+                game.outdoors(),
+                outdoors(game),
+                "at {:?}",
+                whereabouts(game)
+            );
+            was_outdoors.insert(game.outdoors());
+        };
+        for leg in 1..=4 {
+            moves += walk_far(
+                &mut game,
+                [start[0] + leg as f32 * 450.0, start[1]],
+                &mut check,
+            );
+            let ids: std::collections::HashSet<_> = game.npcs.iter().map(|n| n.id).collect();
+            assert_eq!(ids.len(), game.npcs.len(), "NPCs are each awake once");
+            assert!(game.npcs.iter().all(|n| n.layer < game.level.depth()));
+        }
+        assert!(moves >= 2, "the window moved on: {moves}");
+        assert_eq!(was_outdoors.len(), 2, "in and out");
+        assert!(whereabouts(&game).0[0] > start[0] + 1700.0);
+        // Back to the start: what was explored there still is.
+        let mut back = 0;
+        for leg in (0..4).rev() {
+            back += walk_far(
+                &mut game,
+                [start[0] + leg as f32 * 450.0, start[1]],
+                &mut |_| {},
+            );
+        }
+        assert!(back >= 2);
+        let s = game.stream.as_ref().unwrap();
+        let o = s.window.tile_origin();
+        let k = game.top;
+        let explored = |dx: i32| {
+            let t = [tile_of(start)[0] + dx - o[0], tile_of(start)[1] - o[1]];
+            game.visions[k].is_explored(t[0] as usize, t[1] as usize)
+        };
+        assert!((-3..=3).all(explored), "around the start");
+    }
+
+    #[test]
+    fn going_down_moves_the_window_down() {
+        let file = big_file(300, 120, 14);
+        let mut game = Game::from_file(&file, VIEW, 1);
+        let (start, top) = whereabouts(&game);
+        assert_eq!(top, 11);
+        let base = game.stream.as_ref().unwrap().window.base;
+        // Onto the stairs, off them and back on, layer after layer.
+        for down in 1..=6 {
+            walk_far(&mut game, [start[0] + 2.0 * TILE, start[1]], &mut |_| {});
+            assert_eq!(whereabouts(&game).1, 11 - down);
+            walk_far(&mut game, [start[0] + TILE, start[1]], &mut |_| {});
+        }
+        let s = game.stream.as_ref().unwrap();
+        assert!(s.window.base < base, "{} from {base}", s.window.base);
+        assert!(game.top < game.level.depth());
+        assert_eq!(game.layer(), s.window.base + game.top);
     }
 
     #[test]

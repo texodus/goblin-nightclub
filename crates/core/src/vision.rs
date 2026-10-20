@@ -6,7 +6,7 @@
 use std::f32::consts::TAU;
 
 use crate::draw::inward_normal;
-use crate::layer::{Layer, Line, Shape, TILE};
+use crate::layer::{Edge, Layer, Line, Shape, TILE};
 
 /// Minimum angular offset of the extra rays cast to either side of each
 /// corner, sampling the boundary just before and just after it.
@@ -357,6 +357,41 @@ impl Vision {
     /// Has any part of tile `(x, y)` ever been visible?
     pub fn is_explored(&self, x: usize, y: usize) -> bool {
         self.explored[y * self.cols + x]
+    }
+
+    /// The tiles ever visible, to keep when the layer is made again (as
+    /// another window onto a bigger level).
+    pub fn explored_tiles(&self) -> impl Iterator<Item = [usize; 2]> + '_ {
+        let cols = self.cols;
+        (self.explored.iter().enumerate())
+            .filter(|(_, e)| **e)
+            .map(move |(i, _)| [i % cols, i / cols])
+    }
+
+    /// The outline edges of `level` (the layer it was made for) ever seen,
+    /// likewise.
+    pub fn seen_edges<'a>(&'a self, level: &'a Layer) -> impl Iterator<Item = &'a Edge> + 'a {
+        (level.outline_edges().iter().zip(&self.edge_seen))
+            .filter(|(_, seen)| **seen)
+            .map(|(e, _)| e)
+    }
+
+    /// Remember as explored each tile `(x, y)` that `explored` says, and
+    /// as seen each of `level`'s edges (the layer it was made for) that
+    /// `seen` says: what was, before the layer was made again.
+    pub fn remember(
+        &mut self,
+        level: &Layer,
+        explored: impl Fn(usize, usize) -> bool,
+        seen: impl Fn(&Edge) -> bool,
+    ) {
+        let cols = self.cols;
+        for (i, e) in self.explored.iter_mut().enumerate() {
+            *e |= explored(i % cols, i / cols);
+        }
+        for (e, s) in level.outline_edges().iter().zip(&mut self.edge_seen) {
+            *s |= seen(e);
+        }
     }
 
     fn rebuild_polygon(&mut self, level: &Layer) {

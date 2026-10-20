@@ -101,7 +101,7 @@ impl Camera {
     /// world point under `p` (view pixels) where it is.
     pub fn zoom_by(&mut self, steps: i32, p: [f32; 2]) {
         let anchor = self.to_world(p);
-        let min = 1.0 / self.ui_scale();
+        let min = 1.0 / (self.ui_scale());
         self.zoom_factor = (self.zoom_factor * ZOOM_STEP.powi(steps)).clamp(min, ZOOM_MAX);
         let zoom = self.zoom();
         self.pos = [anchor[0] - p[0] / zoom, anchor[1] - p[1] / zoom];

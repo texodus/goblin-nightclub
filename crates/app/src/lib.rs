@@ -7,7 +7,14 @@
 #[cfg(target_arch = "wasm32")]
 mod app;
 #[cfg(target_arch = "wasm32")]
+mod generated;
+#[cfg(target_arch = "wasm32")]
+mod http;
+#[cfg(target_arch = "wasm32")]
 mod renderer;
+// Used only by the renderer, but tested natively.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod pages;
 
 #[cfg(test)]
 mod shader_tests {

@@ -15,7 +15,7 @@ struct Params {
     time: f32,
     // The viewer's layer.
     top: u32,
-    // Bit per layer: drawn this frame.
+    // Bit per slot (layers down from the viewer's): drawn this frame.
     present: u32,
     // Scale of each layer relative to the one above (parallax).
     scale: f32,
@@ -34,18 +34,35 @@ struct Params {
     ground: u32,
     // Layers below `ground` are seen this fraction as far.
     radius_underground: f32,
+    // Edge of a page of `seen`, in its pixels.
+    page_px: f32,
+    _pad: f32,
+    // Where world point (0, 0) is in the whole level (for a level drawn a
+    // window at a time), so patterns pinned to the world stay put.
+    offset: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
-// Per layer `a`, in view space (already moved and scaled for parallax):
-// visible, remembered and unknown canvases at 3a, 3a + 1, 3a + 2; the
+// Each layer drawn goes in a slot: its depth below the viewer's, `s` (0
+// for the viewer's own).
+// Per slot `s`, in view space (already moved and scaled for parallax):
+// visible, remembered and unknown canvases at 3s, 3s + 1, 3s + 2; the
 // `now` mask; and where it's void, showing the layer below.
 @group(0) @binding(1) var canvases: texture_2d_array<f32>;
 @group(0) @binding(2) var mask_now: texture_2d_array<f32>;
-// Per layer, in world space at `seen_zoom` pixels a unit: everywhere ever
-// seen.
+// Everywhere ever seen, in world space at `seen_zoom` pixels a unit, cut
+// into pages `page_px` pixels square; each page in its own layer of the
+// array, if anything on it has been seen.
 @group(0) @binding(3) var mask_seen: texture_2d_array<f32>;
 @group(0) @binding(4) var voids: texture_2d_array<f32>;
+// Where each slot's pages in view are: per slot `s`, at 8s, the page
+// column and row (as i32) of the top-left of a window of pages, its
+// columns and rows, and where its entries start in this same array; each
+// entry, row by row, the page's layer in `mask_seen`, or NO_PAGE.
+@group(0) @binding(5) var<storage, read> pages: array<u32>;
+
+// A page nothing on which has been seen.
+const NO_PAGE: u32 = 0xffffffffu;
 
 // Width (world units) of the band inside the radius where the visible style
 // fades into the remembered one.
@@ -117,7 +134,7 @@ fn value_noise(p: vec2<f32>) -> f32 {
 // hole, drawn at each sheet's own parallax, its copies line up at the
 // view's center and part toward the edges, which shows the depth.
 fn mist_density(world: vec2<f32>, variation: f32, contrast: f32) -> f32 {
-    let p = floor(world * params.seen_zoom) / params.seen_zoom;
+    let p = floor((world + params.offset) * params.seen_zoom) / params.seen_zoom;
     var q = (p + MIST_DRIFT * params.time) / MIST_SCALE;
     // Warped a little, and each octave turned, so no grid shows.
     q += 0.6 * vec2(value_noise(q * 0.8 + 3.1), value_noise(q * 0.8 + 7.9)) - 0.3;
@@ -196,29 +213,38 @@ fn style_unknown(c: vec4<f32>, world: vec2<f32>) -> vec3<f32> {
     return c.rgb + fog * (1.0 - c.a);
 }
 
-// Layer `a`'s `seen` at world point `world` (0 outside the level).
-fn seen_at(a: u32, world: vec2<f32>) -> f32 {
-    let level = world * params.seen_zoom;
-    let size = vec2<f32>(textureDimensions(mask_seen));
-    if all(level >= vec2(0.0)) && all(level < size) {
-        return textureLoad(mask_seen, vec2<i32>(level), a, 0).r;
+// Slot `s`'s `seen` at world point `world`: 0 on a page nothing on which
+// has been seen, and outside its window (and so outside the level).
+fn seen_at(s: u32, world: vec2<f32>) -> f32 {
+    let at = world * params.seen_zoom;
+    let page = vec2<i32>(floor(at / params.page_px));
+    let window = 8u * s;
+    let corner = vec2(bitcast<i32>(pages[window]), bitcast<i32>(pages[window + 1u]));
+    let size = vec2(pages[window + 2u], pages[window + 3u]);
+    let rel = page - corner;
+    if any(rel < vec2(0)) || any(vec2<u32>(rel) >= size) {
+        return 0.0;
     }
-    return 0.0;
+    let layer = pages[pages[window + 4u] + u32(rel.y) * size.x + u32(rel.x)];
+    if layer == NO_PAGE {
+        return 0.0;
+    }
+    let inside = vec2<i32>(at - vec2<f32>(page) * params.page_px);
+    return textureLoad(mask_seen, inside, layer, 0).r;
 }
 
-// How much layer `a` at view pixel `px` and world point `world` is
-// visible now, and has been seen, with view `radius` and `through` as for
-// `shade`.
-fn knowledge(a: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec2<f32> {
-    var now = textureLoad(mask_now, px, a, 0).r;
+// How much slot `s` at view pixel `px` and world point `world` is visible
+// now, and has been seen, with view `radius` and `through` as for `shade`.
+fn knowledge(s: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec2<f32> {
+    var now = textureLoad(mask_now, px, s, 0).r;
     if radius > 0.0 {
         let dist = distance(world, params.origin);
         now *= 1.0 - smoothstep(radius - RADIUS_FADE, radius, dist);
     }
-    return vec2(now, max(seen_at(a, world), through));
+    return vec2(now, max(seen_at(s, world), through));
 }
 
-// Layer `a` at view pixel `px` and world point `world`, styled by its
+// Slot `s` at view pixel `px` and world point `world`, styled by its
 // masks, with view `radius` (0 for unlimited). `through` is how much the
 // hole this pixel looks down has been seen: a lower layer is remembered
 // where it has been seen itself, or where the hole showing it has (the
@@ -226,18 +252,18 @@ fn knowledge(a: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32)
 // the hole, but lie under the layers above, so never in its own `seen`).
 // The canvases hold premultiplied color (drawn over transparent black), so
 // the result is too; water is the translucent case.
-fn shade(a: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec3<f32> {
+fn shade(s: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec3<f32> {
     let dist = distance(world, params.origin);
-    let known = knowledge(a, px, world, radius, through);
+    let known = knowledge(s, px, world, radius, through);
     let now = known.x;
     let seen = known.y;
-    let visible = style_visible(textureLoad(canvases, px, 3u * a, 0).rgb, dist, radius);
+    let visible = style_visible(textureLoad(canvases, px, 3u * s, 0).rgb, dist, radius);
     // Pixel of the art, wrapped to the dither pattern (it can be negative
     // beyond the level's edge on lower layers).
     let dots = vec2<i32>(floor(world * params.seen_zoom));
     let cell = vec2<u32>(((dots % 4) + 4) % 4);
-    let remembered = style_remembered(textureLoad(canvases, px, 3u * a + 1u, 0).rgb, cell);
-    let unknown = style_unknown(textureLoad(canvases, px, 3u * a + 2u, 0), world);
+    let remembered = style_remembered(textureLoad(canvases, px, 3u * s + 1u, 0).rgb, cell);
+    let unknown = style_unknown(textureLoad(canvases, px, 3u * s + 2u, 0), world);
     return mix(mix(unknown, remembered, seen), visible, now);
 }
 
@@ -261,33 +287,33 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var bedrock = vec3(0.0);
     for (var d = 0u; d <= params.top; d++) {
         let a = params.top - d;
-        if ((params.present >> a) & 1u) == 0u {
+        if ((params.present >> d) & 1u) == 0u {
             break;
         }
         let world = params.camera + (center + (frag.xy - center) / scale) / params.zoom;
-        let mask = textureLoad(voids, px, a, 0).r;
+        let mask = textureLoad(voids, px, d, 0).r;
         let below = select(0.0, through, d > 0u);
         let radius = radius_at(a, d);
         if mask <= 0.25 {
-            color += shade(a, px, world, radius, below) * remaining;
+            color += shade(d, px, world, radius, below) * remaining;
             return vec4(color, 1.0);
         }
-        let known = knowledge(a, px, world, radius, below);
+        let known = knowledge(d, px, world, radius, below);
         let unknown = (1.0 - known.x) * (1.0 - known.y);
-        bedrock = style_unknown(textureLoad(canvases, px, 3u * a + 2u, 0), world) * unknown;
+        bedrock = style_unknown(textureLoad(canvases, px, 3u * d + 2u, 0), world) * unknown;
         if mask < 0.75 {
             // Water: its styled (premultiplied) color over what's below.
             // Where it's never been seen, the unknown style is opaque, so
             // nothing beneath shows through that part.
-            let alpha = textureLoad(canvases, px, 3u * a, 0).a;
-            color += shade(a, px, world, radius, below) * remaining;
+            let alpha = textureLoad(canvases, px, 3u * d, 0).a;
+            color += shade(d, px, world, radius, below) * remaining;
             remaining *= (1.0 - alpha) * (1.0 - unknown);
         }
-        through = min(through, seen_at(a, world));
+        through = min(through, seen_at(d, world));
         // The mist down this hole, onto the next layer: there only where
         // the hole is known, in the remembered style's gray where it isn't
         // in view.
-        if a > 0u && ((params.present >> (a - 1u)) & 1u) != 0u {
+        if ((params.present >> (d + 1u)) & 1u) != 0u {
             let sheet = scale * sqrt(params.scale);
             let at = params.camera + (center + (frag.xy - center) / sheet) / params.zoom;
             let light = params.outdoors > 0.5 && a - 1u >= params.ground;

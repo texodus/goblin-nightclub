@@ -9,6 +9,7 @@
 //! random tile soups, invariant checks) for other crates' tests.
 
 pub mod camera;
+pub mod chunk;
 pub mod draw;
 pub mod entity;
 pub mod frame;
@@ -19,11 +20,13 @@ pub mod level;
 pub mod level_file;
 pub mod memory;
 pub mod mesh;
+pub mod packed;
 pub mod palette;
 pub mod path;
 pub mod rng;
 pub mod tileset;
 pub mod vision;
+pub mod world;
 
 /// The screen the interface is laid out for, and the view shows about as
 /// much of the level as: the real screen (the canvas at its own

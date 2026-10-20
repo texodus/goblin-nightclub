@@ -61,6 +61,58 @@ impl Spawn {
     }
 }
 
+/// Everything about a level but its tiles: what a packed level's header
+/// holds (see [`crate::packed`]), and what a game on a level of chunks
+/// starts from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LevelMeta {
+    pub cols: usize,
+    pub rows: usize,
+    /// Layers.
+    pub depth: usize,
+    pub spawn: Spawn,
+    #[serde(default)]
+    pub ground: usize,
+    pub player: Character,
+    pub npc: Character,
+    pub tileset: Tileset,
+}
+
+/// Tiles across or down a level of chunks may have: a bound on what a
+/// file may ask for.
+pub const MAX_SIDE: usize = 1 << 20;
+
+impl LevelMeta {
+    /// Check what can be without the tiles (that the player fits at the
+    /// spawn can't).
+    pub fn check(&self) -> Result<(), String> {
+        if self.depth == 0 || self.depth > MAX_LAYERS {
+            return Err(format!("a level has 1 to {MAX_LAYERS} layers"));
+        }
+        if !(1..=MAX_SIDE).contains(&self.cols) || !(1..=MAX_SIDE).contains(&self.rows) {
+            return Err(format!("a level is 1 to {MAX_SIDE} tiles across and down"));
+        }
+        let [x, y] = self.spawn.pos;
+        let inside = (0.0..self.cols as f32 * TILE).contains(&x)
+            && (0.0..self.rows as f32 * TILE).contains(&y);
+        if self.spawn.layer >= self.depth || !inside {
+            return Err("the spawn is outside the level".into());
+        }
+        if self.ground >= self.depth {
+            return Err("the ground level is above the level's top".into());
+        }
+        for (who, c) in [("player", &self.player), ("npc", &self.npc)] {
+            if self.tileset.sprite(&c.sprite).is_none() {
+                return Err(format!(
+                    "the {who}'s sprite {:?} isn't in the tileset",
+                    c.sprite
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// How a kind of character is drawn.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Character {
@@ -242,6 +294,39 @@ impl LevelFile {
             tileset: raw.tileset,
             layers,
         })
+    }
+
+    /// Everything about it but its tiles.
+    pub fn meta(&self) -> LevelMeta {
+        LevelMeta {
+            cols: self.cols,
+            rows: self.rows,
+            depth: self.layers.len(),
+            spawn: self.spawn,
+            ground: self.ground,
+            player: self.player.clone(),
+            npc: self.npc.clone(),
+            tileset: self.tileset.clone(),
+        }
+    }
+
+    /// A level from `meta` and its tiles: each layer's, row by row.
+    pub fn from_meta(meta: LevelMeta, tiles: Vec<Vec<Tile>>) -> Self {
+        assert_eq!(tiles.len(), meta.depth);
+        Self {
+            format: FORMAT,
+            cols: meta.cols,
+            rows: meta.rows,
+            spawn: meta.spawn,
+            ground: meta.ground,
+            player: meta.player,
+            npc: meta.npc,
+            tileset: meta.tileset,
+            layers: tiles
+                .into_iter()
+                .map(|t| t.chunks(meta.cols).map(<[Tile]>::to_vec).collect())
+                .collect(),
+        }
     }
 
     /// Each layer's tiles, row by row.

@@ -7,6 +7,10 @@
 //!    space into `seen`, never cleared, so it accumulates everything seen
 //!    (for a layer below the viewer's, only where it shows through).
 //!
+//! Layers drawn go in slots by how far below the viewer's they are, so
+//! what's kept per layer is bounded by [`MAX_VISIBLE`], not the level's
+//! depth.
+//!
 //! What only changes with the level's tiles (each layer's tile art, voids,
 //! liquid and shafts) comes as meshes, kept on the GPU while they last;
 //! of those drawn through the camera, only the chunks in view are drawn.
@@ -14,22 +18,29 @@
 //! Then it composites to the screen, from the viewer's layer down through
 //! void (and the mist hanging between the layers), styling each pixel by
 //! its layer's masks, and draws the overlay (world space, on the viewer's
-//! layer) and the interface (view space) on top. `seen` is kept in world space so it survives camera moves, zooming
-//! and the viewer changing layers; it's sized to the level on the first
-//! frame. Everything else is sized to the screen, at its own resolution,
-//! and made again when that changes.
+//! layer) and the interface (view space) on top. `seen` is kept in world
+//! space so it survives camera moves, zooming and the viewer changing
+//! layers, in pages a chunk of the level each, only those seen and only
+//! while in use (see [`crate::pages`]). Everything else is sized to the
+//! screen, at its own resolution, and made again when that changes.
 
 use wasm_bindgen::JsError;
 use web_sys::HtmlCanvasElement;
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 
 use wgpu::util::DeviceExt;
 
+use crate::pages::{Op, Page, Pages};
+use goblin_nightclub_core::camera::Rect;
+use goblin_nightclub_core::chunk::CHUNK;
 use goblin_nightclub_core::draw::Vertex;
-use goblin_nightclub_core::frame::Frame;
+use goblin_nightclub_core::frame::{Frame, LayerFrame};
 use goblin_nightclub_core::layer::TILE;
-use goblin_nightclub_core::level::MAX_LAYERS;
+use goblin_nightclub_core::level::MAX_VISIBLE;
 use goblin_nightclub_core::mesh::Mesh;
 use goblin_nightclub_core::tileset::Sheet;
 
@@ -38,6 +49,19 @@ const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// MSAA sample count for the `now` masks, which anti-aliases their edges.
 /// 1 gives hard pixel edges.
 const MASK_SAMPLES: u32 = 4;
+
+/// Pages of `seen` the atlas starts with room for, and the most it grows to
+/// (if the device allows).
+const PAGES_FIRST: u32 = 16;
+const PAGES_MAX: u32 = 256;
+
+/// Marks a page in the page table nothing on which has been seen; mirrors
+/// `NO_PAGE` in composite.wgsl.
+const NO_PAGE: u32 = u32::MAX;
+
+/// Words per slot at the head of the page table (see `pages` in
+/// composite.wgsl).
+const TABLE_HEAD: usize = 8;
 
 /// Mirrors `Globals` in shapes.wgsl: how world positions land on a target.
 #[repr(C)]
@@ -49,7 +73,9 @@ struct Transform {
     scale: f32,
     zoom: f32,
     cell: f32,
-    _pad: [f32; 3],
+    _pad: f32,
+    /// Where world point (0, 0) is in the whole level.
+    offset: [f32; 2],
 }
 
 /// Mirrors `Params` in composite.wgsl.
@@ -77,6 +103,11 @@ struct CompositeParams {
     ground: u32,
     /// Layers below `ground` are seen this fraction as far.
     radius_underground: f32,
+    /// Edge of a page of `seen`, in its pixels.
+    page_px: f32,
+    _pad: f32,
+    /// Where world point (0, 0) is in the whole level.
+    offset: [f32; 2],
 }
 
 /// A vertex buffer that grows (to the next power of two) as needed.
@@ -111,21 +142,26 @@ impl GrowBuffer {
         })
     }
 
-    fn write(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8]) {
+    /// Write `data` from the start, growing first if need be: whether it
+    /// grew (so anything bound to the old buffer must be bound again).
+    fn write(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8]) -> bool {
         if data.is_empty() {
-            return;
+            return false;
         }
         let len = data.len() as u64;
-        if len > self.buffer.size() {
+        let grow = len > self.buffer.size();
+        if grow {
             self.buffer = Self::alloc(device, self.label, self.usage, len.next_power_of_two());
         }
         queue.write_buffer(&self.buffer, 0, data);
+        grow
     }
 }
 
 /// A 2D array texture: one view of the whole array to read from, and one
 /// view per layer to draw into.
 struct ArrayTexture {
+    texture: wgpu::Texture,
     whole: wgpu::TextureView,
     layers: Vec<wgpu::TextureView>,
 }
@@ -138,6 +174,25 @@ impl ArrayTexture {
         layers: u32,
         format: wgpu::TextureFormat,
     ) -> Self {
+        Self::with_usage(
+            device,
+            label,
+            size,
+            layers,
+            format,
+            wgpu::TextureUsages::empty(),
+        )
+    }
+
+    /// Also usable as `usage`.
+    fn with_usage(
+        device: &wgpu::Device,
+        label: &str,
+        size: [u32; 2],
+        layers: u32,
+        format: wgpu::TextureFormat,
+        usage: wgpu::TextureUsages,
+    ) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -149,7 +204,9 @@ impl ArrayTexture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | usage,
             view_formats: &[],
         });
         let whole = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -166,7 +223,11 @@ impl ArrayTexture {
                 })
             })
             .collect();
-        Self { whole, layers }
+        Self {
+            texture,
+            whole,
+            layers,
+        }
     }
 }
 
@@ -268,6 +329,50 @@ fn upload_sheet(device: &wgpu::Device, queue: &wgpu::Queue, sheet: &Sheet) -> wg
     texture.create_view(&Default::default())
 }
 
+/// Layer `slot` of an array texture, to copy to or from.
+fn at(texture: &wgpu::Texture, slot: u32) -> wgpu::TexelCopyTextureInfo<'_> {
+    wgpu::TexelCopyTextureInfo {
+        texture,
+        mip_level: 0,
+        origin: wgpu::Origin3d {
+            x: 0,
+            y: 0,
+            z: slot,
+        },
+        aspect: wgpu::TextureAspect::All,
+    }
+}
+
+/// Bytes a row of a page takes in a buffer it's copied to: rows of a
+/// texture copied to a buffer start every 256 bytes.
+fn padded_row(page_px: u32) -> u32 {
+    page_px.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+}
+
+/// The pages (columns, then rows, each from inclusive to exclusive) that
+/// `rect` covers within a level `world` units in size, `page` units each.
+fn pages_over(rect: Rect, world: [f32; 2], page: f32) -> [Range<i32>; 2] {
+    [0, 1].map(|axis| {
+        let lo = (rect[0][axis].max(0.0) / page).floor() as i32;
+        let hi = (rect[1][axis].min(world[axis]) / page).ceil() as i32;
+        lo..hi.max(lo)
+    })
+}
+
+/// What a layer's `seen` pages are drawn from: its visible region (as
+/// triangles) and, below the viewer, where it shows through; and the size
+/// of the pages.
+fn seen_key(visible: &[Vertex], shaft: Option<&Mesh>, page_px: u32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for v in visible {
+        v.pos.map(f32::to_bits).hash(&mut h);
+    }
+    shaft.map(Mesh::id).hash(&mut h);
+    page_px.hash(&mut h);
+    h.finish()
+}
+
 /// A plain single-sample attachment, cleared first.
 fn cleared(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
     wgpu::RenderPassColorAttachment {
@@ -344,17 +449,39 @@ impl Uniform {
     }
 }
 
-/// What's sized to the level rather than the screen, a layer each.
-struct World {
-    /// In pixels.
-    size: [u32; 2],
-    depth: usize,
-    seen: ArrayTexture,
-    shafts: ArrayTexture,
-    /// Per layer, reading its shaft mask in `fs_mask_shaft`.
-    shaft_bind_groups: Vec<wgpu::BindGroup>,
-    /// Per layer, the shaft mesh its shaft mask was last filled from.
-    shaft_filled: Vec<Option<u64>>,
+/// What's been seen: the pages of each layer's `seen` mask on the GPU,
+/// in world space at the art's own size (see [`crate::pages`]).
+struct Seen {
+    pages: Pages,
+    /// Pixels a side of a page: a chunk of the level.
+    page_px: u32,
+    /// A page each.
+    atlas: ArrayTexture,
+    /// A page's worth of where the layer it's of shows through to the
+    /// viewer's, drawn afresh for each page of a layer below; read by
+    /// `fs_mask_shaft`.
+    shaft: wgpu::TextureView,
+    shaft_bind_group: wgpu::BindGroup,
+    /// Pages being copied back to the CPU.
+    leaving: Vec<Leaving>,
+    /// Per layer, what its pages were last drawn from (see `seen_key`):
+    /// while that's unchanged they needn't be drawn again.
+    drawn: HashMap<usize, u64>,
+}
+
+/// A page on its way back to the CPU: its pixels, in a buffer being mapped.
+struct Leaving {
+    page: Page,
+    buffer: wgpu::Buffer,
+    /// Set once mapping ends: whether it worked.
+    mapped: Rc<Cell<Option<bool>>>,
+}
+
+/// One page of a layer's `seen` mask to draw what's visible into.
+struct PageDraw {
+    slot: u32,
+    /// Its world rectangle.
+    rect: Rect,
 }
 
 /// A mesh kept on the GPU, and which mesh it is.
@@ -372,12 +499,11 @@ const SHAFT: usize = 3;
 const FRINGES: usize = 4;
 const TRIMS: usize = 5;
 
-/// What's sized to the screen, a layer each.
+/// What's sized to the screen, a slot each.
 struct Screen {
     size: [u32; 2],
-    depth: usize,
-    /// Per layer `a`: visible, remembered, unknown at `3a`, `3a + 1`,
-    /// `3a + 2`.
+    /// Per slot `s`: visible, remembered, unknown at `3s`, `3s + 1`,
+    /// `3s + 2`.
     canvases: ArrayTexture,
     now: ArrayTexture,
     voids: ArrayTexture,
@@ -404,24 +530,27 @@ pub struct Renderer {
     /// sampled.
     sheet: wgpu::TextureView,
     sampler: wgpu::Sampler,
-    /// Per layer, onto the view; then onto the whole level, and the view
-    /// with no camera (for the interface).
+    /// Per slot, onto the view; per page drawn this frame, onto the page
+    /// (made as needed); and the view with no camera (for the interface).
     layer_transforms: Vec<Uniform>,
-    world_transform: Uniform,
+    page_transforms: Vec<Uniform>,
     ui_transform: Uniform,
     config: wgpu::SurfaceConfiguration,
     screen: Option<Screen>,
-    world: Option<World>,
-    /// Reads `screen` and `world`; made again with either.
+    seen: Option<Seen>,
+    /// Where each slot's pages in view are, for the composite (see `pages`
+    /// in composite.wgsl).
+    page_table: GrowBuffer,
+    /// Reads `screen`, `seen` and `page_table`; made again with any.
     composite_bind_group: Option<wgpu::BindGroup>,
     canvas_vertices: GrowBuffer,
     mask_vertices: GrowBuffer,
     /// What goes into those each frame, kept to reuse the memory.
     canvas_scratch: Vec<Vertex>,
     mask_scratch: Vec<Vertex>,
-    /// Per layer: its tiles, voids, liquid, shaft, fringes and trims
+    /// Per layer drawn: its tiles, voids, liquid, shaft, fringes and trims
     /// meshes, as last drawn.
-    meshes: Vec<[Option<Uploaded>; 6]>,
+    meshes: HashMap<usize, [Option<Uploaded>; 6]>,
 }
 
 fn js_err(e: impl std::fmt::Display) -> JsError {
@@ -608,6 +737,16 @@ impl Renderer {
                 texture_entry(2, array),
                 texture_entry(3, array),
                 texture_entry(4, array),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let composite_shader =
@@ -648,9 +787,9 @@ impl Renderer {
             ..Default::default()
         });
         let uniform = || Uniform::new(&device, &transform_layout, &sheet, &sampler);
-        let layer_transforms = (0..MAX_LAYERS).map(|_| uniform()).collect();
-        let world_transform = uniform();
+        let layer_transforms = (0..MAX_VISIBLE).map(|_| uniform()).collect();
         let ui_transform = uniform();
+        let page_table = GrowBuffer::new(&device, "page table", wgpu::BufferUsages::STORAGE);
         let canvas_vertices =
             GrowBuffer::new(&device, "canvas vertices", wgpu::BufferUsages::VERTEX);
         let mask_vertices = GrowBuffer::new(&device, "mask vertices", wgpu::BufferUsages::VERTEX);
@@ -673,17 +812,18 @@ impl Renderer {
             sheet,
             sampler,
             layer_transforms,
-            world_transform,
+            page_transforms: Vec::new(),
             ui_transform,
             config,
             screen: None,
-            world: None,
+            seen: None,
+            page_table,
             composite_bind_group: None,
             canvas_vertices,
             mask_vertices,
             canvas_scratch: Vec::new(),
             mask_scratch: Vec::new(),
-            meshes: (0..MAX_LAYERS).map(|_| Default::default()).collect(),
+            meshes: HashMap::new(),
         })
     }
 
@@ -695,9 +835,9 @@ impl Renderer {
     /// Forget what's been seen, for a new level (the next frame makes it
     /// afresh).
     pub fn reset(&mut self) {
-        self.world = None;
+        self.seen = None;
         self.composite_bind_group = None;
-        self.meshes.fill_with(Default::default);
+        self.meshes.clear();
     }
 
     /// Draw from `sheet` from now on.
@@ -706,7 +846,8 @@ impl Renderer {
         let all = self
             .layer_transforms
             .iter_mut()
-            .chain([&mut self.world_transform, &mut self.ui_transform]);
+            .chain(&mut self.page_transforms)
+            .chain([&mut self.ui_transform]);
         for uniform in all {
             uniform.rebind(
                 &self.device,
@@ -727,67 +868,82 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// (Re)create what's sized to the screen, for `depth` layers, if that
-    /// changed.
-    fn ensure_screen(&mut self, depth: usize) {
+    /// (Re)create what's sized to the screen, if that changed.
+    fn ensure_screen(&mut self) {
         let size = [self.config.width, self.config.height];
-        if self
-            .screen
-            .as_ref()
-            .is_some_and(|s| s.size == size && s.depth == depth)
-        {
+        if self.screen.as_ref().is_some_and(|s| s.size == size) {
             return;
         }
         let device = &self.device;
-        let layers = depth as u32;
+        let slots = MAX_VISIBLE as u32;
         let format = self.config.format;
         self.screen = Some(Screen {
             size,
-            depth,
-            canvases: ArrayTexture::new(device, "canvases", size, 3 * layers, format),
-            now: ArrayTexture::new(device, "mask now", size, layers, MASK_FORMAT),
-            voids: ArrayTexture::new(device, "voids", size, layers, MASK_FORMAT),
-            now_msaa: (0..depth)
+            canvases: ArrayTexture::new(device, "canvases", size, 3 * slots, format),
+            now: ArrayTexture::new(device, "mask now", size, slots, MASK_FORMAT),
+            voids: ArrayTexture::new(device, "voids", size, slots, MASK_FORMAT),
+            now_msaa: (0..MAX_VISIBLE)
                 .map(|_| Msaa::new(device, "now msaa", size))
                 .collect(),
         });
         self.composite_bind_group = None;
     }
 
-    /// (Re)create what's sized to the level, `px` pixels and `depth`
-    /// layers, if that changed.
-    fn ensure_world(&mut self, px: [u32; 2], depth: usize) {
-        if self
-            .world
-            .as_ref()
-            .is_some_and(|w| w.size == px && w.depth == depth)
-        {
+    /// A texture array of `capacity` pages `page_px` pixels square.
+    fn atlas(device: &wgpu::Device, page_px: u32, capacity: u32) -> ArrayTexture {
+        let copies = wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST;
+        ArrayTexture::with_usage(
+            device,
+            "seen pages",
+            [page_px; 2],
+            capacity,
+            MASK_FORMAT,
+            copies,
+        )
+    }
+
+    /// (Re)create the pages of what's been seen, `page_px` pixels square,
+    /// if that changed (forgetting what's been seen).
+    fn ensure_seen(&mut self, page_px: u32) {
+        if self.seen.as_ref().is_some_and(|s| s.page_px == page_px) {
             return;
         }
-        let layers = depth as u32;
-        let seen = ArrayTexture::new(&self.device, "mask seen", px, layers, MASK_FORMAT);
-        let shafts = ArrayTexture::new(&self.device, "shafts", px, layers, MASK_FORMAT);
-        let shaft_bind_groups = shafts
-            .layers
-            .iter()
-            .map(|view| {
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("shaft"),
-                    layout: &self.shaft_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    }],
-                })
+        let device = &self.device;
+        let max = device.limits().max_texture_array_layers.min(PAGES_MAX);
+        let first = PAGES_FIRST.min(max);
+        let shaft = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("page shaft"),
+                size: wgpu::Extent3d {
+                    width: page_px,
+                    height: page_px,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: MASK_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
             })
-            .collect();
-        self.world = Some(World {
-            size: px,
-            depth,
-            seen,
-            shafts,
-            shaft_bind_groups,
-            shaft_filled: vec![None; depth],
+            .create_view(&Default::default());
+        let shaft_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("page shaft"),
+            layout: &self.shaft_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&shaft),
+            }],
+        });
+        self.seen = Some(Seen {
+            pages: Pages::new((page_px * page_px) as usize, first, max),
+            page_px,
+            atlas: Self::atlas(device, page_px, first),
+            shaft,
+            shaft_bind_group,
+            leaving: Vec::new(),
+            drawn: HashMap::new(),
         });
         self.composite_bind_group = None;
     }
@@ -796,7 +952,7 @@ impl Renderer {
         if self.composite_bind_group.is_some() {
             return;
         }
-        let (screen, world) = (self.screen.as_ref().unwrap(), self.world.as_ref().unwrap());
+        let (screen, seen) = (self.screen.as_ref().unwrap(), self.seen.as_ref().unwrap());
         let texture = |binding, view| wgpu::BindGroupEntry {
             binding,
             resource: wgpu::BindingResource::TextureView(view),
@@ -812,8 +968,12 @@ impl Renderer {
                     },
                     texture(1, &screen.canvases.whole),
                     texture(2, &screen.now.whole),
-                    texture(3, &world.seen.whole),
+                    texture(3, &seen.atlas.whole),
                     texture(4, &screen.voids.whole),
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: self.page_table.buffer.as_entire_binding(),
+                    },
                 ],
             }));
     }
@@ -821,7 +981,7 @@ impl Renderer {
     /// Keep `mesh` on the GPU as layer `layer`'s mesh `which`, unless it
     /// already is.
     fn upload(&mut self, layer: usize, which: usize, mesh: &Mesh) {
-        let kept = &mut self.meshes[layer][which];
+        let kept = &mut self.meshes.entry(layer).or_default()[which];
         if kept.as_ref().is_some_and(|u| u.id == mesh.id()) {
             return;
         }
@@ -839,19 +999,163 @@ impl Renderer {
         });
     }
 
+    /// Hand the pages whose pixels have reached the CPU to [`Pages`].
+    fn collect_leaving(&mut self) {
+        let Some(seen) = &mut self.seen else {
+            return;
+        };
+        let px = seen.page_px as usize;
+        let row = padded_row(seen.page_px) as usize;
+        let pages = &mut seen.pages;
+        seen.leaving.retain(|l| {
+            let Some(mapped) = l.mapped.get() else {
+                return true;
+            };
+            let pixels = mapped
+                .then(|| l.buffer.slice(..).get_mapped_range().ok())
+                .flatten()
+                .map(|data| data.chunks(row).flat_map(|r| &r[..px]).copied().collect());
+            // Lost on the way, it's as if nothing on it had been seen.
+            pages.stored(l.page, &pixels.unwrap_or_else(|| vec![0; px * px]));
+            if mapped {
+                l.buffer.unmap();
+            }
+            false
+        });
+    }
+
+    /// Carry out what [`Pages`] decided: grow the atlas and copy evicted
+    /// pages out first (submitted at once), then clear new pages (in
+    /// `encoder`, before anything's drawn into them) and fill those coming
+    /// back (written before `encoder` runs).
+    fn apply_page_ops(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let seen = self.seen.as_mut().unwrap();
+        let ops = seen.pages.take_ops();
+        if ops.is_empty() {
+            return;
+        }
+        let px = seen.page_px;
+        let page = wgpu::Extent3d {
+            width: px,
+            height: px,
+            depth_or_array_layers: 1,
+        };
+        let mut first = self.device.create_command_encoder(&Default::default());
+        let mut leaving = Vec::new();
+        for op in &ops {
+            match op {
+                Op::Grow(capacity) => {
+                    let old = seen.atlas.layers.len() as u32;
+                    let atlas = Self::atlas(&self.device, px, *capacity);
+                    let all = wgpu::Extent3d {
+                        depth_or_array_layers: old,
+                        ..page
+                    };
+                    first.copy_texture_to_texture(
+                        at(&seen.atlas.texture, 0),
+                        at(&atlas.texture, 0),
+                        all,
+                    );
+                    seen.atlas = atlas;
+                    self.composite_bind_group = None;
+                }
+                Op::Evict { page: which, slot } => {
+                    let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("leaving page"),
+                        size: (padded_row(px) * px) as u64,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    first.copy_texture_to_buffer(
+                        at(&seen.atlas.texture, *slot),
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &buffer,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(padded_row(px)),
+                                rows_per_image: Some(px),
+                            },
+                        },
+                        page,
+                    );
+                    leaving.push(Leaving {
+                        page: *which,
+                        buffer,
+                        mapped: Rc::new(Cell::new(None)),
+                    });
+                }
+                Op::Clear(_) | Op::Upload(..) => {}
+            }
+        }
+        self.queue.submit([first.finish()]);
+        for l in leaving {
+            let mapped = l.mapped.clone();
+            l.buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| mapped.set(Some(r.is_ok())));
+            seen.leaving.push(l);
+        }
+        for op in ops {
+            match op {
+                Op::Clear(slot) => {
+                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("clear page"),
+                        color_attachments: &[Some(cleared(&seen.atlas.layers[slot as usize]))],
+                        ..Default::default()
+                    });
+                }
+                Op::Upload(slot, pixels) => self.queue.write_texture(
+                    at(&seen.atlas.texture, slot),
+                    &pixels,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(px),
+                        rows_per_image: Some(px),
+                    },
+                    page,
+                ),
+                Op::Grow(_) | Op::Evict { .. } => {}
+            }
+        }
+    }
+
     pub fn draw(&mut self, frame: &Frame) {
-        // The camera on a whole pixel, so the tile art stays crisp. What's
-        // sized to the level is at the art's own size, whatever the view's
-        // zoom, so zooming keeps what's been seen.
+        // Nothing's decided about pages for a frame that isn't drawn.
+        let output = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            _ => return,
+        };
+        // The camera on a whole pixel, so the tile art stays crisp. `seen`
+        // is at the art's own size, whatever the view's zoom, so zooming
+        // keeps what's been seen; its pages are a chunk of the level each.
         let zoom = frame.zoom;
         let cell = frame.cell as f32;
         let seen_zoom = cell / TILE;
-        let world_px = frame.world.map(|w| (w * seen_zoom).ceil());
-        self.ensure_world(world_px.map(|w| w as u32), frame.depth);
-        self.ensure_screen(frame.depth);
-        self.ensure_composite();
+        let page_world = CHUNK as f32 * TILE;
+        let page_px = CHUNK as u32 * frame.cell;
+        self.ensure_seen(page_px);
+        self.ensure_screen();
+        self.collect_leaving();
         let camera = frame.camera.map(|c| (c * zoom).round() / zoom);
-        for l in &frame.layers {
+        // The level may be drawn a window at a time: its layers and pages,
+        // and patterns pinned to the world, go by where they are in the
+        // whole level.
+        let offset = frame.offset.map(|t| t as f32 * TILE);
+        let page_offset = frame.offset.map(|t| t.div_euclid(CHUNK as i32));
+        let page = |index: usize, px: i32, py: i32| -> Page {
+            (frame.base + index, px + page_offset[0], py + page_offset[1])
+        };
+        // Top first, a slot each: how far below the viewer's it is.
+        let layers: Vec<_> = frame
+            .layers
+            .iter()
+            .filter(|l| frame.top - l.index < MAX_VISIBLE)
+            .collect();
+        let slot = |index: usize| frame.top - index;
+        self.meshes
+            .retain(|index, _| layers.iter().any(|l| l.index == *index));
+        for l in &layers {
             self.upload(l.index, TILES, &l.tiles);
             self.upload(l.index, FRINGES, &l.fringes);
             self.upload(l.index, TRIMS, &l.trims);
@@ -877,8 +1181,7 @@ impl Renderer {
             visible: Range<u32>,
             standing: Range<u32>,
         }
-        let ranges: Vec<Ranges> = frame
-            .layers
+        let ranges: Vec<Ranges> = layers
             .iter()
             .map(|l| {
                 let canvases = [&l.visible, &l.remembered, &l.unknown]
@@ -910,6 +1213,101 @@ impl Renderer {
             .collect();
         let overlay = push(&mut canvas_vertices, &frame.overlay.vertices);
         let ui = push(&mut canvas_vertices, &frame.ui.vertices);
+
+        // Below the viewer's, a layer's pages matter only where it shows
+        // through.
+        let shows = |l: &LayerFrame, rect: Rect| {
+            l.shaft
+                .as_ref()
+                .is_none_or(|shaft| !shaft.ranges(rect).is_empty())
+        };
+        let page_rect = |px: i32, py: i32| -> Rect {
+            let at = [px as f32 * page_world, py as f32 * page_world];
+            [at, [at[0] + page_world, at[1] + page_world]]
+        };
+        let seen = self.seen.as_mut().unwrap();
+        seen.pages.begin_frame();
+        // The pages each slot shows: a window over its part of the level in
+        // view (see `pages` in composite.wgsl). First, so they're in use
+        // this frame before anything needs room: a page drawn into for the
+        // first time below is missing until the next, but that's where it's
+        // visible now, which shows whatever's been seen.
+        let mut table = vec![0u32; TABLE_HEAD * MAX_VISIBLE];
+        for l in &layers {
+            let [xs, ys] = pages_over(frame.layer_view(l.index), frame.world, page_world);
+            let head = TABLE_HEAD * slot(l.index);
+            let size = [xs.len() as u32, ys.len() as u32];
+            let start = table.len() as u32;
+            table[head..head + 5].copy_from_slice(&[
+                xs.start as u32,
+                ys.start as u32,
+                size[0],
+                size[1],
+                start,
+            ]);
+            for py in ys {
+                for px in xs.clone() {
+                    let page = shows(l, page_rect(px, py))
+                        .then(|| seen.pages.read(page(l.index, px, py)))
+                        .flatten();
+                    table.push(page.unwrap_or(NO_PAGE));
+                }
+            }
+        }
+        // What's visible goes into the pages it covers, unless it's what
+        // they were last drawn from. A page there's no room for now is
+        // drawn next frame.
+        let draws: Vec<Vec<PageDraw>> = layers
+            .iter()
+            .zip(&ranges)
+            .map(|(l, r)| {
+                let visible = &mask_vertices[r.visible.start as usize..r.visible.end as usize];
+                if !frame.remember || visible.is_empty() {
+                    return Vec::new();
+                }
+                let key = seen_key(visible, l.shaft.as_deref(), page_px);
+                let layer = frame.base + l.index;
+                if seen.drawn.get(&layer) == Some(&key) {
+                    return Vec::new();
+                }
+                let fold = |f: fn(f32, f32) -> f32, start: f32| {
+                    [0, 1].map(|axis| visible.iter().map(|v| v.pos[axis]).fold(start, f))
+                };
+                let bounds = [
+                    fold(f32::min, f32::INFINITY),
+                    fold(f32::max, f32::NEG_INFINITY),
+                ];
+                let [xs, ys] = pages_over(bounds, frame.world, page_world);
+                let mut complete = true;
+                let mut draws = Vec::new();
+                for py in ys {
+                    for px in xs.clone() {
+                        let rect = page_rect(px, py);
+                        if !shows(l, rect) {
+                            continue;
+                        }
+                        match seen.pages.write(page(l.index, px, py)) {
+                            Some(slot) => draws.push(PageDraw { slot, rect }),
+                            None => complete = false,
+                        }
+                    }
+                }
+                if complete {
+                    seen.drawn.insert(layer, key);
+                } else {
+                    seen.drawn.remove(&layer);
+                }
+                draws
+            })
+            .collect();
+        seen.drawn
+            .retain(|layer, _| layers.iter().any(|l| frame.base + l.index == *layer));
+        if self
+            .page_table
+            .write(&self.device, &self.queue, bytemuck::cast_slice(&table))
+        {
+            self.composite_bind_group = None;
+        }
         self.canvas_vertices.write(
             &self.device,
             &self.queue,
@@ -923,47 +1321,62 @@ impl Renderer {
         self.canvas_scratch = canvas_vertices;
         self.mask_scratch = mask_vertices;
 
-        // Transforms: each layer onto the view, smaller the deeper it is;
-        // the whole level onto world-sized targets; the interface as is.
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.apply_page_ops(&mut encoder);
+        self.ensure_composite();
+
+        // Transforms: each slot onto the view, smaller the deeper it is;
+        // each page drawn onto its page; the interface as is.
         let center = [frame.view[0] / 2.0, frame.view[1] / 2.0];
         let parallax = frame.parallax();
-        for l in &frame.layers {
+        for l in &layers {
             let t = Transform {
                 screen: frame.view,
                 camera,
                 center,
-                scale: parallax.powi((frame.top - l.index) as i32),
+                scale: parallax.powi(slot(l.index) as i32),
                 zoom,
                 cell,
-                _pad: [0.0; 3],
+                _pad: 0.0,
+                offset,
             };
-            let buffer = &self.layer_transforms[l.index].buffer;
+            let buffer = &self.layer_transforms[slot(l.index)].buffer;
             self.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&t));
         }
-        let flat = |screen, zoom| Transform {
+        let flat = |screen, camera, zoom| Transform {
             screen,
-            camera: [0.0; 2],
+            camera,
             center: [0.0; 2],
             scale: 1.0,
             zoom,
             cell,
-            _pad: [0.0; 3],
+            _pad: 0.0,
+            offset,
         };
-        self.queue.write_buffer(
-            &self.world_transform.buffer,
-            0,
-            bytemuck::bytes_of(&flat(world_px, seen_zoom)),
-        );
+        let pages_drawn = draws.iter().map(Vec::len).sum();
+        while self.page_transforms.len() < pages_drawn {
+            let uniform = Uniform::new(
+                &self.device,
+                &self.transform_layout,
+                &self.sheet,
+                &self.sampler,
+            );
+            self.page_transforms.push(uniform);
+        }
+        for (d, uniform) in draws.iter().flatten().zip(&self.page_transforms) {
+            let t = flat([page_px as f32; 2], d.rect[0], seen_zoom);
+            self.queue
+                .write_buffer(&uniform.buffer, 0, bytemuck::bytes_of(&t));
+        }
         self.queue.write_buffer(
             &self.ui_transform.buffer,
             0,
-            bytemuck::bytes_of(&flat(frame.view, frame.ui_scale)),
+            bytemuck::bytes_of(&flat(frame.view, [0.0; 2], frame.ui_scale)),
         );
 
-        let present = frame
-            .layers
+        let present = layers
             .iter()
-            .fold(0u32, |bits, l| bits | 1 << l.index);
+            .fold(0u32, |bits, l| bits | 1 << slot(l.index));
         let params = CompositeParams {
             origin: frame.origin,
             radius: if frame.radius.is_finite() {
@@ -983,35 +1396,16 @@ impl Renderer {
             outdoors: if frame.outdoors { 1.0 } else { 0.0 },
             ground: frame.ground as u32,
             radius_underground: frame.radius_underground,
+            page_px: page_px as f32,
+            _pad: 0.0,
+            offset,
         };
         self.queue
             .write_buffer(&self.composite_params, 0, bytemuck::bytes_of(&params));
 
-        let output = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            _ => return,
-        };
-        // A layer's shaft mask is filled again only when its shaft changes
-        // (the viewer changed layers, or the level did).
-        let world = self.world.as_mut().unwrap();
-        let refill: Vec<bool> = frame
-            .layers
-            .iter()
-            .map(|l| {
-                let id = l.shaft.as_ref().map(|m| m.id());
-                let fresh = id.is_some() && world.shaft_filled[l.index] != id;
-                if fresh {
-                    world.shaft_filled[l.index] = id;
-                }
-                fresh
-            })
-            .collect();
-
         let screen = output.texture.create_view(&Default::default());
-        let world = self.world.as_ref().unwrap();
+        let seen = self.seen.as_ref().unwrap();
         let screen_textures = self.screen.as_ref().unwrap();
-        let mut encoder = self.device.create_command_encoder(&Default::default());
 
         // One pass with `pipeline` through `transform`, drawing each range
         // of a vertex buffer in turn.
@@ -1052,11 +1446,11 @@ impl Renderer {
         };
         // Layer `a`'s mesh `which`: the chunks of it in `view` (`None` for
         // all of it).
-        let mesh = |a: usize, which: usize, m: &Mesh, view: Option<_>| {
-            let Some(Uploaded {
+        let mesh = |a: usize, which: usize, m: &Mesh, view: Option<Rect>| {
+            let Some(Some(Uploaded {
                 buffer: Some(buffer),
                 ..
-            }) = &self.meshes[a][which]
+            })) = self.meshes.get(&a).map(|kept| &kept[which])
             else {
                 return Vec::new();
             };
@@ -1064,11 +1458,11 @@ impl Renderer {
             ranges.into_iter().map(|r| (buffer, r)).collect::<Vec<_>>()
         };
 
-        for ((l, r), refill) in frame.layers.iter().zip(&ranges).zip(refill) {
-            let a = l.index;
+        let mut page_transforms = self.page_transforms.iter();
+        for ((l, r), page_draws) in layers.iter().zip(&ranges).zip(&draws) {
+            let (a, s) = (l.index, slot(l.index));
             let view = Some(frame.layer_view(a));
-            let transform = &self.layer_transforms[a].bind_group;
-            let flat = &self.world_transform.bind_group;
+            let transform = &self.layer_transforms[s].bind_group;
             let (canvas, masks) = (&self.canvas_vertices.buffer, &self.mask_vertices.buffer);
             // The tiles, then fringes and trims over them.
             let mut tiles = mesh(a, TILES, &l.tiles, view);
@@ -1080,7 +1474,7 @@ impl Renderer {
             tiles.extend(edging.iter().cloned());
             for (i, range) in r.canvases.iter().enumerate() {
                 let attachment = wgpu::RenderPassColorAttachment {
-                    view: &screen_textures.canvases.layers[3 * a + i],
+                    view: &screen_textures.canvases.layers[3 * s + i],
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1101,7 +1495,7 @@ impl Renderer {
                     &draws,
                 );
             }
-            let voids = &screen_textures.voids.layers[a];
+            let voids = &screen_textures.voids.layers[s];
             pass(
                 &mut encoder,
                 cleared(voids),
@@ -1137,7 +1531,7 @@ impl Renderer {
                 None,
                 &[(masks, r.standing.clone())],
             );
-            let now = screen_textures.now_msaa[a].attachment(&screen_textures.now.layers[a], true);
+            let now = screen_textures.now_msaa[s].attachment(&screen_textures.now.layers[s], true);
             pass(
                 &mut encoder,
                 now,
@@ -1146,39 +1540,36 @@ impl Renderer {
                 None,
                 &[(masks, r.visible.clone())],
             );
-            let seen = keep(&world.seen.layers[a]);
-            match &l.shaft {
-                // Below the viewer: remembered as seen only where it shows
-                // through.
-                Some(shaft) => {
-                    if refill {
+            // What's visible, into each page of `seen` it covers.
+            for d in page_draws {
+                let onto = &page_transforms.next().unwrap().bind_group;
+                let page = keep(&seen.atlas.layers[d.slot as usize]);
+                let visible = [(masks, r.visible.clone())];
+                match &l.shaft {
+                    // Below the viewer: remembered as seen only where it
+                    // shows through.
+                    Some(shaft) => {
                         pass(
                             &mut encoder,
-                            cleared(&world.shafts.layers[a]),
+                            cleared(&seen.shaft),
                             &self.fill_pipeline,
-                            flat,
+                            onto,
                             None,
-                            &mesh(a, SHAFT, shaft, None),
+                            &mesh(a, SHAFT, shaft, Some(d.rect)),
                         );
+                        let group = Some(&seen.shaft_bind_group);
+                        let pipeline = &self.seen_shaft_pipeline;
+                        pass(&mut encoder, page, pipeline, onto, group, &visible);
                     }
-                    let group = Some(&world.shaft_bind_groups[a]);
-                    pass(
+                    None => pass(
                         &mut encoder,
-                        seen,
-                        &self.seen_shaft_pipeline,
-                        flat,
-                        group,
-                        &[(masks, r.visible.clone())],
-                    );
+                        page,
+                        &self.seen_pipeline,
+                        onto,
+                        None,
+                        &visible,
+                    ),
                 }
-                None => pass(
-                    &mut encoder,
-                    seen,
-                    &self.seen_pipeline,
-                    flat,
-                    None,
-                    &[(masks, r.visible.clone())],
-                ),
             }
         }
 
@@ -1203,7 +1594,7 @@ impl Renderer {
 
         // Overlay on the viewer's layer, then the interface, over it all.
         let canvas = &self.canvas_vertices.buffer;
-        let top = &self.layer_transforms[frame.top].bind_group;
+        let top = &self.layer_transforms[0].bind_group;
         pass(
             &mut encoder,
             keep(&screen),

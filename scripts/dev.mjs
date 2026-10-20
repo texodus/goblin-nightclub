@@ -59,10 +59,25 @@ const server = http.createServer(async (req, res) => {
         if (ext === ".html") {
             body = body.toString().replace("</body>", `${RELOAD_SNIPPET}</body>`);
         }
-        res.writeHead(200, {
+        const headers = {
             "Content-Type": MIME[ext] ?? "application/octet-stream",
             "Cache-Control": "no-store",
-        });
+            "Accept-Ranges": "bytes",
+        };
+        // Part of it, for a packed level read a piece at a time.
+        const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? "");
+        if (range) {
+            const start = Number(range[1]);
+            const end = Math.min(range[2] ? Number(range[2]) : body.length - 1, body.length - 1);
+            if (start > end) {
+                res.writeHead(416, { "Content-Range": `bytes */${body.length}` }).end();
+                return;
+            }
+            res.writeHead(206, { ...headers, "Content-Range": `bytes ${start}-${end}/${body.length}` });
+            res.end(body.subarray(start, end + 1));
+            return;
+        }
+        res.writeHead(200, headers);
         res.end(body);
     } catch {
         res.writeHead(404).end("Not found");

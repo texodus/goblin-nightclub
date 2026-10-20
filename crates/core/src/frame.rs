@@ -83,8 +83,18 @@ pub struct Frame {
     /// from outdoors, the mist over layers at or above it is light, over
     /// those below dark.
     pub ground: usize,
-    /// Size of the level, in world units.
+    /// Size of the level, in world units: of the window onto it, for a
+    /// level played a window at a time (see [`crate::world`]), whose
+    /// coordinates are all the window's.
     pub world: [f32; 2],
+    /// Where the window is in the whole level: its top-left tile, and the
+    /// layer its layer 0 is. What's kept across windows (what's been seen)
+    /// and patterns pinned to the world go by these.
+    pub offset: [i32; 2],
+    pub base: usize,
+    /// Whether what's visible is remembered as seen; the editor shows
+    /// everything and remembers none of it.
+    pub remember: bool,
     /// Drawn in world space over everything, on the viewer's layer.
     pub overlay: Canvas,
     /// Drawn over everything in interface pixels (`ui_scale` screen

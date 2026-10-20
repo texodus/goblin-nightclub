@@ -6,6 +6,7 @@
 //! what they mean between layers is up to [`crate::level`].
 
 use crate::camera::Rect;
+use crate::chunk::Chunks;
 use crate::draw::{Canvas, faces_light, inset_corner, inward_normal};
 use crate::palette;
 #[cfg(any(test, feature = "test-util"))]
@@ -169,13 +170,30 @@ pub enum Tile {
     Stairs(Dir, FloorId),
 }
 
+/// The tile point `p` (pixels) is in, and the quarter of it (as a bit;
+/// see [`QUARTERS`]): the triangle between its diagonals.
+pub fn quarter_at(p: [f32; 2]) -> ([i32; 2], u8) {
+    let [x, y] = [(p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32];
+    let (u, v) = (p[0] / TILE - x as f32, p[1] / TILE - y as f32);
+    let quarter = if v < u.min(1.0 - u) {
+        N
+    } else if v > u.max(1.0 - u) {
+        S
+    } else if u < 0.5 {
+        W
+    } else {
+        E
+    };
+    ([x, y], quarter)
+}
+
 /// The quarters of a tile, the triangles between its diagonals, as bits.
 const N: u8 = 1;
 const E: u8 = 2;
 const S: u8 = 4;
 const W: u8 = 8;
-/// The quarters in bit order.
-const QUARTERS: [u8; 4] = [N, E, S, W];
+/// The quarters of a tile in bit order, as bits.
+pub const QUARTERS: [u8; 4] = [N, E, S, W];
 
 impl Corner {
     /// The quarters making up the half of a tile at this corner, as bits.
@@ -619,7 +637,12 @@ impl Line {
 pub struct Layer {
     pub cols: usize,
     pub rows: usize,
-    tiles: Vec<Tile>,
+    /// Where its tile (0, 0) is in the whole level, in tiles: for a layer
+    /// that's a window onto a bigger one. Only how tiles are drawn depends
+    /// on it (which variant of its art each shows), so it looks the same
+    /// whichever window it's seen through.
+    origin: [i32; 2],
+    tiles: Chunks,
     /// Where each tile is wall: all the geometry runs on these.
     solids: Vec<Solid>,
     corners: Vec<[f32; 2]>,
@@ -728,10 +751,19 @@ impl Layer {
     /// A level from its tiles, row by row.
     pub fn from_tiles(cols: usize, rows: usize, tiles: Vec<Tile>) -> Self {
         assert_eq!(tiles.len(), cols * rows);
-        let solids = tiles.iter().map(|t| t.wall()).collect();
+        Self::from_chunks(Chunks::from_tiles(cols, rows, &tiles))
+    }
+
+    /// A level from its tiles in chunks.
+    pub fn from_chunks(tiles: Chunks) -> Self {
+        let (cols, rows) = (tiles.cols(), tiles.rows());
+        let solids = (0..cols * rows)
+            .map(|i| tiles.get(i % cols, i / cols).wall())
+            .collect();
         let mut level = Self {
             cols,
             rows,
+            origin: [0, 0],
             tiles,
             solids,
             corners: Vec::new(),
@@ -832,13 +864,33 @@ impl Layer {
         Self::from_solids(cols, rows, tiles)
     }
 
+    /// The same, its tile (0, 0) at `origin` in the whole level.
+    pub fn at(mut self, origin: [i32; 2]) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Where its tile (0, 0) is in the whole level, in tiles.
+    pub fn origin(&self) -> [i32; 2] {
+        self.origin
+    }
+
+    /// Its tile `(x, y)` in the whole level, for picking what it looks
+    /// like.
+    pub fn absolute(&self, x: usize, y: usize) -> [usize; 2] {
+        [
+            (x as i64 + self.origin[0] as i64) as usize,
+            (y as i64 + self.origin[1] as i64) as usize,
+        ]
+    }
+
     /// The tile at `(x, y)`. Out-of-bounds tiles are wall, so the level
     /// edge is a wall.
     pub fn tile(&self, x: i32, y: i32) -> Tile {
         if !self.in_bounds([x, y]) {
             return Tile::WALL;
         }
-        self.tiles[y as usize * self.cols + x as usize]
+        self.tiles.get(x as usize, y as usize)
     }
 
     /// Where tile `(x, y)` is wall; out of bounds, all of it.
@@ -852,22 +904,8 @@ impl Layer {
     /// Is point `p` (pixels) over void (or liquid): in a void quarter of
     /// its tile? Outside the layer, no.
     pub fn is_void_at(&self, p: [f32; 2]) -> bool {
-        let [x, y] = [(p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32];
-        if !self.in_bounds([x, y]) {
-            return false;
-        }
-        let (u, v) = (p[0] / TILE - x as f32, p[1] / TILE - y as f32);
-        // The quarter it's in, between the tile's diagonals.
-        let quarter = if v < u.min(1.0 - u) {
-            N
-        } else if v > u.max(1.0 - u) {
-            S
-        } else if u < 0.5 {
-            W
-        } else {
-            E
-        };
-        self.tile(x, y).void_quarters() & quarter != 0
+        let ([x, y], quarter) = quarter_at(p);
+        self.in_bounds([x, y]) && self.tile(x, y).void_quarters() & quarter != 0
     }
 
     /// Is tile `(x, y)` entirely free of solid?
@@ -1516,23 +1554,24 @@ impl Layer {
     /// wall or liquid (translucent), nothing where void, stairs over the
     /// whole tile.
     pub fn draw_tile(&self, tileset: &Tileset, canvas: &mut Canvas, x: usize, y: usize) {
-        let tile = self.tiles[y * self.cols + x];
+        let tile = self.tiles.get(x, y);
         let origin = [x as f32 * TILE, y as f32 * TILE];
+        let [ax, ay] = self.absolute(x, y);
         let mut part = |shape: Option<Shape>, part: Part| {
             let (cell, color) = match part {
                 Part::Floor(f) => (
-                    tileset::variant(&tileset.floors[f as usize].cells, x, y),
+                    tileset::variant(&tileset.floors[f as usize].cells, ax, ay),
                     palette::WHITE,
                 ),
                 Part::Wall(w) => (
-                    tileset::variant(&tileset.walls[w as usize].cells, x, y),
+                    tileset::variant(&tileset.walls[w as usize].cells, ax, ay),
                     palette::WHITE,
                 ),
                 // Translucent, so what's beneath shows through.
                 Part::Liquid(l) => {
                     let liquid = &tileset.liquids[l as usize];
                     (
-                        tileset::variant(&liquid.cells, x, y),
+                        tileset::variant(&liquid.cells, ax, ay),
                         [1.0, 1.0, 1.0, liquid.alpha],
                     )
                 }

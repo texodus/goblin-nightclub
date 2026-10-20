@@ -55,15 +55,38 @@ impl Entity {
         avoid: [f32; 2],
         min_dist: f32,
     ) -> Vec<Self> {
-        let (w, h) = (level.cols as f32 * TILE, level.rows as f32 * TILE);
+        let size = [level.cols as f32 * TILE, level.rows as f32 * TILE];
+        Self::spawn_npcs_in(
+            level,
+            [[0.0; 2], size],
+            rng,
+            count,
+            first_id,
+            avoid,
+            min_dist,
+        )
+    }
+
+    /// The same, in the part of `level` at `area` (top-left and size,
+    /// pixels).
+    pub fn spawn_npcs_in(
+        level: &Layer,
+        area: [[f32; 2]; 2],
+        rng: &mut Rng,
+        count: usize,
+        first_id: EntityId,
+        avoid: [f32; 2],
+        min_dist: f32,
+    ) -> Vec<Self> {
+        let [[x0, y0], [w, h]] = area;
         let mut out = Vec::with_capacity(count);
         for _ in 0..count * 100 {
             if out.len() == count {
                 break;
             }
             let pos = [
-                rng.unit() * (w - NPC_SIZE[0]),
-                rng.unit() * (h - NPC_SIZE[1]),
+                x0 + rng.unit() * (w - NPC_SIZE[0]),
+                y0 + rng.unit() * (h - NPC_SIZE[1]),
             ];
             let npc = Self::npc(first_id + out.len() as EntityId, pos);
             let c = npc.center();
