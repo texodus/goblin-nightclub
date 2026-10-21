@@ -821,6 +821,7 @@ impl Editor {
                     unknown: Canvas::new(&self.tileset),
                     polygon: everywhere.clone(),
                     lit_shapes: Vec::new(),
+                    lights: Vec::new(),
                     standing: Canvas::new(&self.tileset),
                     shaft: (k < top).then(|| self.level.shaft_mesh(top, k)),
                 }
@@ -1033,8 +1034,9 @@ mod tests {
         let names: Vec<String> = e.swatches().into_iter().map(|s| s.name).collect();
         assert!(names.contains(&"grate floor".to_string()));
         assert!(names.contains(&"water".to_string()));
+        assert!(names.contains(&"torch".to_string()));
         // Floors, walls, void, water, stairs, props and none.
-        assert_eq!(e.swatches().len(), 4 + 3 + 1 + 1 + 2 + 2 + 1);
+        assert_eq!(e.swatches().len(), 4 + 3 + 1 + 1 + 2 + 3 + 1);
     }
 
     #[test]

@@ -35,7 +35,7 @@ use crate::mesh::Mesh;
 use crate::path;
 use crate::prop::draw_prop;
 use crate::tileset::Tileset;
-use crate::vision::Circle;
+use crate::vision::{Circle, Lamp};
 use crate::world::{PieceOf, Pieces};
 
 /// Layers a level may have: a bound on what a file may ask for.
@@ -115,6 +115,8 @@ pub struct Level {
     deepest: Vec<u8>,
     /// Per layer, made when first asked for; see [`Level::circles`].
     circles: Vec<OnceLock<Vec<Circle>>>,
+    /// Per layer, made when first asked for; see [`Level::lamps`].
+    lamps: Vec<OnceLock<Vec<Lamp>>>,
     /// Per layer, made when first asked for; see [`Level::meshes`].
     meshes: Vec<OnceLock<Arc<LayerMeshes>>>,
     /// By `(top, k)`, made when first asked for and dropped once the viewer
@@ -326,6 +328,7 @@ impl Level {
             deepest,
             meshes: (0..depth).map(|_| OnceLock::new()).collect(),
             circles: (0..depth).map(|_| OnceLock::new()).collect(),
+            lamps: (0..depth).map(|_| OnceLock::new()).collect(),
             views: Default::default(),
             shafts: Default::default(),
             shaft_meshes: Default::default(),
@@ -523,6 +526,23 @@ impl Level {
                         center: [(x + 0.5) * TILE, (y + 0.5) * TILE],
                         radius: kind.sight / zoom,
                     })
+                })
+                .collect()
+        })
+    }
+
+    /// The lights on layer `k`: its props' (those that give any; see
+    /// [`crate::tileset::PropKind::light`]). What each lights is worked out
+    /// when first asked for (see [`Lamp::lit`]).
+    pub fn lamps(&self, k: usize) -> &[Lamp] {
+        self.lamps[k].get_or_init(|| {
+            self.layers[k]
+                .props()
+                .filter_map(|p| {
+                    let light = self.tileset.props[p.kind as usize].light?;
+                    let [x, y] = p.at.map(|t| t as f32);
+                    let center = [(x + 0.5) * TILE, (y + 0.5) * TILE];
+                    Some(Lamp::new(center, light.radius * TILE, light.color))
                 })
                 .collect()
         })

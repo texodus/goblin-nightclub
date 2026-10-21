@@ -5,7 +5,11 @@
 //! 2. where it's void (the layer below shows through), in a mask;
 //! 3. its visibility polygon into `now`, cleared every frame; and in world
 //!    space into `seen`, never cleared, so it accumulates everything seen
-//!    (for a layer below the viewer's, only where it shows through).
+//!    (for a layer below the viewer's, only where it shows through);
+//! 4. on the viewer's layer, what lights cast into a light map: beyond the
+//!    view radius the polygon is visible only where they light it (and
+//!    remembered as seen only there), and the visible style is lit by
+//!    them.
 //!
 //! Layers drawn go in slots by how far below the viewer's they are, so
 //! what's kept per layer is bounded by [`MAX_VISIBLE`], not the level's
@@ -46,6 +50,10 @@ use goblin_nightclub_core::mesh::Mesh;
 use goblin_nightclub_core::tileset::Sheet;
 
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
+/// What lights cast on the viewer's layer (see `light_map` in
+/// composite.wgsl): their colors added up, so past 1 where they meet.
+const LIGHT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// MSAA sample count for the `now` masks, which anti-aliases their edges.
 /// 1 gives hard pixel edges.
@@ -245,7 +253,12 @@ struct Msaa {
 }
 
 impl Msaa {
-    fn new(device: &wgpu::Device, label: &str, size: [u32; 2]) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        label: &str,
+        size: [u32; 2],
+        format: wgpu::TextureFormat,
+    ) -> Self {
         let view = (MASK_SAMPLES > 1).then(|| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -258,7 +271,7 @@ impl Msaa {
                     mip_level_count: 1,
                     sample_count: MASK_SAMPLES,
                     dimension: wgpu::TextureDimension::D2,
-                    format: MASK_FORMAT,
+                    format,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 })
@@ -366,14 +379,15 @@ fn pages_over(rect: Rect, world: [f32; 2], page: f32) -> [Range<i32>; 2] {
     })
 }
 
-/// What a layer's `seen` pages are drawn from: its visible region (as
-/// triangles) and, below the viewer, where it shows through; and the size
-/// of the pages.
-fn seen_key(visible: &[Vertex], shaft: Option<&Mesh>, page_px: u32) -> u64 {
+/// What a layer's `seen` pages are drawn from: its visible region and what
+/// lights show (as triangles, and how far each reaches) and, below the
+/// viewer, where it shows through; and the size of the pages.
+fn seen_key(drawn: &[&[Vertex]], shaft: Option<&Mesh>, page_px: u32) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for v in visible {
+    for v in drawn.iter().copied().flatten() {
         v.pos.map(f32::to_bits).hash(&mut h);
+        v.edge.map(f32::to_bits).hash(&mut h);
     }
     shaft.map(Mesh::id).hash(&mut h);
     page_px.hash(&mut h);
@@ -465,8 +479,9 @@ struct Seen {
     /// A page each.
     atlas: ArrayTexture,
     /// A page's worth of where the layer it's of shows through to the
-    /// viewer's, drawn afresh for each page of a layer below; read by
-    /// `fs_mask_shaft`.
+    /// viewer's, drawn afresh for each page of a layer below; or, on the
+    /// viewer's layer, of what's in line of sight, for what lights show.
+    /// Read by `fs_mask_shaft`.
     shaft: wgpu::TextureView,
     shaft_bind_group: wgpu::BindGroup,
     /// Pages being copied back to the CPU.
@@ -512,6 +527,9 @@ struct Screen {
     now: ArrayTexture,
     voids: ArrayTexture,
     now_msaa: Vec<Msaa>,
+    /// What lights cast on the viewer's layer.
+    light: wgpu::TextureView,
+    light_msaa: Msaa,
 }
 
 pub struct Renderer {
@@ -522,7 +540,11 @@ pub struct Renderer {
     mask_pipeline: wgpu::RenderPipeline,
     /// The same, but only where a sprite is opaque: the props seen.
     mask_cutout_pipeline: wgpu::RenderPipeline,
-    seen_pipeline: wgpu::RenderPipeline,
+    /// What lights cast, into the light map.
+    light_pipeline: wgpu::RenderPipeline,
+    /// What's visible into `seen`: within the view radius (beyond it,
+    /// only what lights show, through `seen_shaft_pipeline`).
+    seen_near_pipeline: wgpu::RenderPipeline,
     seen_cutout_pipeline: wgpu::RenderPipeline,
     seen_shaft_pipeline: wgpu::RenderPipeline,
     fill_pipeline: wgpu::RenderPipeline,
@@ -608,6 +630,22 @@ fn texture_entry(
         },
         count: None,
     }
+}
+
+/// A polygon around `center` (by angle, as a sight polygon is), fanned out
+/// from it, then each of the convex `shapes` fanned from its first point:
+/// as a triangle list.
+fn fan<'a>(
+    center: [f32; 2],
+    polygon: &'a [[f32; 2]],
+    shapes: &'a [Vec<[f32; 2]>],
+) -> impl Iterator<Item = [f32; 2]> + 'a {
+    let n = polygon.len();
+    (0..n)
+        .flat_map(move |i| [center, polygon[i], polygon[(i + 1) % n]])
+        .chain(shapes.iter().flat_map(|shape| {
+            (1..shape.len().saturating_sub(1)).flat_map(move |i| [shape[0], shape[i], shape[i + 1]])
+        }))
 }
 
 impl Renderer {
@@ -747,7 +785,32 @@ impl Renderer {
             MASK_FORMAT.into(),
             MASK_SAMPLES,
         );
-        let seen_pipeline = triangles("seen", plain, "fs_mask", MASK_FORMAT.into(), 1);
+        // Lights' colors add up; how much they show is the most of any.
+        let add = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let most = wgpu::BlendComponent {
+            operation: wgpu::BlendOperation::Max,
+            ..add
+        };
+        let light_pipeline = triangles(
+            "light",
+            plain,
+            "fs_light",
+            wgpu::ColorTargetState {
+                format: LIGHT_FORMAT,
+                blend: Some(wgpu::BlendState {
+                    color: add,
+                    alpha: most,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            },
+            MASK_SAMPLES,
+        );
+        let seen_near_pipeline =
+            triangles("seen near", plain, "fs_mask_near", MASK_FORMAT.into(), 1);
         let seen_cutout_pipeline = triangles(
             "seen cutout",
             plain,
@@ -791,6 +854,7 @@ impl Renderer {
                     },
                     count: None,
                 },
+                texture_entry(6, wgpu::TextureViewDimension::D2),
             ],
         });
         let composite_shader =
@@ -845,7 +909,8 @@ impl Renderer {
             shape_pipeline,
             mask_pipeline,
             mask_cutout_pipeline,
-            seen_pipeline,
+            light_pipeline,
+            seen_near_pipeline,
             seen_cutout_pipeline,
             seen_shaft_pipeline,
             fill_pipeline,
@@ -931,8 +996,26 @@ impl Renderer {
             now: ArrayTexture::new(device, "mask now", size, slots, MASK_FORMAT),
             voids: ArrayTexture::new(device, "voids", size, slots, MASK_FORMAT),
             now_msaa: (0..MAX_VISIBLE)
-                .map(|_| Msaa::new(device, "now msaa", size))
+                .map(|_| Msaa::new(device, "now msaa", size, MASK_FORMAT))
                 .collect(),
+            light: device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("light"),
+                    size: wgpu::Extent3d {
+                        width: size[0],
+                        height: size[1],
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: LIGHT_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default()),
+            light_msaa: Msaa::new(device, "light msaa", size, LIGHT_FORMAT),
         });
         self.composite_bind_group = None;
     }
@@ -1022,6 +1105,7 @@ impl Renderer {
                         binding: 5,
                         resource: self.page_table.buffer.as_entire_binding(),
                     },
+                    texture(6, &screen.light),
                 ],
             }));
     }
@@ -1228,9 +1312,17 @@ impl Renderer {
         struct Ranges {
             canvases: [Range<u32>; 3],
             visible: Range<u32>,
+            lights: Range<u32>,
             props_seen: Range<u32>,
             standing: Range<u32>,
         }
+        // How far each sees by itself, for the triangles of what's visible
+        // (see `fs_mask_near`).
+        let radius = if frame.radius.is_finite() {
+            frame.radius
+        } else {
+            f32::MAX
+        };
         let ranges: Vec<Ranges> = layers
             .iter()
             .map(|l| {
@@ -1238,26 +1330,39 @@ impl Renderer {
                     .map(|c| push(&mut canvas_vertices, &c.vertices));
                 // Visible area as a triangle list: the polygon fanning out
                 // from the origin, plus each (convex) lit shape fanned from
-                // its first point.
-                let poly = &l.polygon;
+                // its first point; each vertex with how far the viewer sees
+                // by itself.
                 let start = mask_vertices.len() as u32;
-                let fan = (0..poly.len())
-                    .flat_map(|i| [frame.origin, poly[i], poly[(i + 1) % poly.len()]])
-                    .chain(l.lit_shapes.iter().flat_map(|shape| {
-                        (1..shape.len().saturating_sub(1))
-                            .flat_map(move |i| [shape[0], shape[i], shape[i + 1]])
-                    }))
-                    .map(|pos| Vertex {
+                let near = [frame.origin[0], frame.origin[1], radius, 0.0];
+                mask_vertices.extend(fan(frame.origin, &l.polygon, &l.lit_shapes).map(|pos| {
+                    Vertex {
                         pos,
+                        edge: near,
                         ..Default::default()
-                    });
-                mask_vertices.extend(fan);
+                    }
+                }));
                 let visible = start..mask_vertices.len() as u32;
+                // Likewise what each light lights, with its center, radius
+                // and color.
+                let start = mask_vertices.len() as u32;
+                for lit in &l.lights {
+                    let edge = [lit.center[0], lit.center[1], lit.radius, 0.0];
+                    mask_vertices.extend(fan(lit.center, lit.polygon(), lit.band()).map(|pos| {
+                        Vertex {
+                            pos,
+                            color: lit.color,
+                            edge,
+                            ..Default::default()
+                        }
+                    }));
+                }
+                let lights = start..mask_vertices.len() as u32;
                 let props_seen = push(&mut mask_vertices, &l.props_seen.vertices);
                 let standing = push(&mut mask_vertices, &l.standing.vertices);
                 Ranges {
                     canvases,
                     visible,
+                    lights,
                     props_seen,
                     standing,
                 }
@@ -1313,11 +1418,12 @@ impl Renderer {
             .iter()
             .zip(&ranges)
             .map(|(l, r)| {
-                let visible = &mask_vertices[r.visible.start as usize..r.visible.end as usize];
+                let of = |r: &Range<u32>| &mask_vertices[r.start as usize..r.end as usize];
+                let visible = of(&r.visible);
                 if !frame.remember || visible.is_empty() {
                     return Vec::new();
                 }
-                let key = seen_key(visible, l.shaft.as_deref(), page_px);
+                let key = seen_key(&[visible, of(&r.lights)], l.shaft.as_deref(), page_px);
                 let layer = frame.base + l.index;
                 if seen.drawn.get(&layer) == Some(&key) {
                     return Vec::new();
@@ -1641,6 +1747,20 @@ impl Renderer {
                     now.draw(range, 0..1);
                 }
             }
+            // On the viewer's layer, what lights cast.
+            if s == 0 {
+                let light = screen_textures
+                    .light_msaa
+                    .attachment(&screen_textures.light, true);
+                pass(
+                    &mut encoder,
+                    light,
+                    &self.light_pipeline,
+                    transform,
+                    None,
+                    &[(masks, r.lights.clone(), 0)],
+                );
+            }
             // What's visible, into each page of `seen` it covers.
             for d in page_draws {
                 let onto = &page_transforms.next().unwrap().bind_group;
@@ -1662,15 +1782,35 @@ impl Renderer {
                         let pipeline = &self.seen_shaft_pipeline;
                         pass(&mut encoder, page, pipeline, onto, group, &visible);
                     }
+                    // The viewer's layer: what's in sight within the radius,
+                    // and what lights show wherever it's in sight.
                     None => {
                         pass(
                             &mut encoder,
                             page,
-                            &self.seen_pipeline,
+                            &self.seen_near_pipeline,
                             onto,
                             None,
                             &visible,
                         );
+                        if !r.lights.is_empty() {
+                            pass(
+                                &mut encoder,
+                                cleared(&seen.shaft),
+                                &self.fill_pipeline,
+                                onto,
+                                None,
+                                &visible,
+                            );
+                            pass(
+                                &mut encoder,
+                                keep(&seen.atlas.layers[d.slot as usize]),
+                                &self.seen_shaft_pipeline,
+                                onto,
+                                Some(&seen.shaft_bind_group),
+                                &[(masks, r.lights.clone(), 0)],
+                            );
+                        }
                         if !r.props_seen.is_empty() {
                             pass(
                                 &mut encoder,

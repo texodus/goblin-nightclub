@@ -22,7 +22,8 @@
   },
   "props": {
     "tree": { "cells": [[0,15], [2,15], [4,15]], "size": [2, 2], "anchor": [0.5, 0.5], "height": 0.08, "blocks": true, "sight": 6 },
-    "rock": { "cells": [[6,15], [7,15], [8,15], [9,15]], "blocks": true, "sight": 5 }
+    "rock": { "cells": [[6,15], [7,15], [8,15], [9,15]], "blocks": true, "sight": 5 },
+    "torch": { "cells": [[10,15], [11,15]], "height": 0.05, "blocks": true, "light": { "radius": 5, "color": "#ffb060" } }
   },
   "sprites": {
     "player": { "cell": [0, 3] },

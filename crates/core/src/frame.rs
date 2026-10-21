@@ -8,6 +8,7 @@ use crate::draw::Canvas;
 use crate::layer::TILE;
 use crate::level::LayerMeshes;
 use crate::mesh::Mesh;
+use crate::vision::Lit;
 
 /// One layer of the level as seen this frame.
 pub struct LayerFrame {
@@ -24,12 +25,17 @@ pub struct LayerFrame {
     pub remembered: Canvas,
     /// Drawn where the viewer has never seen.
     pub unknown: Canvas,
-    /// Boundary of the visible region around `origin`, by angle; drawn as a
-    /// triangle fan.
+    /// Boundary of what's in line of sight around `origin`, by angle;
+    /// drawn as a triangle fan. It goes as far as `lights` light: visible
+    /// within the view radius, and beyond it where they light it.
     pub polygon: Vec<[f32; 2]>,
     /// Convex pieces of solid lit along with the polygon (which stops at
     /// wall faces): the band one tile behind the visible stretches of wall.
     pub lit_shapes: Vec<Vec<[f32; 2]>>,
+    /// What the lights showing what's beyond the view radius light (see
+    /// [`crate::vision::Vision::lights`]): each in its color, brightest
+    /// at its center.
+    pub lights: Vec<Arc<Lit>>,
     /// The art of the props seen in the way of sight (see
     /// [`crate::vision::Vision::props_seen`]): wherever it's opaque, it's
     /// visible, though the polygon stops at the near side of each one's

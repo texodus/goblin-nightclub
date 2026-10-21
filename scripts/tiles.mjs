@@ -16,7 +16,8 @@
 //              grate, grass, sand, stone, rock, brick, metal
 //   rows 15-16 props (things standing on tiles): trees, each two cells
 //              square, seen from above (columns 0-5), then rocks, a cell
-//              each, on row 15 (from column 6)
+//              each, on row 15 (from column 6), then torches (braziers),
+//              a cell each (from column 10)
 //
 // Natural textures are tileable across variants: near a cell's edges each
 // variant shows a field all of its material's variants share, and only
@@ -867,7 +868,34 @@ function boulder(v) {
     return shaded(CELL, h, R.rock, { mid: 2.6, grain: 0.5, seed: seedOf("boulder") + v, drop: 1 });
 }
 
-export const PROPS = { trees: 3, rocks: 4 };
+const FIRE = ramp("#5a1a14", "#9c2f17", "#d8571c", "#f28c28", "#fbc04a", "#ffe98a", "#fffbe0");
+
+// A torch, variant `v`: an iron brazier, a cell square, seen from above,
+// its coals glowing and a flame licking up out of them, brightest at the
+// heart.
+function brazier(v) {
+    const next = rng(seedOf("brazier") + v * 15485863);
+    const c = CELL / 2;
+    const bowl = shaded(CELL, clumps(CELL, [[c - 0.5, c - 0.5, 6]]), R.metal, { mid: 1.6, grain: 0.3, seed: seedOf("brazier") + v, drop: 1 });
+    // The flame: a few tongues about the middle, swept a little one way.
+    const tongues = [[c - 0.5, c - 0.5, 2.2]];
+    for (let i = 0; i < 4; i++) {
+        const a = (i / 4 + next() * 0.15) * Math.PI * 2;
+        tongues.push([c - 0.5 + Math.cos(a) * 1.9, c - 0.5 + Math.sin(a) * 1.9, 1.1 + next() * 0.7]);
+    }
+    const flame = clumps(CELL, tongues);
+    return bowl.map((px, i) => {
+        const [x, y] = [i % CELL, Math.floor(i / CELL)];
+        const d = Math.hypot(x + 0.5 - (c - 0.5), y + 0.5 - (c - 0.5));
+        if (d > 4.2) return px;
+        // Coals in the bowl, flecked; the flame over them.
+        const coal = 0.4 + hash(x >> 1, y, seedOf("coals") + v) * 2 - d * 0.3;
+        const f = flame(x + 0.5, y + 0.5);
+        return pick(FIRE, f > 0 ? Math.max(coal, 2 + f * 4.4) : coal);
+    });
+}
+
+export const PROPS = { trees: 3, rocks: 4, torches: 2 };
 
 export const SPRITES = { player: [PLAYER, PLAYER_LEGEND], npc: [NPC, NPC_LEGEND] };
 export { sprite };
@@ -915,6 +943,7 @@ export function sheet() {
         tree(v).forEach((t, i) => put(2 * v + (i % 2), 15 + Math.floor(i / 2), t));
     }
     for (let v = 0; v < PROPS.rocks; v++) put(2 * PROPS.trees + v, 15, boulder(v));
+    for (let v = 0; v < PROPS.torches; v++) put(2 * PROPS.trees + PROPS.rocks + v, 15, brazier(v));
     return { width: W, height: H, pixels };
 }
 

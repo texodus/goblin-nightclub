@@ -21,7 +21,7 @@ use goblin_nightclub_core::path;
 use goblin_nightclub_core::prop::draw_prop;
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::tileset::{Cell, Tileset};
-use goblin_nightclub_core::vision::Vision;
+use goblin_nightclub_core::vision::{Around, Vision};
 use goblin_nightclub_core::world::{Build, ChunkSource, FileSource, Window};
 use goblin_nightclub_generate::Params;
 
@@ -864,15 +864,18 @@ impl Game {
                 let underground = self.outdoors() && k < self.local_ground();
                 self.visions[k].set_radius(view_radius(base, self.top - k, underground));
                 let own = self.level.layer(k);
-                // Props block sight on the viewer's own layer; below, seen
-                // from above, they don't.
-                let circles = if k == self.top {
-                    self.level.circles(k)
+                // Props block sight on the viewer's own layer, and lamps
+                // light it; below, seen from above, neither.
+                let around = if k == self.top {
+                    Around {
+                        circles: self.level.circles(k),
+                        lamps: self.level.lamps(k),
+                    }
                 } else {
-                    &[]
+                    Around::default()
                 };
                 let vision = &mut self.visions[k];
-                vision.update_through(&view, own, shaft.as_deref(), above, origin, circles);
+                vision.update_through(&view, own, shaft.as_deref(), above, origin, around);
             }
             let here = self.npcs.iter().filter(|n| n.layer == k);
             self.memories[k].update(&view, &self.visions[k], here, self.time);
@@ -977,6 +980,7 @@ impl Game {
                     unknown: Canvas::new(tileset),
                     polygon: vision.polygon().to_vec(),
                     lit_shapes: vision.wall_band().to_vec(),
+                    lights: vision.lights().to_vec(),
                     standing,
                     shaft,
                 }
@@ -1547,6 +1551,38 @@ mod tests {
         assert_eq!(player_tile(&game), [7, 1]);
         let route_ok = game.level.movement(0).solid(4, 1) == Solid::Full;
         assert!(route_ok, "solid to walking");
+    }
+
+    #[test]
+    fn torchlight_shows_what_it_lights_beyond_the_view_radius() {
+        // Under a roof, so seen only `VIEW_RADIUS` far but for the torch.
+        let floor = ".".repeat(30);
+        let rows = [floor.as_str(), floor.as_str(), floor.as_str()];
+        let torch = tileset().prop("torch").unwrap();
+        let lit = |torch: Option<u8>| {
+            let props: Vec<Prop> = torch
+                .map(|kind| Prop { at: [12, 1], kind })
+                .into_iter()
+                .collect();
+            let lower = Layer::from_ascii(&rows).with_props(&props);
+            Level::new(vec![lower, Layer::from_ascii(&rows)], tileset())
+        };
+        for (torch, seen) in [(Some(torch), true), (None, false)] {
+            let mut game = game_on(lit(torch), 0, [0, 1]);
+            assert!(!game.outdoors());
+            // Past the view radius, one in its light and one past it.
+            game.npcs.push(Entity::npc(7, [150.0, 12.0]));
+            game.npcs.push(Entity::npc(8, [190.0, 12.0]));
+            game.observed = None;
+            game.observe();
+            assert_eq!(game.memories[0].is_visible(7), seen, "torch {torch:?}");
+            assert!(!game.memories[0].is_visible(8), "torch {torch:?}");
+            assert_eq!(game.visions[0].is_explored(15, 1), seen);
+            assert!(!game.visions[0].is_explored(20, 1));
+            // The frame has its light, to draw.
+            let lights = game.frame().layers[0].lights.len();
+            assert_eq!(lights, usize::from(seen));
+        }
     }
 
     #[test]

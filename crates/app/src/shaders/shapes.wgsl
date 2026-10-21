@@ -229,8 +229,43 @@ fn fs_mask_cutout(in: VsOut) -> @location(0) vec4<f32> {
     return vec4(1.0);
 }
 
+// Like `fs_mask`, but only within `edge.z` of `edge.xy`: what's seen within
+// the view radius, remembered as seen (beyond it, only what lights show is).
+@fragment
+fn fs_mask_near(in: VsOut) -> @location(0) vec4<f32> {
+    if distance(in.world, in.edge.xy) > in.edge.z {
+        discard;
+    }
+    return vec4(1.0);
+}
+
+// A light (see `goblin_nightclub_core::vision::Lit`): how bright at its
+// heart and at its rim, and how much of its color it casts (the rest
+// white). Mirrored in composite.wgsl, for the viewer's own.
+const LIGHT_HEART: f32 = 1.1;
+const LIGHT_RIM: f32 = 0.4;
+const LIGHT_WARMTH: f32 = 0.6;
+// Width (world units) of the band inside its radius where what it lights
+// fades from view (as `RADIUS_FADE` in composite.wgsl).
+const LIGHT_FADE: f32 = 12.0;
+
+// What a light, its center and radius in `edge` and its color in `color`,
+// casts at `world`: its tinted brightness (added up where lights meet),
+// and how much what it lights shows (the most of any).
+@fragment
+fn fs_light(in: VsOut) -> @location(0) vec4<f32> {
+    let d = distance(in.world, in.edge.xy);
+    let r = in.edge.z;
+    let t = clamp(d / r, 0.0, 1.0);
+    let bright = mix(LIGHT_RIM, LIGHT_HEART, (1.0 - t) * (1.0 - t));
+    let tint = mix(vec3(1.0), in.color.rgb, LIGHT_WARMTH);
+    let shown = 1.0 - smoothstep(r - LIGHT_FADE, r, d);
+    return vec4(tint * bright * shown, shown);
+}
+
 // Like `fs_mask`, but only where `shaft` is set: a layer below the viewer's
-// may only be remembered as seen where it shows through.
+// may only be remembered as seen where it shows through, and what lights
+// show only where it's in line of sight.
 @group(1) @binding(0) var shaft: texture_2d<f32>;
 
 @fragment

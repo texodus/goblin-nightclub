@@ -2249,9 +2249,9 @@ mod tests {
     #[test]
     fn props_stand_alone_and_close_no_way() {
         let t = tileset();
-        let (tree, rock) = (t.prop("tree").unwrap(), t.prop("rock").unwrap());
+        let [tree, rock, torch] = ["tree", "rock", "torch"].map(|n| t.prop(n).unwrap());
         let (grass, cave) = (t.floor(PLAINS).unwrap(), t.floor(CAVE_FLOOR).unwrap());
-        let (mut trees, mut rocks) = (0, 0);
+        let (mut trees, mut rocks, mut torches) = (0, 0, 0);
         for seed in 0..3 {
             let params = Params::default();
             let file = super::world(seed, 160, 100, [805.0, 505.0], &params);
@@ -2266,15 +2266,21 @@ mod tests {
                     props.iter().map(|p| p.at).collect();
                 for p in props {
                     let [x, y] = p.at.map(|v| v as i32);
-                    // Trees on the grass above ground, rocks on caves' floor
-                    // below.
-                    let (kind, on) = if k >= ground {
-                        (tree, grass)
+                    // Trees on the grass above ground; rocks on caves' floor
+                    // below, and torches on any floor.
+                    let tile = at(k, x, y);
+                    if k >= ground {
+                        assert_eq!(p.kind, tree, "seed {seed} layer {k} at {:?}", p.at);
+                        assert_eq!(tile, Some(Tile::Whole(Part::Floor(grass))));
+                        trees += 1;
+                    } else if p.kind == torch {
+                        assert!(matches!(tile, Some(Tile::Whole(Part::Floor(_)))));
+                        torches += 1;
                     } else {
-                        (rock, cave)
-                    };
-                    assert_eq!(p.kind, kind, "seed {seed} layer {k} at {:?}", p.at);
-                    assert_eq!(at(k, x, y), Some(Tile::Whole(Part::Floor(on))));
+                        assert_eq!(p.kind, rock, "seed {seed} layer {k} at {:?}", p.at);
+                        assert_eq!(tile, Some(Tile::Whole(Part::Floor(cave))));
+                        rocks += 1;
+                    }
                     // Open floor all round, nothing else standing there.
                     for (dx, dy) in (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dx, dy))) {
                         if (dx, dy) == (0, 0) {
@@ -2297,11 +2303,6 @@ mod tests {
                             || (x - s[0]).abs().max((y - s[1]).abs()) > SPAWN_CLEARANCE
                     );
                 }
-                if k >= ground {
-                    trees += props.len();
-                } else {
-                    rocks += props.len();
-                }
             }
             // Everywhere walkable without them is walkable with them, but
             // where they stand.
@@ -2322,7 +2323,10 @@ mod tests {
                 }
             }
         }
-        assert!(trees > 50 && rocks > 50, "{trees} trees, {rocks} rocks");
+        assert!(
+            trees > 50 && rocks > 50 && torches > 20,
+            "{trees} trees, {rocks} rocks, {torches} torches"
+        );
     }
 
     fn spawn_tile_of(file: &LevelFile) -> [i32; 2] {

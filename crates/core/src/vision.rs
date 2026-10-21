@@ -18,11 +18,21 @@
 //! (a tree dims what's behind it; several hide it). What's seen of NPCs
 //! and what's remembered would then need a matching test here: how much
 //! light gets through the circles along a line.
+//!
+//! Lights (a torch's: see [`Lamp`]) show more than the viewer's own radius:
+//! what a lamp lights, the viewer sees wherever it has a line of sight to
+//! it, however far, so long as the lamp lights something the viewer sees
+//! by itself. What a lamp lights is what it would see, were it a viewer:
+//! worked out once, since lamps stay put. The viewer's polygon then goes
+//! as far as any such lamp's light does, and is seen where it's within the
+//! viewer's radius or lit.
 
 use std::f32::consts::TAU;
+use std::sync::{Arc, OnceLock};
 
 use crate::draw::inward_normal;
 use crate::layer::{Edge, Layer, Line, Shape, TILE};
+use crate::palette::Color;
 
 /// Minimum angular offset of the extra rays cast to either side of each
 /// corner, sampling the boundary just before and just after it.
@@ -160,6 +170,109 @@ pub struct Circle {
     pub radius: f32,
 }
 
+/// A light on a layer: a prop's (see [`crate::tileset::Light`]), at its
+/// tile's center.
+pub struct Lamp {
+    pub center: [f32; 2],
+    /// How far it reaches, in world units.
+    pub radius: f32,
+    pub color: Color,
+    lit: OnceLock<Arc<Lit>>,
+}
+
+impl Lamp {
+    pub fn new(center: [f32; 2], radius: f32, color: Color) -> Self {
+        Self {
+            center,
+            radius,
+            color,
+            lit: OnceLock::new(),
+        }
+    }
+
+    /// What it lights of `layer`, the one it's on, with `circles` in the
+    /// way: the same every time, so worked out once.
+    pub fn lit(&self, layer: &Layer, circles: &[Circle]) -> &Arc<Lit> {
+        self.lit
+            .get_or_init(|| Arc::new(Lit::new(layer, self, circles)))
+    }
+}
+
+/// What a lamp lights: what it would see, were it a viewer.
+pub struct Lit {
+    pub center: [f32; 2],
+    pub radius: f32,
+    pub color: Color,
+    polygon: Vec<[f32; 2]>,
+    band: Vec<Shape>,
+    /// The stretches of its layer's outline edges it lights (see
+    /// [`Vision::stretches`]), by edge.
+    stretches: Vec<(usize, f32, f32)>,
+    /// The tiles any of which it lights.
+    tiles: Vec<[usize; 2]>,
+    blocking: Circles,
+}
+
+impl Lit {
+    fn new(layer: &Layer, lamp: &Lamp, circles: &[Circle]) -> Self {
+        let mut v = Vision::new(layer, lamp.radius);
+        let around = Around {
+            circles,
+            lamps: &[],
+        };
+        v.update_through(layer, layer, None, None, lamp.center, around);
+        Self {
+            center: lamp.center,
+            radius: lamp.radius,
+            color: lamp.color,
+            stretches: {
+                let mut s = std::mem::take(&mut v.stretches);
+                s.sort_unstable_by_key(|s| s.0);
+                s
+            },
+            tiles: v.explored_tiles().collect(),
+            polygon: std::mem::take(&mut v.polygon),
+            band: std::mem::take(&mut v.wall_band),
+            blocking: std::mem::take(&mut v.blocking),
+        }
+    }
+
+    /// The boundary of what it lights, by angle around its center (see
+    /// [`Vision::polygon`]).
+    pub fn polygon(&self) -> &[[f32; 2]] {
+        &self.polygon
+    }
+
+    /// The solid it lights, as convex pieces (see [`Vision::wall_band`]).
+    pub fn band(&self) -> &[Shape] {
+        &self.band
+    }
+
+    /// Does it light point `p`? `level` is what blocks sight on its layer.
+    pub fn lights(&self, level: &Layer, p: [f32; 2]) -> bool {
+        distance(self.center, p) <= self.radius
+            && level.los(self.center, p)
+            && self.blocking.clear(p)
+    }
+
+    /// The stretches of outline edge `k` it lights: from and to, along it.
+    fn lit_along(&self, k: usize) -> impl Iterator<Item = (f32, f32)> + '_ {
+        let first = self.stretches.partition_point(|s| s.0 < k);
+        (self.stretches[first..].iter())
+            .take_while(move |s| s.0 == k)
+            .map(|s| (s.1, s.2))
+    }
+}
+
+/// What stands on a layer that matters to sight, besides its tiles.
+#[derive(Clone, Copy, Default)]
+pub struct Around<'a> {
+    /// Props' circles in the way of sight.
+    pub circles: &'a [Circle],
+    /// Lights.
+    pub lamps: &'a [Lamp],
+}
+
 /// Bins the circles in reach are sorted into, by the angles they span
 /// from the viewer.
 const CIRCLE_BINS: usize = 256;
@@ -279,6 +392,11 @@ pub struct Vision {
     origin: [f32; 2],
     /// View distance in pixels; `f32::INFINITY` for unlimited.
     radius: f32,
+    /// How far the polygon goes: the radius, or further as far as the
+    /// light of any lamp near enough goes.
+    reach: f32,
+    /// What the lamps that light anything the viewer sees by itself light.
+    lit: Vec<Arc<Lit>>,
     /// Boundary of the visible region, by increasing angle around `origin`
     /// (clockwise on screen, since y points down). Render as a triangle fan
     /// centered on `origin`.
@@ -286,6 +404,9 @@ pub struct Vision {
     /// Lit solid, as convex pieces: within one tile of the visible stretches
     /// of wall, or for a layer seen from above, whole walls whose tops show.
     wall_band: Vec<Shape>,
+    /// The visible stretches of outline edges: each edge's index, and
+    /// from and to, along it from its `a`.
+    stretches: Vec<(usize, f32, f32)>,
     /// Per outline edge of the level: visible now, and ever seen.
     edge_visible: Vec<bool>,
     edge_seen: Vec<bool>,
@@ -305,8 +426,11 @@ impl Vision {
         Self {
             origin: [0.0; 2],
             radius,
+            reach: radius,
+            lit: Vec::new(),
             polygon: Vec::new(),
             wall_band: Vec::new(),
+            stretches: Vec::new(),
             edge_visible: vec![false; level.outline_edges().len()],
             edge_seen: vec![false; level.outline_edges().len()],
             cols: level.cols,
@@ -330,8 +454,22 @@ impl Vision {
         self.radius = radius;
     }
 
+    /// How far the polygon goes: see [`Vision::polygon`].
+    pub fn reach(&self) -> f32 {
+        self.reach
+    }
+
+    /// Boundary of what's in line of sight, out to [`Vision::reach`]: the
+    /// radius, or further where lamps light what's beyond it. Seen within
+    /// the radius, and beyond it where [`Vision::lights`] light it.
     pub fn polygon(&self) -> &[[f32; 2]] {
         &self.polygon
+    }
+
+    /// What's lit by the lamps that light anything seen within the radius:
+    /// seen too, wherever it's in line of sight.
+    pub fn lights(&self) -> &[Arc<Lit>] {
+        &self.lit
     }
 
     /// The tiles of the props in the way of sight that are seen (any of
@@ -360,7 +498,7 @@ impl Vision {
 
     /// Recompute visibility from `origin` (a pixel-space point in open space).
     pub fn update(&mut self, level: &Layer, origin: [f32; 2]) {
-        self.update_through(level, level, None, None, origin, &[]);
+        self.update_through(level, level, None, None, origin, Around::default());
     }
 
     /// Recompute visibility of a layer `own` seen from above: through the
@@ -374,8 +512,11 @@ impl Vision {
     /// each wall tile whose top is in view lights up whole, instead of a
     /// band behind visible faces.
     ///
-    /// Sight can't pass `circles` either (props in the way: see
-    /// [`Circle`]), and each seen lights up whole.
+    /// Sight can't pass `around`'s circles either (props in the way: see
+    /// [`Circle`]), and each seen lights up whole. Its lamps (on `own`, the
+    /// layer they're on, which `sight` must block as `own` does) show what
+    /// they light beyond the radius, if they light anything seen within
+    /// it.
     pub fn update_through(
         &mut self,
         sight: &Layer,
@@ -383,10 +524,18 @@ impl Vision {
         shaft: Option<&[bool]>,
         above: Option<&Layer>,
         origin: [f32; 2],
-        circles: &[Circle],
+        around: Around,
     ) {
         self.origin = origin;
-        self.blocking.gather(origin, self.radius, circles);
+        // The lamps whose light may reach into the radius: seen as far as
+        // their light goes.
+        let near: Vec<&Lamp> = (around.lamps.iter())
+            .filter(|l| distance(origin, l.center) < self.radius + l.radius)
+            .collect();
+        self.reach = (near.iter())
+            .map(|l| distance(origin, l.center) + l.radius)
+            .fold(self.radius, f32::max);
+        self.blocking.gather(origin, self.reach, around.circles);
         // Kept (it's read until the next update), but rarely changes.
         match (&mut self.shaft, shaft) {
             (Some(mine), Some(shaft)) if mine.as_slice() != shaft => mine.clone_from_slice(shaft),
@@ -394,6 +543,14 @@ impl Vision {
             (mine, shaft) => *mine = shaft.map(<[bool]>::to_vec),
         }
         self.rebuild_polygon(sight);
+        // Of those, the ones lighting anything seen within the radius.
+        self.lit.clear();
+        for lamp in near {
+            let lit = lamp.lit(own, around.circles);
+            if self.sees_lit(sight, own, lit) {
+                self.lit.push(lit.clone());
+            }
+        }
         self.find_wall_band(own);
         if let Some(above) = above {
             self.find_wall_tops(own, above);
@@ -541,12 +698,31 @@ impl Vision {
     /// Can the viewer currently see pixel-space point `p`? `level` is what
     /// blocks sight (the sight grid, for a layer seen from above).
     pub fn can_see(&self, level: &Layer, p: [f32; 2]) -> bool {
-        let d = [p[0] - self.origin[0], p[1] - self.origin[1]];
+        let d = distance(self.origin, p);
+        d <= self.reach
+            && (d <= self.radius || self.lit.iter().any(|l| l.lights(level, p)))
+            && self.in_line(level, p)
+    }
+
+    /// Is `p` in line of sight, however far?
+    fn in_line(&self, level: &Layer, p: [f32; 2]) -> bool {
         let tile = [(p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32];
-        crate::length(d) <= self.radius
-            && self.in_shaft(tile)
-            && level.los(self.origin, p)
-            && self.blocking.clear(p)
+        self.in_shaft(tile) && level.los(self.origin, p) && self.blocking.clear(p)
+    }
+
+    /// Is anything `lit` lights seen within the radius? Only its tiles' sight
+    /// samples are looked at (see [`Layer::sight_samples`]), of `own`.
+    fn sees_lit(&self, sight: &Layer, own: &Layer, lit: &Lit) -> bool {
+        let near = self.radius + TILE;
+        let center = |[x, y]: [usize; 2]| [(x as f32 + 0.5) * TILE, (y as f32 + 0.5) * TILE];
+        (lit.tiles.iter())
+            .filter(|t| distance(center(**t), self.origin) <= near)
+            .flat_map(|&[x, y]| own.sight_samples(x as i32, y as i32))
+            .any(|p| {
+                distance(p, self.origin) <= self.radius
+                    && lit.lights(sight, p)
+                    && self.in_line(sight, p)
+            })
     }
 
     /// Has any part of tile `(x, y)` ever been visible?
@@ -595,10 +771,10 @@ impl Vision {
         // Angular zones around each corner (center, half-width) in which a
         // plain ray can't be trusted to land on the right side of it.
         let mut zones: Vec<(f32, f32)> = Vec::new();
-        for i in level.corners_near(origin, self.radius) {
+        for i in level.corners_near(origin, self.reach) {
             let c = level.corners()[i];
             // Corners outside the radius can't shape the visible region.
-            if distance(origin, c) > self.radius {
+            if distance(origin, c) > self.reach {
                 continue;
             }
             let (a, eps) = (angle(origin, c), corner_eps(distance(origin, c)));
@@ -626,7 +802,7 @@ impl Vision {
                     .map(|i| Ray::new(a - half + 2.0 * half * i as f32 / across as f32, vec![])),
             );
         }
-        if self.radius.is_finite() {
+        if self.reach.is_finite() {
             rays.extend(
                 (0..ARC_SAMPLES).map(|i| Ray::new(i as f32 * TAU / ARC_SAMPLES as f32, vec![])),
             );
@@ -634,10 +810,10 @@ impl Vision {
             // arc where the wall crosses the circle; elsewhere it switches at
             // corners. So sample either side of every such crossing, or the
             // chord between neighboring rays could cut off visible floor.
-            let eps = corner_eps(self.radius);
-            for k in level.edges_near(origin, self.radius) {
+            let eps = corner_eps(self.reach);
+            for k in level.edges_near(origin, self.reach) {
                 let e = &level.outline_edges()[k];
-                for p in circle_crossings(origin, self.radius, e.a, e.b) {
+                for p in circle_crossings(origin, self.reach, e.a, e.b) {
                     let angle = angle(origin, p);
                     rays.extend([Ray::new(angle - eps, vec![]), Ray::new(angle + eps, vec![])]);
                 }
@@ -699,7 +875,7 @@ impl Vision {
         let blocking = &self.blocking;
         let cast = |angle: f32| {
             let d = dir(angle);
-            let walls = level.raycast(origin, d, self.radius);
+            let walls = level.raycast(origin, d, self.reach);
             blocking.cast(angle, d, walls)
         };
         // Plain rays contribute their hit point. At a corner ray the
@@ -718,7 +894,7 @@ impl Vision {
                 // there to the circle; where it ends, it goes back out.
                 let side = if starts { -1.0 } else { 1.0 };
                 let d = dir(ray.angle);
-                let walls = level.raycast(origin, d, self.radius);
+                let walls = level.raycast(origin, d, self.reach);
                 let exact = blocking.cast_except(ray.angle, d, walls, center);
                 let far = exact.min(cast(ray.angle + side * corner_eps(near)));
                 if far <= near + SAME_POINT {
@@ -757,7 +933,7 @@ impl Vision {
             let base = angle(origin, nearest);
             let (before, after) = (cast(base - side), cast(base + side));
             let reach = blocking
-                .cast(base, aim, level.raycast(origin, aim, self.radius))
+                .cast(base, aim, level.raycast(origin, aim, self.reach))
                 .min(before.max(after));
             let along = |d: f32| [origin[0] + aim[0] * d, origin[1] + aim[1] * d];
 
@@ -823,6 +999,7 @@ impl Vision {
         const ON: f32 = 1e-2;
         self.edge_visible.fill(false);
         self.wall_band.clear();
+        self.stretches.clear();
         let mut band: Vec<Shape> = Vec::new();
         let mut reached: Vec<[f32; 2]> = Vec::new();
 
@@ -848,32 +1025,47 @@ impl Vision {
                 }
                 let (tp, tq) = (along(p), along(q));
                 let (lo, hi) = (tp.min(tq).max(0.0), tp.max(tq).min(len));
-                if hi - lo <= 1e-6 {
-                    continue;
+                // Beyond the radius, only what's lit is seen: of the
+                // stretch, what's within the radius, and what lamps light.
+                let mut pieces = vec![(lo, hi)];
+                if self.reach > self.radius {
+                    let w = [e.a[0] - self.origin[0], e.a[1] - self.origin[1]];
+                    let b = w[0] * u[0] + w[1] * u[1];
+                    let disc = b * b - (w[0] * w[0] + w[1] * w[1] - self.radius * self.radius);
+                    let s = disc.max(0.0).sqrt();
+                    pieces[0] = (lo.max(-b - s), hi.min(-b + s));
+                    let lit = self.lit.iter().flat_map(|l| l.lit_along(k));
+                    pieces.extend(lit.map(|(a, b)| (lo.max(a), hi.min(b))));
                 }
-                // Seen from above, only faces showing through count.
-                if !self.in_shaft(e.solid) && self.shaft.is_some() {
-                    continue;
+                for (lo, hi) in pieces {
+                    if hi - lo <= 1e-6 {
+                        continue;
+                    }
+                    // Seen from above, only faces showing through count.
+                    if !self.in_shaft(e.solid) && self.shaft.is_some() {
+                        continue;
+                    }
+                    self.edge_visible[k] = true;
+                    self.edge_seen[k] = true;
+                    self.stretches.push((k, lo, hi));
+                    if !level.in_bounds(e.solid) {
+                        continue; // The level's boundary: nothing to light.
+                    }
+                    let nrm = inward_normal(e.a, e.b);
+                    let s0 = [e.a[0] + u[0] * lo, e.a[1] + u[1] * lo];
+                    let s1 = [e.a[0] + u[0] * hi, e.a[1] + u[1] * hi];
+                    let deep = |x: [f32; 2]| [x[0] + nrm[0] * TILE, x[1] + nrm[1] * TILE];
+                    band.push(vec![s0, s1, deep(s1), deep(s0)]);
+                    reached.extend([s0, s1]);
                 }
-                self.edge_visible[k] = true;
-                self.edge_seen[k] = true;
-                if !level.in_bounds(e.solid) {
-                    continue; // The level's boundary: nothing to light.
-                }
-                let nrm = inward_normal(e.a, e.b);
-                let s0 = [e.a[0] + u[0] * lo, e.a[1] + u[1] * lo];
-                let s1 = [e.a[0] + u[0] * hi, e.a[1] + u[1] * hi];
-                let deep = |x: [f32; 2]| [x[0] + nrm[0] * TILE, x[1] + nrm[1] * TILE];
-                band.push(vec![s0, s1, deep(s1), deep(s0)]);
-                reached.extend([s0, s1]);
             }
         }
 
-        // Every stretch reached is within the radius.
+        // Every stretch reached is within reach.
         let near = if reached.is_empty() {
             Vec::new()
         } else {
-            level.concave_near(self.origin, self.radius + TILE)
+            level.concave_near(self.origin, self.reach + TILE)
         };
         for c in near.into_iter().map(|k| &level.concave_corners()[k]) {
             if reached.iter().any(|r| distance(*r, c.at) < 1e-3) {
@@ -934,6 +1126,19 @@ impl Vision {
                 }
                 let center = [(x as f32 + 0.5) * TILE, (y as f32 + 0.5) * TILE];
                 if distance(center, self.origin) > reach {
+                    continue;
+                }
+                self.explored[i] = own
+                    .sight_samples(x as i32, y as i32)
+                    .into_iter()
+                    .any(|p| self.can_see(sight, p));
+            }
+        }
+        // And beyond, what's lit.
+        for lit in self.lit.clone() {
+            for &[x, y] in &lit.tiles {
+                let i = y * self.cols + x;
+                if self.explored[i] || !self.in_shaft([x as i32, y as i32]) {
                     continue;
                 }
                 self.explored[i] = own
@@ -1168,6 +1373,14 @@ mod tests {
         }
     }
 
+    /// Just `circles` around.
+    fn circles(circles: &[Circle]) -> Around<'_> {
+        Around {
+            circles,
+            ..Default::default()
+        }
+    }
+
     /// A circle around tile `t`'s center, radius `r`.
     fn circle_at(t: [usize; 2], r: f32) -> Circle {
         let [x, y] = t.map(|v| v as f32 * TILE);
@@ -1185,7 +1398,7 @@ mod tests {
         let rock = circle_at([15, 10], 4.0);
         let origin = [50.0, 105.0];
         let mut v = Vision::new(&level, f32::INFINITY);
-        v.update_through(&level, &level, None, None, origin, &[rock]);
+        v.update_through(&level, &level, None, None, origin, circles(&[rock]));
         // Behind it, hidden; beside it, and its own tile, seen.
         let (behind, beside) = ([250.0, 105.0], [250.0, 140.0]);
         assert!(!v.can_see(&level, behind));
@@ -1216,9 +1429,88 @@ mod tests {
             None,
             None,
             origin,
-            &[circle_at([12, 10], 2.0)],
+            circles(&[circle_at([12, 10], 2.0)]),
         );
         assert!(v.props_seen().is_empty());
+    }
+
+    /// Just `lamps` around.
+    fn lamps(lamps: &[Lamp]) -> Around<'_> {
+        Around {
+            lamps,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lamps_show_what_they_light_beyond_the_radius() {
+        let rows: Vec<String> = (0..20).map(|_| ".".repeat(40)).collect();
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let level = Layer::from_ascii(&rows);
+        let origin = [55.0, 105.0];
+        let lamp = [Lamp::new([105.0, 105.0], 40.0, [1.0; 4])];
+        let mut v = Vision::new(&level, 30.0);
+        v.update_through(&level, &level, None, None, origin, self::lamps(&lamp));
+        assert_eq!(v.lights().len(), 1, "it lights what's seen");
+        assert_eq!(v.reach(), 50.0 + 40.0);
+        // Past the radius, lit: seen. Past its light too: not.
+        assert!(v.can_see(&level, [140.0, 105.0]));
+        assert!(!v.can_see(&level, [150.0, 105.0]));
+        assert!(!v.can_see(&level, [55.0, 150.0]), "unlit, past the radius");
+        assert!(v.is_explored(13, 10));
+        assert!(!v.is_explored(16, 10));
+        // The polygon goes as far.
+        assert!(inside(v.polygon(), [140.0, 105.0]));
+        // Further off, its light no longer reaches into the radius.
+        v.update_through(
+            &level,
+            &level,
+            None,
+            None,
+            [15.0, 105.0],
+            self::lamps(&lamp),
+        );
+        assert!(v.lights().is_empty());
+        assert_eq!(v.reach(), 30.0);
+        assert!(!v.can_see(&level, [100.0, 105.0]));
+    }
+
+    #[test]
+    fn lamps_count_only_if_they_light_whats_seen() {
+        // A corridor, and a room off it through a door, its lamp lighting
+        // a little of the corridor below the door.
+        let level = Layer::from_ascii(&[
+            "##############################",
+            "#############.....############",
+            "#############.....############",
+            "###############.##############",
+            "#............................#",
+            "##############################",
+        ]);
+        let lamp = [Lamp::new([155.0, 15.0], 80.0, [1.0; 4])];
+        let lit = [159.0, 45.0];
+        assert!(lamp[0].lit(&level, &[]).lights(&level, lit));
+        let origin = [25.0, 45.0];
+        // Its light and the viewer's sight overlap, but walls part them:
+        // what it lights in view is all beyond the radius.
+        let mut v = Vision::new(&level, 60.0);
+        v.update_through(&level, &level, None, None, origin, self::lamps(&lamp));
+        assert!(v.lights().is_empty());
+        assert!(!v.can_see(&level, lit));
+        assert!(!v.is_explored(15, 4));
+        // Seeing a little further, the near edge of what it lights is in
+        // the radius, and the rest of it beyond seen too.
+        let mut v = Vision::new(&level, 128.0);
+        v.update_through(&level, &level, None, None, origin, self::lamps(&lamp));
+        assert_eq!(v.lights().len(), 1);
+        assert!(distance(origin, lit) > 128.0);
+        assert!(v.can_see(&level, lit));
+        // Not what's past its light, nor the room, out of line of sight.
+        assert!(!v.can_see(&level, [175.0, 45.0]));
+        assert!(!v.can_see(&level, [155.0, 15.0]));
+        // The wall it lights below the door is seen, as far as it's lit.
+        assert!(band_covers(&v, [160.0, 52.0]));
+        assert!(!band_covers(&v, [175.0, 52.0]));
     }
 
     #[test]
@@ -1246,7 +1538,14 @@ mod tests {
             {
                 for radius in [f32::INFINITY, 80.0] {
                     let mut vision = Vision::new(&level, radius);
-                    vision.update_through(&level, &level, None, None, origin, &circles);
+                    vision.update_through(
+                        &level,
+                        &level,
+                        None,
+                        None,
+                        origin,
+                        self::circles(&circles),
+                    );
                     check_polygon(&level, &vision, &mut rng);
                 }
             }
@@ -1431,7 +1730,14 @@ mod tests {
             let mut v = Vision::new(&below, f32::INFINITY);
             let sight = deck_sight(&below, deck);
             let shaft = vec![true; 18];
-            v.update_through(&sight, &below, Some(&shaft), Some(deck), [5.0, 15.0], &[]);
+            v.update_through(
+                &sight,
+                &below,
+                Some(&shaft),
+                Some(deck),
+                [5.0, 15.0],
+                Around::default(),
+            );
             band_area(&v)
         };
         // Nothing above: all three wall tops, though the far block's faces
@@ -1453,7 +1759,14 @@ mod tests {
         let mut v = Vision::new(&below, f32::INFINITY);
         let sight = deck_sight(&below, &deck);
         let shaft = [false, true, true, true, false, false];
-        v.update_through(&sight, &below, Some(&shaft), Some(&deck), [45.0, 5.0], &[]);
+        v.update_through(
+            &sight,
+            &below,
+            Some(&shaft),
+            Some(&deck),
+            [45.0, 5.0],
+            Around::default(),
+        );
         // The left wall, next to the hole, lights up; the right one, next
         // to floor, doesn't.
         assert!((band_area(&v) - 100.0).abs() < 1e-2, "{}", band_area(&v));
@@ -1461,7 +1774,14 @@ mod tests {
         assert!(!v.is_explored(5, 0));
         // Out of range of the hole's edge, it stays dark.
         let mut near = Vision::new(&below, 20.0);
-        near.update_through(&sight, &below, Some(&shaft), Some(&deck), [45.0, 5.0], &[]);
+        near.update_through(
+            &sight,
+            &below,
+            Some(&shaft),
+            Some(&deck),
+            [45.0, 5.0],
+            Around::default(),
+        );
         assert_eq!(band_area(&near), 0.0);
     }
 

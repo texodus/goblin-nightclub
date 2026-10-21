@@ -66,6 +66,10 @@ struct Params {
 // columns and rows, and where its entries start in this same array; each
 // entry, row by row, the page's layer in `mask_seen`, or NO_PAGE.
 @group(0) @binding(5) var<storage, read> pages: array<u32>;
+// On the viewer's layer, in view space like `now`, what lights cast: their
+// colors, added up, as bright as they are there (rgb), and how much what
+// they light shows (a), wherever it's in line of sight.
+@group(0) @binding(6) var light_map: texture_2d<f32>;
 
 // A page nothing on which has been seen.
 const NO_PAGE: u32 = 0xffffffffu;
@@ -73,6 +77,16 @@ const NO_PAGE: u32 = 0xffffffffu;
 // Width (world units) of the band inside the radius where the visible style
 // fades into the remembered one.
 const RADIUS_FADE: f32 = 12.0;
+
+// Away from the open sky, the viewer carries a light: brightest close by,
+// dimmer toward the edge of sight, its color partly cast (as a light's in
+// shapes.wgsl, whose brightness this mirrors). However many lights meet,
+// nothing's lit brighter than `LIGHT_MOST`.
+const OWN_LIGHT: vec3<f32> = vec3(1.0, 0.82, 0.6);
+const LIGHT_HEART: f32 = 1.1;
+const LIGHT_RIM: f32 = 0.4;
+const LIGHT_WARMTH: f32 = 0.6;
+const LIGHT_MOST: f32 = 1.3;
 
 // Anywhere never seen, and beyond the level's edge: a dark gray fog in the
 // mist's billows, drifting with it, under whatever the unknown canvas
@@ -188,12 +202,25 @@ fn radius_at(a: u32, d: u32) -> f32 {
     return r;
 }
 
-// Full color, dimming slightly toward the edge of a finite view `radius`.
-fn style_visible(c: vec3<f32>, dist: f32, radius: f32) -> vec3<f32> {
+// Full color `c` of slot `s` at view pixel `px`, `dist` from the viewer
+// with view `radius` (0 for unlimited), lit: outdoors by daylight, dimming
+// slightly toward the edge of sight; anywhere else by the viewer's own
+// light, warm and dimming more, and on the viewer's layer by lights too.
+fn style_visible(c: vec3<f32>, s: u32, px: vec2<i32>, dist: f32, radius: f32) -> vec3<f32> {
     if radius <= 0.0 {
         return c;
     }
-    return c * mix(1.0, 0.75, smoothstep(0.0, radius, dist));
+    if params.outdoors > 0.5 {
+        return c * mix(1.0, 0.75, smoothstep(0.0, radius, dist));
+    }
+    let t = clamp(dist / radius, 0.0, 1.0);
+    let own = mix(LIGHT_RIM, LIGHT_HEART, (1.0 - t) * (1.0 - t))
+        * (1.0 - smoothstep(radius - RADIUS_FADE, radius, dist));
+    var light = mix(vec3(1.0), OWN_LIGHT, LIGHT_WARMTH) * own;
+    if s == 0u {
+        light += textureLoad(light_map, px, 0).rgb;
+    }
+    return c * min(light, vec3(LIGHT_MOST));
 }
 
 // Dimmed grayscale, dithered down to the four EGA grays (0, 1/3, 2/3, 1).
@@ -241,11 +268,17 @@ fn seen_at(s: u32, world: vec2<f32>) -> f32 {
 
 // How much slot `s` at view pixel `px` and world point `world` is visible
 // now, and has been seen, with view `radius` and `through` as for `shade`.
+// In line of sight, it's visible within the radius, and beyond it where
+// lights show it.
 fn knowledge(s: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec2<f32> {
     var now = textureLoad(mask_now, px, s, 0).r;
     if radius > 0.0 {
         let dist = distance(world, params.origin);
-        now *= 1.0 - smoothstep(radius - RADIUS_FADE, radius, dist);
+        var shown = 1.0 - smoothstep(radius - RADIUS_FADE, radius, dist);
+        if s == 0u {
+            shown = max(shown, textureLoad(light_map, px, 0).a);
+        }
+        now *= shown;
     }
     return vec2(now, max(seen_at(s, world), through));
 }
@@ -263,7 +296,7 @@ fn shade(s: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> 
     let known = knowledge(s, px, world, radius, through);
     let now = known.x;
     let seen = known.y;
-    let visible = style_visible(textureLoad(canvases, px, 3u * s, 0).rgb, dist, radius);
+    let visible = style_visible(textureLoad(canvases, px, 3u * s, 0).rgb, s, px, dist, radius);
     // Pixel of the art, wrapped to the dither pattern (it can be negative
     // beyond the level's edge on lower layers).
     let dots = vec2<i32>(floor(world * params.seen_zoom));

@@ -132,6 +132,17 @@ pub struct PropKind {
     /// The radius of a circle around its tile's center that sight can't
     /// pass, in pixels of the art: less than half a tile. 0 hides nothing.
     pub sight: f32,
+    /// The light it gives off, if any: a torch's.
+    pub light: Option<Light>,
+}
+
+/// Light given off by a prop (see [`PropKind::light`]), lighting what's
+/// around it in its line of sight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Light {
+    /// How far it reaches, in tiles.
+    pub radius: f32,
+    pub color: Color,
 }
 
 impl PropKind {
@@ -313,6 +324,11 @@ impl Tileset {
                     p.name
                 ));
             }
+            if p.light
+                .is_some_and(|l| !(l.radius > 0.0 && l.radius.is_finite()))
+            {
+                return Err(format!("prop {:?}: its light must reach somewhere", p.name));
+            }
         }
         Ok(())
     }
@@ -392,6 +408,14 @@ pub(crate) struct RawProp {
     blocks: bool,
     #[serde(default)]
     sight: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    light: Option<RawLight>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RawLight {
+    radius: f32,
+    color: String,
 }
 
 fn one_cell() -> [u16; 2] {
@@ -569,6 +593,10 @@ impl Tileset {
                             height: p.height,
                             blocks: p.blocks,
                             sight: p.sight,
+                            light: p.light.map(|l| RawLight {
+                                radius: l.radius,
+                                color: palette::hex(l.color),
+                            }),
                         },
                     )
                 })
@@ -644,16 +672,28 @@ impl<'de> Deserialize<'de> for Tileset {
             props: raw
                 .props
                 .into_iter()
-                .map(|(name, p)| PropKind {
-                    name,
-                    cells: p.cells,
-                    size: p.size,
-                    anchor: p.anchor,
-                    height: p.height,
-                    blocks: p.blocks,
-                    sight: p.sight,
+                .map(|(name, p)| {
+                    let light = p
+                        .light
+                        .map(|l| {
+                            Ok(Light {
+                                radius: l.radius,
+                                color: color(&name, &l.color)?,
+                            })
+                        })
+                        .transpose()?;
+                    Ok(PropKind {
+                        name,
+                        cells: p.cells,
+                        size: p.size,
+                        anchor: p.anchor,
+                        height: p.height,
+                        blocks: p.blocks,
+                        sight: p.sight,
+                        light,
+                    })
                 })
-                .collect(),
+                .collect::<Result<_, D::Error>>()?,
             sprites: raw
                 .sprites
                 .into_iter()
@@ -730,6 +770,7 @@ pub mod testing {
                     height: 0.05,
                     blocks: true,
                     sight: 3.0,
+                    light: None,
                 },
                 PropKind {
                     name: "rock".into(),
@@ -739,6 +780,20 @@ pub mod testing {
                     height: 0.0,
                     blocks: true,
                     sight: 6.0,
+                    light: None,
+                },
+                PropKind {
+                    name: "torch".into(),
+                    cells: vec![[2, 3]],
+                    size: [1, 1],
+                    anchor: [0.0, 0.0],
+                    height: 0.05,
+                    blocks: true,
+                    sight: 0.0,
+                    light: Some(Light {
+                        radius: 5.0,
+                        color: palette::parse_hex("#ffb060").unwrap(),
+                    }),
                 },
             ],
             sprites: vec![
@@ -837,6 +892,8 @@ mod tests {
             ("\"cell\":16", "\"cell\":0"),
             ("\"#ffff55\"", "\"yellow\""),
             ("\"cells\":[[2,2],[3,2]]", "\"cells\":[]"),
+            ("\"radius\":5.0", "\"radius\":0.0"),
+            ("\"#ffb060\"", "\"warm\""),
         ] {
             let bad = json.replacen(from, to, 1);
             assert_ne!(bad, json);
