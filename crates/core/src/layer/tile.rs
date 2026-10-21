@@ -359,7 +359,7 @@ impl Tile {
     }
 
     /// The part in each quarter, in `N E S W` order. Stairs are floor.
-    fn parts(self) -> [Part; 4] {
+    pub fn parts(self) -> [Part; 4] {
         match self {
             Tile::Whole(p) => [p; 4],
             Tile::Stairs(_, f) => [Part::Floor(f); 4],

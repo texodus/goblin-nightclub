@@ -414,8 +414,9 @@ async function main() {
   });
 
   // Keys: Escape toggles the menu; arrows / WASD pan; in a game, Space
-  // pauses and C centers the camera on the player; in the editor, the
-  // tool shortcuts and undo / redo.
+  // pauses, = and - move the view a layer up and down, and C centers the
+  // camera on the player, on their layer; in the editor, the tool
+  // shortcuts and undo / redo.
   const GAME_KEYS = new Set([
     "ArrowUp",
     "ArrowDown",

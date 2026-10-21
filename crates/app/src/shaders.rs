@@ -4,14 +4,18 @@
 //! out as theirs are (checked by the tests). Built natively too, so the
 //! tests can.
 
+use goblin_nightclub_core::chunk::CHUNK;
 use goblin_nightclub_core::layer::TILE;
 
 /// Marks a page in the page table nothing on which has been seen.
 pub const NO_PAGE: u32 = u32::MAX;
 
 /// Words per slot at the head of the page table (see `pages` in
-/// composite.wgsl).
+/// composite.wgsl), and per layer at the head of the map's.
 pub const TABLE_HEAD: usize = 8;
+
+/// Codes the map has art for (see `map_art` in composite.wgsl): a byte's.
+pub const MAP_CODES: usize = 256;
 
 /// `Globals` in shapes.wgsl: how world positions land on a target.
 #[repr(C)]
@@ -57,13 +61,19 @@ pub struct CompositeParams {
     pub radius_underground: f32,
     /// Edge of a page of `seen`, in its pixels.
     pub page_px: f32,
-    pub _pad: f32,
+    /// The layer of the whole level the window's layer 0 is.
+    pub base: u32,
     /// Where world point (0, 0) is in the whole level.
     pub offset: [f32; 2],
     /// See [`goblin_nightclub_core::frame::Frame::fade`] and `sink`.
     pub fade: f32,
     pub sink: f32,
-    pub _pad2: [f32; 2],
+    /// Size of the window, in world units: beyond it, the map is shown.
+    pub world: [f32; 2],
+    /// See [`goblin_nightclub_core::frame::Frame::sight`].
+    pub sight: u32,
+    pub _pad: u32,
+    pub _pad2: [u32; 2],
 }
 
 /// shapes.wgsl, ready to compile.
@@ -81,6 +91,8 @@ fn with_common(body: &str) -> String {
     format!(
         "// From Rust (see `crate::shaders`).\n\
          const TILE: f32 = {TILE:?};\n\
+         const CHUNK: u32 = {CHUNK}u;\n\
+         const MAP_CODES: u32 = {MAP_CODES}u;\n\
          const NO_PAGE: u32 = {NO_PAGE}u;\n\
          const TABLE_HEAD: u32 = {TABLE_HEAD}u;\n\n\
          {}\n{body}",

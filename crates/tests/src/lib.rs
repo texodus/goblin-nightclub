@@ -14,6 +14,7 @@ mod generated_levels;
 mod layer;
 mod level;
 mod level_file;
+mod map;
 mod memory;
 mod mesh;
 mod packed;

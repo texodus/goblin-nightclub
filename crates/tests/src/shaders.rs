@@ -78,10 +78,13 @@ fn uniforms_match_the_shaders() {
             ground,
             radius_underground,
             page_px,
-            _pad,
+            base,
             offset,
             fade,
             sink,
+            world,
+            sight,
+            _pad,
             _pad2,
         ]
     );

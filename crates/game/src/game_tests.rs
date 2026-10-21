@@ -254,7 +254,7 @@ fn big_levels_are_played_a_window_at_a_time() {
     let file = big_file(300, 120, 12);
     let whole = file.level();
     let mut game = Game::from_file(&file, VIEW, 1);
-    let start = whereabouts(&game).0;
+    let (start, first) = whereabouts(&game);
     let w = game.stream.as_ref().expect("too big to play whole").window;
     assert!(w.cols < 300 && w.depth < 12);
     // The ground level is the bottom: outdoors only under holes all the
@@ -294,6 +294,20 @@ fn big_levels_are_played_a_window_at_a_time() {
     assert!(moves >= 2, "the window moved on: {moves}");
     assert_eq!(was_outdoors.len(), 2, "in and out");
     assert!(whereabouts(&game).0[0] > start[0] + 1700.0);
+    // Far from the start, the map has what was explored around it, as it
+    // is.
+    let map = &game.stream.as_ref().unwrap().map;
+    for dx in -3..=3 {
+        let t = [tile_of(start)[0] + dx, tile_of(start)[1]];
+        assert!(map.is_explored(first, t), "{dx} from the start");
+        let [cx, cy] = t.map(|v| v.div_euclid(CHUNK as i32));
+        let i = (t[1] - cy * CHUNK as i32) * CHUNK as i32 + t[0] - cx * CHUNK as i32;
+        let tiles = &map.chunk((first, cx, cy)).unwrap().tiles;
+        assert_eq!(
+            tiles[i as usize],
+            map.code(whole.layer(first).tile(t[0], t[1]))
+        );
+    }
     // Back to the start: what was explored there still is.
     let mut back = 0;
     for leg in (0..4).rev() {
@@ -520,6 +534,105 @@ fn changing_layers_fades_and_zooms_between_them() {
     assert!(game.shift.is_none());
     let f = game.frame();
     assert_eq!((f.top, f.fade, f.sink), (1, 1.0, 0.0));
+}
+
+/// `=` and `-` move the view a layer up and down, as far as there are
+/// layers, the player staying where they are, and following them again
+/// once it's back on their layer; C brings it back to theirs.
+/// Sight stays the player's: nothing is in sight on other layers, and
+/// what's in sight is remembered whether its layer is shown or not.
+#[test]
+fn the_view_moves_between_layers_apart_from_the_player() {
+    let l = level(&[
+        &["........<.", "..........", "..........", ".........."],
+        &["........>.", "..........", "..........", "~~........"],
+        &["~~~~......", "~~~~......", "~~~~......", "~~~~......"],
+    ]);
+    let mut g = game_on(l, 1, [6, 1]);
+    let settle = |g: &mut Game| g.update(LAYER_SHIFT_TIME);
+    let shown = |f: &Frame| f.layers.iter().map(|l| l.index).collect::<Vec<_>>();
+    let sighted = |f: &Frame| f.sighted.iter().map(|l| l.index).collect::<Vec<_>>();
+    let f = g.frame();
+    let both = vec![1, 0];
+    assert_eq!(
+        (f.top, f.sight, shown(&f), sighted(&f)),
+        (1, 1, both.clone(), vec![])
+    );
+
+    // Up: the player's layer shows through the hole, in sight; the one
+    // above isn't.
+    g.key_pressed("Equal");
+    assert!(g.shift.is_some(), "going there as the stairs do");
+    settle(&mut g);
+    let f = g.frame();
+    assert_eq!((f.top, f.sight, shown(&f)), (2, 1, vec![2, 1, 0]));
+    assert_eq!(g.top, 1, "the player stays");
+    assert!(f.layers[0].polygon.is_empty());
+    assert!(!f.layers[1].polygon.is_empty());
+    assert!(f.layers[1].shaft.is_some() && f.layers[1].seen_through.is_none());
+    g.key_pressed("Equal");
+    assert!(g.shift.is_none() && g.frame().top == 2, "no further up");
+
+    // Clicks walk the player to the point of their layer drawn there,
+    // smaller about the view's center.
+    let c = VIEW.map(|v| v / 2.0);
+    let p = [c[0] + 30.0, c[1] + 8.0];
+    g.click(p);
+    let scale = g.parallax();
+    let want = g.to_world([c[0] + 30.0 / scale, c[1] + 8.0 / scale]);
+    let goal = *g.route.as_ref().unwrap().waypoints.last().unwrap();
+    assert!(distance(goal, want) < 1e-3, "{goal:?} for {want:?}");
+    g.route = None;
+
+    // Back on the player's layer, following them again.
+    g.key_pressed("Minus");
+    assert!(g.view.is_none());
+
+    // Down below the player: theirs isn't shown, but is still in sight,
+    // as is this one through its hole, though with nothing over it, it's
+    // shown as it's remembered.
+    g.key_pressed("Minus");
+    assert!(g.view.is_some());
+    settle(&mut g);
+    let f = g.frame();
+    assert_eq!(
+        (f.top, f.sight, shown(&f), sighted(&f)),
+        (0, 1, vec![0], both)
+    );
+    assert!(f.layers[0].polygon.is_empty());
+    assert!(f.sighted.iter().all(|l| !l.polygon.is_empty()));
+    assert!(f.sighted[1].seen_through.is_some(), "seen through the hole");
+    g.key_pressed("Minus");
+    assert_eq!(g.frame().top, 0, "no further down");
+
+    // The player taking the stairs leaves the view where it is, moved
+    // off them.
+    g.key_pressed("Equal");
+    g.key_pressed("Equal");
+    settle(&mut g);
+    let to_stairs = |g: &mut Game| {
+        g.player = [
+            path::center([8, 0])[0] - PLAYER_SIZE[0] / 2.0,
+            path::center([8, 0])[1] - PLAYER_SIZE[1] / 2.0,
+        ];
+        g.take_stairs([7, 0]);
+    };
+    to_stairs(&mut g);
+    assert_eq!((g.top, g.frame().top), (0, 2));
+    assert!(g.shift.is_none());
+
+    // C: back to the player's layer, and following them again.
+    g.key_pressed("KeyC");
+    assert!(g.shift.is_some());
+    settle(&mut g);
+    let f = g.frame();
+    assert_eq!((f.top, f.sight, sighted(&f)), (0, 0, vec![]));
+    assert!(g.view.is_none());
+    // Following them, the view goes with them.
+    g.player[0] -= TILE;
+    to_stairs(&mut g);
+    settle(&mut g);
+    assert_eq!((g.top, g.frame().top), (1, 1));
 }
 
 /// Along a chamfered shore the route steps diagonally over the

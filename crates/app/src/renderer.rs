@@ -25,8 +25,11 @@
 //! layer) and the interface (view space) on top. `seen` is kept in world
 //! space so it survives camera moves, zooming and the viewer changing
 //! layers, in pages a chunk of the level each, only those seen and only
-//! while in use (see [`crate::pages`]). Everything else is sized to the
-//! screen, at its own resolution, and made again when that changes.
+//! while in use (see [`crate::pages`]). Beyond the window of a level
+//! played a window at a time, the composite shows the map instead (see
+//! [`goblin_nightclub_core::map`]): the chunks of it in view on the GPU,
+//! while there's room (see [`crate::map_pages`]). Everything else is sized
+//! to the screen, at its own resolution, and made again when that changes.
 
 use wasm_bindgen::JsError;
 use web_sys::HtmlCanvasElement;
@@ -35,18 +38,22 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use wgpu::util::DeviceExt;
 
+use crate::map_pages::{MapOp, MapPages};
 use crate::pages::{Op, Page, Pages};
-use crate::shaders::{self, CompositeParams, NO_PAGE, TABLE_HEAD, Transform};
+use crate::shaders::{self, CompositeParams, MAP_CODES, NO_PAGE, TABLE_HEAD, Transform};
 use goblin_nightclub_core::art::MeshPiece;
+use goblin_nightclub_core::camera;
 use goblin_nightclub_core::chunk::CHUNK;
 use goblin_nightclub_core::draw::Vertex;
 use goblin_nightclub_core::frame::{Frame, LayerFrame};
 use goblin_nightclub_core::geom::{Rect, bounds};
 use goblin_nightclub_core::layer::TILE;
 use goblin_nightclub_core::level::MAX_VISIBLE;
+use goblin_nightclub_core::map::{MapArt, MapTiles};
 use goblin_nightclub_core::mesh::Mesh;
 use goblin_nightclub_core::tileset::Sheet;
 
@@ -64,6 +71,12 @@ const MASK_SAMPLES: u32 = 4;
 /// (if the device allows).
 const PAGES_FIRST: u32 = 16;
 const PAGES_MAX: u32 = 256;
+
+/// Chunks of the map there's room for at first, and the most (if the
+/// device allows): 4 KiB each.
+const MAP_PAGES_FIRST: u32 = 64;
+const MAP_PAGES_MAX: u32 = 8192;
+const MAP_PAGE_BYTES: u64 = size_of::<MapTiles>() as u64;
 
 /// A vertex buffer that grows (to the next power of two) as needed.
 struct GrowBuffer {
@@ -451,7 +464,8 @@ struct Leaving {
 struct LayerPlan<'f> {
     layer: &'f LayerFrame,
     /// How far below the viewer's it is: which textures it's drawn into.
-    slot: usize,
+    /// `None` for a layer only in sight (see [`Frame::sighted`]), not drawn.
+    slot: Option<usize>,
     /// Its first piece's in [`Renderer::shifts`].
     first: u32,
     /// Its canvases, in the canvas vertices.
@@ -467,9 +481,9 @@ struct LayerPlan<'f> {
 }
 
 impl<'f> LayerPlan<'f> {
-    /// Layer `layer` in slot `slot`, its pieces' shifts from `first`; its
-    /// vertices and pages yet to be worked out.
-    fn new(layer: &'f LayerFrame, slot: usize, first: u32) -> Self {
+    /// Layer `layer` in slot `slot` (if drawn), its pieces' shifts from
+    /// `first`; its vertices and pages yet to be worked out.
+    fn new(layer: &'f LayerFrame, slot: Option<usize>, first: u32) -> Self {
         Self {
             layer,
             slot,
@@ -563,7 +577,18 @@ pub struct Renderer {
     /// Where each slot's pages in view are, for the composite (see `pages`
     /// in composite.wgsl).
     page_table: GrowBuffer,
-    /// Reads `screen`, `seen` and `page_table`; made again with any.
+    /// The chunks of the map on the GPU, a slot each, and which are where
+    /// (see `map_tiles` in composite.wgsl).
+    map_tiles: wgpu::Buffer,
+    map_pages: MapPages,
+    /// Where each layer's chunks in view are, and what the map's codes are
+    /// drawn as (see `map_table` and `map_art` in composite.wgsl), the
+    /// art the map's (see [`goblin_nightclub_core::map::Map::art`]).
+    map_table: GrowBuffer,
+    map_art: GrowBuffer,
+    map_art_of: Option<Arc<[MapArt]>>,
+    /// Reads `screen`, `seen`, `page_table`, the map's and the sheet; made
+    /// again with any.
     composite_bind_group: Option<wgpu::BindGroup>,
     canvas_vertices: GrowBuffer,
     mask_vertices: GrowBuffer,
@@ -572,7 +597,7 @@ pub struct Renderer {
     mask_scratch: Vec<Vertex>,
     /// By mesh id, those on the GPU: drawn, or offered to be (see
     /// [`Renderer::preload`]). A layer's meshes are mostly its chunks'
-    /// (see [`goblin_nightclub_core::level::LayerMeshes`]), shared with the windows before and after
+    /// (see [`goblin_nightclub_core::art::LayerMeshes`]), shared with the windows before and after
     /// it, so they stay as long as any has them.
     meshes: HashMap<u64, Kept>,
     /// What each draw moves its vertices by, per frame: nothing, then
@@ -623,6 +648,55 @@ fn texture_entry(
         },
         count: None,
     }
+}
+
+/// A storage buffer read in a fragment shader.
+fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+/// A buffer for `pages` chunks of the map.
+fn map_buffer(device: &wgpu::Device, pages: u32) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("map"),
+        size: pages as u64 * MAP_PAGE_BYTES,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+/// No chunks of the map on the GPU yet, with room for as many as `buffer`
+/// holds, growing as far as `device` allows.
+fn map_pages(device: &wgpu::Device, buffer: &wgpu::Buffer) -> MapPages {
+    let first = (buffer.size() / MAP_PAGE_BYTES) as u32;
+    let most = device.limits().max_storage_buffer_binding_size / MAP_PAGE_BYTES;
+    MapPages::new(first, MAP_PAGES_MAX.min(most as u32))
+}
+
+/// What `art` the map's codes are drawn as, for `map_art` in
+/// composite.wgsl.
+fn map_art_words(art: &[MapArt]) -> Vec<u32> {
+    let mut words = vec![0u32; 2 * MAP_CODES];
+    let mut cells = Vec::new();
+    for (code, a) in art.iter().enumerate().take(MAP_CODES) {
+        let start = (2 * MAP_CODES + cells.len()) as u32;
+        words[2 * code] = start | (a.cells.len() as u32) << 16;
+        words[2 * code + 1] = a.alpha.to_bits();
+        cells.extend(a.cells.iter().map(|c| c[0] as u32 | (c[1] as u32) << 16));
+    }
+    words.extend(cells);
+    words
 }
 
 /// A polygon around `center` (by angle, as a sight polygon is), fanned out
@@ -843,17 +917,12 @@ impl Renderer {
                 texture_entry(2, array),
                 texture_entry(3, array),
                 texture_entry(4, array),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                storage_entry(5),
                 texture_entry(6, wgpu::TextureViewDimension::D2),
+                storage_entry(7),
+                storage_entry(8),
+                storage_entry(9),
+                texture_entry(10, wgpu::TextureViewDimension::D2),
             ],
         });
         let composite_shader = module("composite", shaders::composite());
@@ -896,6 +965,10 @@ impl Renderer {
         let layer_transforms = (0..MAX_VISIBLE).map(|_| uniform()).collect();
         let ui_transform = uniform();
         let page_table = GrowBuffer::new(&device, "page table", wgpu::BufferUsages::STORAGE);
+        let map_tiles = map_buffer(&device, MAP_PAGES_FIRST);
+        let map_pages = map_pages(&device, &map_tiles);
+        let map_table = GrowBuffer::new(&device, "map table", wgpu::BufferUsages::STORAGE);
+        let map_art = GrowBuffer::new(&device, "map art", wgpu::BufferUsages::STORAGE);
         let canvas_vertices =
             GrowBuffer::new(&device, "canvas vertices", wgpu::BufferUsages::VERTEX);
         let mask_vertices = GrowBuffer::new(&device, "mask vertices", wgpu::BufferUsages::VERTEX);
@@ -928,6 +1001,11 @@ impl Renderer {
             screen: None,
             seen: None,
             page_table,
+            map_tiles,
+            map_pages,
+            map_table,
+            map_art,
+            map_art_of: None,
             composite_bind_group: None,
             canvas_vertices,
             mask_vertices,
@@ -949,11 +1027,14 @@ impl Renderer {
         self.seen = None;
         self.composite_bind_group = None;
         self.meshes.clear();
+        self.map_pages = map_pages(&self.device, &self.map_tiles);
+        self.map_art_of = None;
     }
 
     /// Draw from `sheet` from now on.
     pub fn set_sheet(&mut self, sheet: &Sheet) {
         self.sheet = upload_sheet(&self.device, &self.queue, sheet);
+        self.composite_bind_group = None;
         let all = self
             .layer_transforms
             .iter_mut()
@@ -1104,6 +1185,19 @@ impl Renderer {
                         resource: self.page_table.buffer.as_entire_binding(),
                     },
                     texture(6, &screen.light),
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: self.map_art.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: self.map_table.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: self.map_tiles.as_entire_binding(),
+                    },
+                    texture(10, &self.sheet),
                 ],
             }));
     }
@@ -1297,11 +1391,25 @@ impl Renderer {
             .iter()
             .filter(|l| frame.top - l.index < MAX_VISIBLE)
         {
-            for mesh in l.meshes.all().chain(l.shaft.as_deref()) {
+            let shafts = l
+                .shaft
+                .as_deref()
+                .into_iter()
+                .chain(l.seen_through.as_deref());
+            for mesh in l.meshes.all().chain(shafts) {
                 self.keep(mesh);
             }
-            layers.push(LayerPlan::new(l, frame.top - l.index, shifts.len() as u32));
+            let slot = Some(frame.top - l.index);
+            layers.push(LayerPlan::new(l, slot, shifts.len() as u32));
             shifts.extend((0..l.meshes.pieces.len()).map(|i| l.meshes.corner(i)));
+        }
+        // Those only in sight: what's visible of them goes into `seen`, and
+        // that's all.
+        for l in &frame.sighted {
+            if let Some(shaft) = &l.seen_through {
+                self.keep(shaft);
+            }
+            layers.push(LayerPlan::new(l, None, 0));
         }
         self.shifts
             .write(&self.device, &self.queue, bytemuck::cast_slice(&shifts));
@@ -1362,12 +1470,15 @@ impl Renderer {
         let ui = push(&mut canvas_vertices, &frame.ui.vertices);
 
         // Below the viewer's, a layer's pages matter only where it shows
-        // through.
-        let shows = |l: &LayerFrame, rect: Rect| {
-            l.shaft
+        // through; below the player's, it's seen only where it shows
+        // through to theirs.
+        let within = |shaft: &Option<Arc<Mesh>>, rect: Rect| {
+            shaft
                 .as_ref()
                 .is_none_or(|shaft| shaft.ranges(rect).next().is_some())
         };
+        let shows = |l: &LayerFrame, rect: Rect| within(&l.shaft, rect);
+        let in_sight = |l: &LayerFrame, rect: Rect| within(&l.seen_through, rect);
         let page_rect = |px: i32, py: i32| -> Rect {
             let at = [px as f32 * page_world, py as f32 * page_world];
             [at, [at[0] + page_world, at[1] + page_world]]
@@ -1381,9 +1492,12 @@ impl Renderer {
         // visible now, which shows whatever's been seen.
         let mut table = vec![0u32; TABLE_HEAD * MAX_VISIBLE];
         for lp in &layers {
+            let Some(slot) = lp.slot else {
+                continue;
+            };
             let l = lp.layer;
             let [xs, ys] = pages_over(frame.layer_view(l.index), frame.world, page_world);
-            let head = TABLE_HEAD * lp.slot;
+            let head = TABLE_HEAD * slot;
             let size = [xs.len() as u32, ys.len() as u32];
             let start = table.len() as u32;
             table[head..head + 5].copy_from_slice(&[
@@ -1412,7 +1526,11 @@ impl Renderer {
             if !frame.remember || visible.is_empty() {
                 continue;
             }
-            let key = seen_key(&[visible, of(&lp.lights)], l.shaft.as_deref(), page_px);
+            let key = seen_key(
+                &[visible, of(&lp.lights)],
+                l.seen_through.as_deref(),
+                page_px,
+            );
             let layer = frame.base + l.index;
             if seen.drawn.get(&layer) == Some(&key) {
                 continue;
@@ -1423,7 +1541,7 @@ impl Renderer {
             for py in ys {
                 for px in xs.clone() {
                     let rect = page_rect(px, py);
-                    if !shows(l, rect) {
+                    if !in_sight(l, rect) {
                         continue;
                     }
                     match seen.pages.write(page(l.index, px, py)) {
@@ -1463,10 +1581,112 @@ impl Renderer {
         self.mask_scratch = mask_vertices;
         self.meshes
             .retain(|_, kept| std::mem::replace(&mut kept.used, false));
+        self.plan_map(frame);
         FramePlan {
             layers,
             overlay,
             ui,
+        }
+    }
+
+    /// The map beyond the window, for the composite: what its codes are
+    /// drawn as, where each layer's chunks in view are (down to the bottom
+    /// of the whole level), and those chunks on the GPU, while there's room.
+    /// Chunks inside the window are left out: the composite never shows the
+    /// map there.
+    fn plan_map(&mut self, frame: &Frame) {
+        let layers = frame.base + frame.top + 1;
+        let mut table = vec![0u32; TABLE_HEAD * layers];
+        if let Some(map) = &frame.map {
+            let art = map.art();
+            if !self
+                .map_art_of
+                .as_ref()
+                .is_some_and(|a| Arc::ptr_eq(a, art))
+            {
+                let words = map_art_words(art);
+                if self
+                    .map_art
+                    .write(&self.device, &self.queue, bytemuck::cast_slice(&words))
+                {
+                    self.composite_bind_group = None;
+                }
+                self.map_art_of = Some(art.clone());
+            }
+            self.map_pages.begin_frame();
+            let edge = CHUNK as f32 * TILE;
+            // The window, in chunks of the whole level.
+            let origin = frame.offset.map(|t| t.div_euclid(CHUNK as i32));
+            let window = frame.world.map(|w| (w / edge).ceil() as i32);
+            let inside = |cx: i32, cy: i32| {
+                (0..window[0]).contains(&(cx - origin[0]))
+                    && (0..window[1]).contains(&(cy - origin[1]))
+            };
+            let parallax = frame.parallax();
+            for a in 0..layers {
+                let Some([lo, hi]) = map.bounds(a) else {
+                    continue;
+                };
+                let depth = (layers - 1 - a) as f32 + frame.sink;
+                let view =
+                    camera::layer_view(frame.camera, frame.view, frame.zoom, parallax.powf(depth));
+                let [xs, ys] = [0, 1].map(|axis| {
+                    let first = (view[0][axis] / edge).floor() as i32 + origin[axis];
+                    let last = (view[1][axis] / edge).ceil() as i32 + origin[axis];
+                    let (first, last) = (first.max(lo[axis]), last.min(hi[axis]));
+                    first..last.max(first)
+                });
+                let (head, start) = (TABLE_HEAD * a, table.len() as u32);
+                table[head..head + 5].copy_from_slice(&[
+                    xs.start as u32,
+                    ys.start as u32,
+                    xs.len() as u32,
+                    ys.len() as u32,
+                    start,
+                ]);
+                for cy in ys {
+                    for cx in xs.clone() {
+                        let key = (a, cx, cy);
+                        let slot = map
+                            .chunk(key)
+                            .filter(|_| !inside(cx, cy))
+                            .and_then(|chunk| self.map_pages.slot(key, chunk.version));
+                        table.push(slot.unwrap_or(NO_PAGE));
+                    }
+                }
+            }
+            for op in self.map_pages.take_ops() {
+                match op {
+                    MapOp::Grow(capacity) => {
+                        let buffer = map_buffer(&self.device, capacity);
+                        let mut encoder = self.device.create_command_encoder(&Default::default());
+                        encoder.copy_buffer_to_buffer(
+                            &self.map_tiles,
+                            0,
+                            &buffer,
+                            0,
+                            self.map_tiles.size(),
+                        );
+                        self.queue.submit([encoder.finish()]);
+                        self.map_tiles = buffer;
+                        self.composite_bind_group = None;
+                    }
+                    MapOp::Upload { slot, key } => {
+                        let tiles = &map.chunk(key).unwrap().tiles[..];
+                        self.queue.write_buffer(
+                            &self.map_tiles,
+                            slot as u64 * MAP_PAGE_BYTES,
+                            bytemuck::cast_slice(tiles),
+                        );
+                    }
+                }
+            }
+        }
+        if self
+            .map_table
+            .write(&self.device, &self.queue, bytemuck::cast_slice(&table))
+        {
+            self.composite_bind_group = None;
         }
     }
 
@@ -1484,7 +1704,7 @@ impl Renderer {
         let offset = frame.offset.map(|t| t as f32 * TILE);
         let center = [frame.view[0] / 2.0, frame.view[1] / 2.0];
         let parallax = frame.parallax();
-        for lp in &plan.layers {
+        for (lp, slot) in plan.layers.iter().filter_map(|lp| Some((lp, lp.slot?))) {
             let t = Transform {
                 screen: frame.view,
                 camera,
@@ -1495,7 +1715,7 @@ impl Renderer {
                 parallax,
                 offset,
             };
-            let buffer = &self.layer_transforms[lp.slot].buffer;
+            let buffer = &self.layer_transforms[slot].buffer;
             self.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&t));
         }
         let flat = |screen, camera, zoom| Transform {
@@ -1532,7 +1752,8 @@ impl Renderer {
         let present = plan
             .layers
             .iter()
-            .fold(0u32, |bits, lp| bits | 1 << lp.slot);
+            .filter_map(|lp| lp.slot)
+            .fold(0u32, |bits, slot| bits | 1 << slot);
         let params = CompositeParams {
             origin: frame.origin,
             radius: if frame.radius.is_finite() {
@@ -1553,11 +1774,14 @@ impl Renderer {
             ground: frame.ground as u32,
             radius_underground: frame.radius_underground,
             page_px: page_px as f32,
-            _pad: 0.0,
+            base: frame.base as u32,
+            sight: frame.sight as u32,
+            _pad: 0,
+            _pad2: [0; 2],
             offset,
             fade: frame.fade,
             sink: frame.sink,
-            _pad2: [0.0; 2],
+            world: frame.world,
         };
         self.queue
             .write_buffer(&self.composite_params, 0, bytemuck::bytes_of(&params));
@@ -1575,7 +1799,10 @@ impl Renderer {
         let mut onto = self.page_transforms.iter();
         let mut draws = Vec::new();
         for lp in &plan.layers {
-            self.encode_layer(encoder, frame, lp, &mut onto, &mut draws);
+            if let Some(slot) = lp.slot {
+                self.encode_layer(encoder, frame, lp, slot, &mut draws);
+            }
+            self.encode_seen(encoder, lp, &mut onto);
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1590,12 +1817,16 @@ impl Renderer {
             pass.set_bind_group(0, self.composite_bind_group.as_ref().unwrap(), &[]);
             pass.draw(0..3, 0..1);
         }
-        // Overlay on the viewer's layer, then the interface, over it all.
+        // Overlay on the player's layer, if it's drawn, then the interface,
+        // over it all.
         let canvas = &self.canvas_vertices.buffer;
         let shapes = &self.shape_pipeline;
-        let top = &self.layer_transforms[0].bind_group;
-        let overlay = [(canvas, plan.overlay.clone(), 0)];
-        self.pass(encoder, kept(screen), top, None, &[(shapes, &overlay)]);
+        let sight = plan.layers.iter().find(|lp| lp.layer.index == frame.sight);
+        if let Some(slot) = sight.and_then(|lp| lp.slot) {
+            let onto = &self.layer_transforms[slot].bind_group;
+            let overlay = [(canvas, plan.overlay.clone(), 0)];
+            self.pass(encoder, kept(screen), onto, None, &[(shapes, &overlay)]);
+        }
         let ui = [(canvas, plan.ui.clone(), 0)];
         self.pass(
             encoder,
@@ -1606,24 +1837,23 @@ impl Renderer {
         );
     }
 
-    /// The passes of one layer: its canvases with the tiles under them and
-    /// the props over them; where it's void; what's visible now, and what
-    /// lights cast; and what's visible into each page of `seen` it covers
-    /// (through the next of `onto`). `draws` is scratch space.
+    /// The passes of one layer drawn, in slot `s`: its canvases with the
+    /// tiles under them and the props over them; where it's void; what's
+    /// visible now, and on the player's layer, what lights cast. `draws` is
+    /// scratch space.
     fn encode_layer<'a>(
         &'a self,
         encoder: &mut wgpu::CommandEncoder,
         frame: &Frame,
         lp: &LayerPlan,
-        onto: &mut std::slice::Iter<'a, Uniform>,
+        s: usize,
         draws: &mut Vec<Draw<'a>>,
     ) {
-        let (l, s) = (lp.layer, lp.slot);
+        let l = lp.layer;
         let view = frame.layer_view(l.index);
         let transform = &self.layer_transforms[s].bind_group;
         let (canvas, masks) = (&self.canvas_vertices.buffer, &self.mask_vertices.buffer);
         let screen = self.screen.as_ref().unwrap();
-        let seen = self.seen.as_ref().unwrap();
         let first = lp.first;
         // The draws of the layer's meshes, side by side in `draws`: the
         // tiles, then fringes and trims over them (the pieces', then those
@@ -1695,9 +1925,9 @@ impl Renderer {
                 (&self.mask_cutout_pipeline, &props_seen),
             ],
         );
-        // On the viewer's layer, what lights cast.
+        // On the player's layer, what lights cast.
         let lights = [(masks, lp.lights.clone(), 0)];
-        if s == 0 {
+        if l.index == frame.sight {
             let light = screen.light_msaa.attachment(&screen.light);
             self.pass(
                 encoder,
@@ -1707,19 +1937,34 @@ impl Renderer {
                 &[(&self.light_pipeline, &lights)],
             );
         }
-        // What's visible, into each page of `seen` it covers.
+    }
+
+    /// What's visible of a layer, into each page of `seen` it covers
+    /// (through the next of `onto`).
+    fn encode_seen<'a>(
+        &'a self,
+        encoder: &mut wgpu::CommandEncoder,
+        lp: &LayerPlan,
+        onto: &mut std::slice::Iter<'a, Uniform>,
+    ) {
+        let l = lp.layer;
+        let masks = &self.mask_vertices.buffer;
+        let seen = self.seen.as_ref().unwrap();
+        let visible = [(masks, lp.visible.clone(), 0)];
+        let props_seen = [(masks, lp.props_seen.clone(), 0)];
+        let lights = [(masks, lp.lights.clone(), 0)];
         for d in &lp.pages {
             let onto = &onto.next().unwrap().bind_group;
             let page = &seen.atlas.layers[d.slot as usize];
-            match &l.shaft {
-                // Below the viewer: remembered as seen only where it shows
-                // through.
+            match &l.seen_through {
+                // Below the player: remembered as seen only where it shows
+                // through to them.
                 Some(shaft) => {
                     let mut stencil = Vec::new();
                     self.mesh_draws(shaft, d.rect, 0, &mut stencil);
                     self.through(encoder, page, onto, &stencil, &visible);
                 }
-                // The viewer's layer: what's in sight within the radius, what
+                // The player's layer: what's in sight within the radius, what
                 // lights show wherever it's in sight, and the props seen.
                 None => {
                     self.pass(

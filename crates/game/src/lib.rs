@@ -82,6 +82,10 @@ pub struct Game {
     sprites: Sprites,
     /// The player's layer.
     top: usize,
+    /// The layer the view is from, in the whole level, once it's been
+    /// moved off the player's (see [`Game::view_top`]); until then, `None`,
+    /// and the view follows the player from layer to layer.
+    view: Option<usize>,
     /// The ground level: the lowest layer under the open sky (see
     /// [`goblin_nightclub_core::level_file::LevelFile::ground`]), in the
     /// whole level.
@@ -232,6 +236,7 @@ impl Game {
             camera,
             pointer: None,
             observed: None,
+            view: None,
         };
         game.center_camera();
         game.observe();
@@ -276,13 +281,20 @@ impl Game {
     }
 
     /// A key just went down (`KeyboardEvent.code`): Space toggles pause,
-    /// Escape pauses, C centers the camera on the player. Held keys pan the
-    /// camera.
+    /// Escape pauses, `=` and `-` move the view a layer up and down (the
+    /// player staying where they are, and the view following them again
+    /// once it's back on theirs), C centers the camera on the player, on
+    /// their layer. Held keys pan the camera.
     pub fn key_pressed(&mut self, code: &str) {
         match code {
             "Space" => self.paused = !self.paused,
             "Escape" => self.paused = true,
-            "KeyC" => self.center_camera(),
+            "Equal" => self.move_view(1),
+            "Minus" => self.move_view(-1),
+            "KeyC" => {
+                self.center_camera();
+                self.set_view(None);
+            }
             _ => {}
         }
     }
@@ -299,7 +311,27 @@ impl Game {
             self.paused = !self.paused;
             return;
         }
-        self.walk_to(self.to_world(p));
+        self.walk_to(self.on_players_layer(p));
+    }
+
+    /// The point of the player's layer drawn at `p` (view pixels): drawn
+    /// smaller about the view's center the further below the view's layer
+    /// it is (parallax), or larger above it, as if it were drawn.
+    fn on_players_layer(&self, p: [f32; 2]) -> [f32; 2] {
+        let shown = self.shown();
+        let below = shown.top as f32 - self.top as f32 + shown.sink;
+        if below == 0.0 {
+            return self.to_world(p);
+        }
+        let scale = self.parallax().powf(below);
+        let c = self.camera.view.map(|v| v / 2.0);
+        self.to_world([0, 1].map(|a| c[a] + (p[a] - c[a]) / scale))
+    }
+
+    /// How much smaller each layer is drawn than the one above it (see
+    /// [`camera::parallax`]).
+    fn parallax(&self) -> f32 {
+        camera::parallax(self.zoom(), self.tileset().zoom() * self.ui_scale())
     }
 
     /// Screen pixels per interface pixel; see [`Camera::ui_scale`].
@@ -344,14 +376,17 @@ impl Game {
         self.camera.center_on(center(self.player, PLAYER_SIZE));
     }
 
-    /// Everything to draw this frame: the player's layer and each one
-    /// showing through below it. Each layer is drawn in full and the
-    /// renderer shows it only where the matching visibility applies, so live
-    /// NPCs go in `visible` and last-seen markers in `remembered`.
+    /// Everything to draw this frame: the view's layer and each one
+    /// showing through below it, and the layers the player sees that those
+    /// aren't (looking down from one the view's above, or moved off it), for
+    /// what they see of them to be remembered. Each layer is drawn in full
+    /// and the renderer shows it only where the matching visibility
+    /// applies, so live NPCs go in `visible` and last-seen markers in
+    /// `remembered`.
     pub fn frame(&self) -> Frame {
         let tileset = self.tileset();
         let bevel = 1.0 / tileset.zoom();
-        let parallax = camera::parallax(self.zoom(), tileset.zoom() * self.ui_scale());
+        let parallax = self.parallax();
         let shown = self.shown();
         let top = shown.top;
         let mut seen = self.level.visible_layers(top);
@@ -359,59 +394,66 @@ impl Game {
             seen.insert(1, k);
             seen.truncate(MAX_VISIBLE);
         }
-        let layers = seen
-            .iter()
-            .map(|&k| {
-                let (layer, vision) = (self.level.layer(k), &self.visions[k]);
+        // The layers the player sees, from theirs, and whether what's in
+        // sight on layer `k` is drawn as such. Following the player, it's
+        // drawn as last seen while the view goes from one layer to another.
+        // Moved off them, only on those they see, and only from above:
+        // looking up at them, nothing covers what's below the player's
+        // layer but its own sight, so nothing's in sight there.
+        let sight = self.level.visible_layers(self.top);
+        let in_sight = |k: usize| self.view.is_none() || top >= self.top && sight.contains(&k);
+        // Layer `k`, `drawn` as one of those shown, or else only what's in
+        // sight there.
+        let layer_frame = |k: usize, drawn: bool| {
+            let (layer, vision) = (self.level.layer(k), &self.visions[k]);
+            let live = !drawn || in_sight(k);
+            // Bevels a pixel of the art wide, only on faces seen: now for
+            // the visible canvas, ever for the remembered one.
+            // Otherwise a lit wall would show the bevel of a face behind
+            // it nobody has seen.
+            // Characters drawn on this layer, as sprites centered on
+            // their boxes: live NPCs where visible, the last sighting of
+            // each (a gray ghost, in the remembered style) elsewhere.
+            let memory = &self.memories[k];
+            let mut visible = Canvas::new(tileset);
+            let mut remembered = Canvas::new(tileset);
+            let mut standing = Canvas::new(tileset);
+            if drawn {
                 // The tiles are drawn from the level's meshes; just the
                 // bevels in view are drawn here.
                 let scale = parallax.powf((top - k) as f32 + shown.sink);
                 let within =
                     camera::layer_view(self.camera.pos, self.camera.view, self.zoom(), scale);
-                // Bevels a pixel of the art wide, only on faces seen: now for
-                // the visible canvas, ever for the remembered one.
-                // Otherwise a lit wall would show the bevel of a face behind
-                // it nobody has seen.
-                // Characters drawn on this layer, as sprites centered on
-                // their boxes: live NPCs where visible, the last sighting of
-                // each (a gray ghost, in the remembered style) elsewhere.
-                let memory = &self.memories[k];
-                let mut live: Vec<([f32; 2], Cell)> = self
+                let mut live_sprites: Vec<([f32; 2], Cell)> = self
                     .npcs
                     .iter()
                     .filter(|n| n.layer == k)
                     .map(|n| (n.center(), self.sprite(n.kind)))
                     .collect();
                 if k == self.top {
-                    live.push((center(self.player, PLAYER_SIZE), self.sprites.player));
+                    live_sprites.push((center(self.player, PLAYER_SIZE), self.sprites.player));
                 }
                 let stale: Vec<([f32; 2], Cell)> = memory
                     .stale()
                     .map(|(_, m)| (center(m.pos, m.size), self.sprite(m.kind)))
                     .collect();
 
-                let mut visible = Canvas::new(tileset);
-                let seen_now = |i| vision.edge_visible()[i];
-                draw_bevels(layer, tileset, &mut visible, seen_now, bevel, within);
-                for &(at, cell) in &live {
+                if live {
+                    let seen_now = |i| vision.edge_visible()[i];
+                    draw_bevels(layer, tileset, &mut visible, seen_now, bevel, within);
+                }
+                for &(at, cell) in &live_sprites {
                     visible.sprite(at, cell, palette::WHITE);
                 }
-                let mut remembered = Canvas::new(tileset);
                 let seen_ever = |i| vision.edge_seen()[i];
                 draw_bevels(layer, tileset, &mut remembered, seen_ever, bevel, within);
                 for &(at, cell) in &stale {
                     remembered.sprite(at, cell, palette::WHITE);
                 }
 
-                let meshes = self.level.meshes(k);
-                // The layer beneath going from one layer to another is
-                // shown whole, as the viewer's is.
-                let through = k < top && shown.beneath != Some(k);
-                let shaft = through.then(|| self.level.shaft_mesh(top, k));
                 // Characters drawn on this layer cover any void their
                 // sprites overhang: the player, NPCs in view and last
                 // sightings.
-                let mut standing = Canvas::new(tileset);
                 let in_view = self
                     .npcs
                     .iter()
@@ -426,32 +468,58 @@ impl Game {
                 for &(at, cell) in &stale {
                     standing.sprite(at, cell, palette::WHITE);
                 }
+            }
 
-                // The props seen, whole where their art is.
-                let mut props_seen = Canvas::new(tileset);
+            // The props seen, whole where their art is.
+            let mut props_seen = Canvas::new(tileset);
+            if live {
                 for &[x, y] in vision.props_seen() {
                     draw_prop(layer, tileset, &mut props_seen, x as usize, y as usize);
                 }
+            }
 
-                LayerFrame {
-                    index: k,
-                    meshes: meshes.clone(),
-                    props_seen,
-                    visible,
-                    remembered,
-                    polygon: vision.polygon().to_vec(),
-                    lit_shapes: vision.wall_band().to_vec(),
-                    lights: vision.lights().to_vec(),
-                    standing,
-                    shaft,
-                }
-            })
+            // The layer beneath going from one layer to another is
+            // shown whole, as the viewer's is.
+            let through = drawn && k < top && shown.beneath != Some(k);
+            let shaft = through.then(|| self.level.shaft_mesh(top, k));
+            // What's in sight is remembered only where it shows through to
+            // the player, below them.
+            let seen_through = if self.view.is_none() && drawn {
+                shaft.clone()
+            } else {
+                (k < self.top).then(|| self.level.shaft_mesh(self.top, k))
+            };
+            fn sight_of<T: Clone>(live: bool, v: &[T]) -> Vec<T> {
+                if live { v.to_vec() } else { Vec::new() }
+            }
+
+            LayerFrame {
+                index: k,
+                meshes: self.level.meshes(k).clone(),
+                props_seen,
+                visible,
+                remembered,
+                polygon: sight_of(live, vision.polygon()),
+                lit_shapes: sight_of(live, vision.wall_band()),
+                lights: sight_of(live, vision.lights()),
+                standing,
+                shaft,
+                seen_through,
+            }
+        };
+        let layers = seen.iter().map(|&k| layer_frame(k, true)).collect();
+        let sighted = sight
+            .iter()
+            .filter(|&&k| !seen.contains(&k) || !in_sight(k))
+            .map(|&k| layer_frame(k, false))
             .collect();
 
         let vision = &self.visions[self.top];
         Frame {
             top,
             layers,
+            sight: self.top,
+            sighted,
             origin: vision.origin(),
             radius: vision.radius(),
             radius_step: VIEW_RADIUS_STEP,
@@ -475,6 +543,7 @@ impl Game {
                 .as_ref()
                 .map_or([0, 0], |s| s.window.tile_origin()),
             base: self.stream.as_ref().map_or(0, |s| s.window.base),
+            map: self.stream.as_ref().map(|s| s.map.clone()),
             remember: true,
             fade: shown.fade,
             sink: shown.sink,

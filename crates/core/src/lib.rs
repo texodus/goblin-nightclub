@@ -20,6 +20,7 @@ pub mod input;
 pub mod layer;
 pub mod level;
 pub mod level_file;
+pub mod map;
 pub mod memory;
 pub mod mesh;
 pub mod packed;

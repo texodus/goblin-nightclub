@@ -1,9 +1,10 @@
 //! Playing a level too big to keep whole, a window at a time (see
 //! [`goblin_nightclub_core::world`]): making the next window as the player
 //! moves on, and swapping it in. What's kept between windows, in the
-//! level's own coordinates: the tiles explored and the outline edges seen
-//! on each layer, and the NPCs outside the window, asleep where they were
-//! (only those in the window move).
+//! level's own coordinates: the tiles explored on each layer (as the map,
+//! shown beyond the window) and the outline edges seen, and the NPCs
+//! outside the window, asleep where they were (only those in the window
+//! move).
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -13,15 +14,13 @@ use goblin_nightclub_core::chunk::{CHUNK, ChunkKey};
 use goblin_nightclub_core::entity::{Entity, EntityId};
 use goblin_nightclub_core::layer::{Edge, TILE};
 use goblin_nightclub_core::level::Level;
+use goblin_nightclub_core::map::{Map, UNEXPLORED};
 use goblin_nightclub_core::pieces::Pieces;
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::vision::Vision;
 use goblin_nightclub_core::world::{Build, ChunkSource, Roofs, Window};
 
 use super::*;
-
-/// Words of bits for a chunk's tiles.
-const WORDS: usize = CHUNK * CHUNK / 64;
 
 pub(crate) struct Stream {
     pub source: Rc<dyn ChunkSource>,
@@ -32,8 +31,8 @@ pub(crate) struct Stream {
     pub next: Option<Build>,
     /// Pieces of the layers' geometry, kept from one window to the next.
     pub pieces: Arc<Mutex<Pieces>>,
-    /// Per chunk, its tiles ever explored, a bit each, row by row.
-    explored: HashMap<ChunkKey, Box<[u64; WORDS]>>,
+    /// The tiles ever explored, as they are.
+    pub map: Arc<Map>,
     /// Outline edges ever seen: the layer, and the ends in eighths of a
     /// tile.
     seen: HashSet<(usize, [i64; 4])>,
@@ -54,12 +53,12 @@ impl Stream {
         seed: u32,
     ) -> Self {
         Self {
+            map: Arc::new(Map::new(source.tileset())),
             source,
             window,
             roofs,
             next: None,
             pieces,
-            explored: HashMap::new(),
             seen: HashSet::new(),
             asleep: HashMap::new(),
             peopled: HashSet::new(),
@@ -79,15 +78,6 @@ impl Stream {
         [t[0] + o[0], t[1] + o[1]]
     }
 
-    /// The chunk, and the bit in it, of the window's tile `(x, y)` on its
-    /// layer `k`.
-    fn bit(&self, k: usize, x: usize, y: usize) -> (ChunkKey, usize) {
-        let [ax, ay] = self.absolute([x as i32, y as i32]);
-        let c = CHUNK as i32;
-        let key = (self.window.base + k, ax.div_euclid(c), ay.div_euclid(c));
-        (key, (ay.rem_euclid(c) * c + ax.rem_euclid(c)) as usize)
-    }
-
     /// An edge of the window's layer `k`, in the level.
     fn edge(&self, k: usize, e: &Edge) -> (usize, [i64; 4]) {
         let o = self.window.tile_origin();
@@ -101,14 +91,12 @@ impl Stream {
     /// Keep what `visions` (one a layer of `level`, the window's) have
     /// explored and seen.
     pub fn keep(&mut self, level: &Level, visions: &[Vision]) {
+        let (o, base) = (self.window.tile_origin(), self.window.base);
         for (k, v) in visions.iter().enumerate() {
+            let (layer, map) = (level.layer(k), Arc::make_mut(&mut self.map));
             for [x, y] in v.explored_tiles() {
-                let (key, bit) = self.bit(k, x, y);
-                let words = self
-                    .explored
-                    .entry(key)
-                    .or_insert_with(|| Box::new([0; WORDS]));
-                words[bit / 64] |= 1 << (bit % 64);
+                let t = [x as i32, y as i32];
+                map.explore(base + k, [t[0] + o[0], t[1] + o[1]], layer.tile(t[0], t[1]));
             }
             let seen: Vec<_> = v
                 .seen_edges(level.layer(k))
@@ -130,12 +118,12 @@ impl Stream {
                 for cy in 0..w.chunks[1] {
                     for cx in 0..w.chunks[0] {
                         let key = (w.base + k, w.origin[0] + cx as i32, w.origin[1] + cy as i32);
-                        let Some(words) = self.explored.get(&key) else {
+                        let Some(chunk) = self.map.chunk(key) else {
                             continue;
                         };
-                        for bit in 0..CHUNK * CHUNK {
-                            let [x, y] = [cx * CHUNK + bit % CHUNK, cy * CHUNK + bit / CHUNK];
-                            if x < w.cols && y < w.rows && words[bit / 64] & 1 << (bit % 64) != 0 {
+                        for (i, code) in chunk.tiles.iter().enumerate() {
+                            let [x, y] = [cx * CHUNK + i % CHUNK, cy * CHUNK + i / CHUNK];
+                            if x < w.cols && y < w.rows && code[0] != UNEXPLORED {
                                 explored[y * w.cols + x] = true;
                             }
                         }

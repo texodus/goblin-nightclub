@@ -824,12 +824,15 @@ impl Editor {
                     lights: Vec::new(),
                     standing: Canvas::new(&self.tileset),
                     shaft: (k < top).then(|| self.level.shaft_mesh(top, k)),
+                    seen_through: (k < top).then(|| self.level.shaft_mesh(top, k)),
                 }
             })
             .collect();
         Frame {
             top,
             layers,
+            sight: top,
+            sighted: Vec::new(),
             origin: [w / 2.0, h / 2.0],
             radius: f32::INFINITY,
             radius_step: 0.0,
@@ -846,6 +849,7 @@ impl Editor {
             world: self.world(),
             offset: [0, 0],
             base: 0,
+            map: None,
             remember: false,
             fade: 1.0,
             sink: 0.0,

@@ -8,6 +8,7 @@ use crate::camera;
 use crate::draw::Canvas;
 use crate::geom::Rect;
 use crate::layer::TILE;
+use crate::map::Map;
 use crate::mesh::Mesh;
 use crate::vision::Lit;
 
@@ -44,17 +45,33 @@ pub struct LayerFrame {
     /// the layer is drawn over any void beneath them rather than letting
     /// the layer below show through.
     pub standing: Canvas,
-    /// For a layer below the viewer's, where it shows through; only there
-    /// may it be remembered as seen. `None` for the viewer's own layer.
+    /// For a layer below the viewer's, where it shows through to it; only
+    /// there is what's remembered of it shown. `None` for the viewer's own
+    /// layer (or one shown whole, or not shown at all: see
+    /// [`Frame::sighted`]).
     pub shaft: Option<Arc<Mesh>>,
+    /// For a layer below the one sight is from ([`Frame::sight`]), where
+    /// it shows through to that one; only there may what's visible of it
+    /// be remembered as seen. `None` for that layer itself, and those above
+    /// it (where nothing is in sight).
+    pub seen_through: Option<Arc<Mesh>>,
 }
 
 pub struct Frame {
-    /// The viewer's layer.
+    /// The viewer's layer: the one the view is from.
     pub top: usize,
     /// The viewer's layer and each one below it that shows through, top
     /// first.
     pub layers: Vec<LayerFrame>,
+    /// The layer sight is from: what's visible is on it and those below it
+    /// showing through. The viewer's, unless the view's been moved off
+    /// it to another (to look around the level); then `origin`, the view
+    /// radius and the lights are this one's.
+    pub sight: usize,
+    /// The layers seen from `sight` that aren't in `layers`, top first:
+    /// not drawn, but what's visible of them is remembered as seen all the
+    /// same. Only what's in sight of each is filled in.
+    pub sighted: Vec<LayerFrame>,
     pub origin: [f32; 2],
     /// View radius on the viewer's layer, in world units; `f32::INFINITY` for
     /// unlimited.
@@ -95,6 +112,9 @@ pub struct Frame {
     /// and patterns pinned to the world go by these.
     pub offset: [i32; 2],
     pub base: usize,
+    /// For a level played a window at a time, what's been explored of it,
+    /// shown beyond the window.
+    pub map: Option<Arc<Map>>,
     /// Whether what's visible is remembered as seen; the editor shows
     /// everything and remembers none of it.
     pub remember: bool,

@@ -3,6 +3,8 @@
 //   now  = 1 where currently visible
 //   seen = 1 where ever visible
 // Masks are anti-aliased, so styles blend smoothly across their edges.
+// Beyond the window of a level played a window at a time, there's only the
+// map: the tiles explored, in the remembered style.
 //
 // Compiled after common.wgsl (see `crate::shaders`).
 
@@ -38,7 +40,8 @@ struct Params {
     radius_underground: f32,
     // Edge of a page of `seen`, in its pixels.
     page_px: f32,
-    _pad: f32,
+    // The layer of the whole level the window's layer 0 is.
+    base: u32,
     // Where world point (0, 0) is in the whole level (for a level drawn a
     // window at a time), so patterns pinned to the world stay put.
     offset: vec2<f32>,
@@ -47,7 +50,15 @@ struct Params {
     // deeper than it is each is drawn (so how much smaller).
     fade: f32,
     sink: f32,
-    _pad2: vec2<f32>,
+    // Size of the window (all of the level, unless it's played a window at
+    // a time): beyond it, the map is shown.
+    world: vec2<f32>,
+    // The layer sight is from, the player's: what's visible is on it and
+    // below it, as far as `radius` reaches there, and lit by `light_map`.
+    // The viewer's (`top`), unless the view's been moved off it.
+    sight: u32,
+    _pad: u32,
+    _pad2: vec2<u32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -68,10 +79,25 @@ struct Params {
 // columns and rows, and where its entries start in this same array; each
 // entry, row by row, the page's layer in `mask_seen`, or NO_PAGE.
 @group(0) @binding(5) var<storage, read> pages: array<u32>;
-// On the viewer's layer, in view space like `now`, what lights cast: their
+// On the player's layer, in view space like `now`, what lights cast: their
 // colors, added up, as bright as they are there (rgb), and how much what
 // they light shows (a), wherever it's in line of sight.
 @group(0) @binding(6) var light_map: texture_2d<f32>;
+// The map (see `goblin_nightclub_core::map`). What each of its codes is
+// drawn as: per code, two words: where its cells start in this same array
+// (the low 16 bits) and how many there are (the high), then how opaque it
+// is (f32 bits); after the codes', the cells, each its column and row in
+// the sheet (16 bits each).
+@group(0) @binding(7) var<storage, read> map_art: array<u32>;
+// Where each layer's chunks in view are, laid out as `pages` is, but per
+// layer of the whole level from the bottom, a chunk a page, and each entry
+// the chunk's slot in `map_tiles` (or NO_PAGE).
+@group(0) @binding(8) var<storage, read> map_table: array<u32>;
+// Per slot, a chunk's tiles, row by row, a word each: its quarters' codes,
+// a byte each, in the order of `QUARTERS` (N, E, S, W); 0 for unexplored.
+@group(0) @binding(9) var<storage, read> map_tiles: array<u32>;
+// The tile sheet, which the map's art is from.
+@group(0) @binding(10) var sheet: texture_2d<f32>;
 
 // Away from the open sky, the viewer carries a light: brightest close by,
 // dimmer toward the edge of sight, its color partly cast (as a light's:
@@ -161,14 +187,15 @@ fn bayer(p: vec2<u32>) -> f32 {
     return (m[(p.y % 4u) * 4u + p.x % 4u] + 0.5) / 16.0;
 }
 
-// View radius `d` layers below the viewer's (0 for unlimited).
-// View radius on layer `a`, `d` layers below the viewer's (0 for
-// unlimited): a step less per layer, and a fraction of that below ground.
-fn radius_at(a: u32, d: u32) -> f32 {
+// View radius on layer `a` (0 for unlimited): a step less per layer below
+// the one sight is from, and a fraction of that below ground. (Above it,
+// nothing's in sight.)
+fn radius_at(a: u32) -> f32 {
     if params.radius <= 0.0 {
         return 0.0;
     }
-    var r = max(params.radius - params.radius_step * f32(d), params.radius_min);
+    let below = f32(max(params.sight, a) - a);
+    var r = max(params.radius - params.radius_step * below, params.radius_min);
     if a < params.ground {
         r = max(r * params.radius_underground, params.radius_min);
     }
@@ -232,6 +259,106 @@ fn seen_at(s: u32, world: vec2<f32>) -> f32 {
     }
     let inside = vec2<i32>(at - vec2<f32>(page) * params.page_px);
     return textureLoad(mask_seen, inside, layer, 0).r;
+}
+
+// A spot on the map: its quarter's code and how opaque that is (0 for
+// void), its tile in the whole level, and where in the tile it is (0 to 1
+// across and down).
+struct Spot {
+    code: u32,
+    alpha: f32,
+    tile: vec2<i32>,
+    uv: vec2<f32>,
+};
+
+// The map at world point `world` (in the window's coordinates, as
+// everything else is) of layer `a` of the whole level: code 0 where it's
+// not been explored, or isn't on the GPU.
+fn map_at(a: u32, world: vec2<f32>) -> Spot {
+    let at = world / TILE;
+    let local = floor(at);
+    let tile = vec2<i32>(local) + vec2<i32>(round(params.offset / TILE));
+    var spot = Spot(0u, 1.0, tile, at - local);
+    let chunk = vec2<i32>(floor(vec2<f32>(tile) / f32(CHUNK)));
+    let head = TABLE_HEAD * a;
+    let corner = vec2(bitcast<i32>(map_table[head]), bitcast<i32>(map_table[head + 1u]));
+    let size = vec2(map_table[head + 2u], map_table[head + 3u]);
+    let rel = chunk - corner;
+    if any(rel < vec2(0)) || any(vec2<u32>(rel) >= size) {
+        return spot;
+    }
+    let slot = map_table[map_table[head + 4u] + u32(rel.y) * size.x + u32(rel.x)];
+    if slot == NO_PAGE {
+        return spot;
+    }
+    let inside = vec2<u32>(tile - chunk * i32(CHUNK));
+    let word = map_tiles[(slot * CHUNK + inside.y) * CHUNK + inside.x];
+    // The quarter it's in: the triangle between the tile's diagonals.
+    let uv = spot.uv;
+    var q = 1u;
+    if uv.y < min(uv.x, 1.0 - uv.x) {
+        q = 0u;
+    } else if uv.y > max(uv.x, 1.0 - uv.x) {
+        q = 2u;
+    } else if uv.x < 0.5 {
+        q = 3u;
+    }
+    spot.code = (word >> (8u * q)) & 0xffu;
+    spot.alpha = bitcast<f32>(map_art[2u * spot.code + 1u]);
+    return spot;
+}
+
+// Of `count` cells, the one for tile `tile`: as `tileset::variant` picks.
+fn variant(count: u32, tile: vec2<i32>) -> u32 {
+    var h = (u32(tile.x) * 0x9E3779B1u) ^ (u32(tile.y) * 0x85EBCA77u);
+    h ^= h >> 15u;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 12u;
+    return h % count;
+}
+
+// `spot`'s art, premultiplied (as the canvases are): transparent for void.
+fn map_color(spot: Spot) -> vec4<f32> {
+    let entry = map_art[2u * spot.code];
+    let count = entry >> 16u;
+    if count == 0u {
+        return vec4(0.0);
+    }
+    let cell = map_art[(entry & 0xffffu) + variant(count, spot.tile)];
+    let px = u32(params.page_px) / CHUNK;
+    let inside = min(vec2<u32>(spot.uv * f32(px)), vec2(px - 1u));
+    let c = textureLoad(sheet, vec2(cell & 0xffffu, cell >> 16u) * px + inside, 0);
+    let alpha = c.a * spot.alpha;
+    return vec4(c.rgb * alpha, alpha);
+}
+
+// `spot`, at world point `world`, styled: remembered if it's been
+// explored, else unknown.
+fn shade_map(spot: Spot, world: vec2<f32>) -> vec3<f32> {
+    if spot.code == 0u {
+        return style_unknown(world);
+    }
+    let dots = vec2<i32>(floor(world * params.seen_zoom));
+    let cell = vec2<u32>(((dots % 4) + 4) % 4);
+    return style_remembered(map_color(spot).rgb, cell);
+}
+
+// The sheet of mist hanging under a layer drawn `scale` times its size,
+// down a hole onto the layer below, at view pixel `xy` (`center` the
+// view's): `light` haze or dark, `known` as the hole is, and counting only
+// `weight` (see `fs_main`). Its color (multiply by the opacity) and its
+// opacity.
+fn mist(xy: vec2<f32>, center: vec2<f32>, scale: f32, light: bool, known: Known, weight: f32) -> vec4<f32> {
+    let sheet = scale * sqrt(params.scale);
+    let at = params.camera + (center + (xy - center) / sheet) / params.zoom;
+    let tint = select(MIST_DARK, MIST_LIGHT, light);
+    let opacity = select(MIST_DARK_ALPHA, MIST_LIGHT_ALPHA, light);
+    let gray = vec3(luminance(tint) * 0.75);
+    let variation = select(MIST_DARK_VARIATION, MIST_LIGHT_VARIATION, light);
+    let contrast = select(MIST_DARK_CONTRAST, MIST_LIGHT_CONTRAST, light);
+    let density = mist_density(at, variation, contrast);
+    let alpha = clamp(opacity * density, 0.0, 1.0) * max(known.now, known.seen) * weight;
+    return vec4(mix(gray, tint, known.now), alpha);
 }
 
 // What's known of a layer at a pixel: how much it's visible now, how much
@@ -308,24 +435,57 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // layer passed through has it, where it is on that layer).
     var unknown = 0.0;
     var bottom = vec2(0.0);
-    for (var d = 0u; d <= params.top; d++) {
-        let a = params.top - d;
-        if ((params.present >> d) & 1u) == 0u {
-            break;
-        }
+    // Down to the bottom of the whole level, which only the map may show.
+    let deepest = params.base + params.top;
+    for (var d = 0u; d <= deepest; d++) {
         let world = params.camera + (center + (frag.xy - center) / scale) / params.zoom;
-        let mask = textureLoad(voids, px, d, 0).r;
-        let below = select(0.0, through, d > 0u);
-        let radius = radius_at(a, d);
-        // What lights cast, on the viewer's layer.
-        var lights = vec4(0.0);
-        if d == 0u {
-            lights = textureLoad(light_map, px, 0);
-        }
-        let known = knowledge(d, px, world, radius, lights.a, below);
         // The viewer's layer, fading in or out, counts only so much; the
         // layer beneath shows through the rest of it, solid or not.
         let weight = select(1.0, params.fade, d == 0u);
+        if any(world < vec2(0.0)) || any(world >= params.world) {
+            // Beyond the window, the map: never in view.
+            let a = deepest - d;
+            let spot = map_at(a, world);
+            let next = a > 0u;
+            if spot.alpha >= 1.0 {
+                color += shade_map(spot, world) * remaining * weight;
+                if weight >= 1.0 || !next {
+                    return vec4(color, 1.0);
+                }
+                remaining *= 1.0 - weight;
+                through = 0.0;
+                scale *= params.scale;
+                continue;
+            }
+            unknown = 0.0;
+            bottom = world;
+            if spot.alpha > 0.0 {
+                color += shade_map(spot, world) * remaining * weight;
+                remaining *= 1.0 - weight * map_color(spot).a;
+            }
+            if next {
+                let base = i32(params.base);
+                let light = params.outdoors > 0.5 && i32(a) - 1 - base >= i32(params.ground);
+                let m = mist(frag.xy, center, scale, light, Known(0.0, 1.0, 1.0), weight);
+                color += m.rgb * m.a * remaining;
+                remaining *= 1.0 - m.a;
+            }
+            scale *= params.scale;
+            continue;
+        }
+        if d > params.top || ((params.present >> d) & 1u) == 0u {
+            break;
+        }
+        let a = params.top - d;
+        let mask = textureLoad(voids, px, d, 0).r;
+        let below = select(0.0, through, d > 0u);
+        let radius = radius_at(a);
+        // What lights cast, on the player's layer.
+        var lights = vec4(0.0);
+        if a == params.sight {
+            lights = textureLoad(light_map, px, 0);
+        }
+        let known = knowledge(d, px, world, radius, lights.a, below);
         let next = ((params.present >> (d + 1u)) & 1u) != 0u;
         if mask <= 0.25 {
             color += shade(d, px, world, radius, known, lights.rgb) * remaining * weight;
@@ -353,18 +513,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         // the hole is known, in the remembered style's gray where it isn't
         // in view.
         if next {
-            let sheet = scale * sqrt(params.scale);
-            let at = params.camera + (center + (frag.xy - center) / sheet) / params.zoom;
             let light = params.outdoors > 0.5 && a - 1u >= params.ground;
-            let tint = select(MIST_DARK, MIST_LIGHT, light);
-            let opacity = select(MIST_DARK_ALPHA, MIST_LIGHT_ALPHA, light);
-            let gray = vec3(luminance(tint) * 0.75);
-            let variation = select(MIST_DARK_VARIATION, MIST_LIGHT_VARIATION, light);
-            let contrast = select(MIST_DARK_CONTRAST, MIST_LIGHT_CONTRAST, light);
-            let density = mist_density(at, variation, contrast);
-            let alpha = clamp(opacity * density, 0.0, 1.0) * max(known.now, known.seen) * weight;
-            color += mix(gray, tint, known.now) * alpha * remaining;
-            remaining *= 1.0 - alpha;
+            let m = mist(frag.xy, center, scale, light, known, weight);
+            color += m.rgb * m.a * remaining;
+            remaining *= 1.0 - m.a;
         }
         scale *= params.scale;
     }
