@@ -7,6 +7,8 @@
 // art, out to a distance from its edge that varies with a noise pinned to
 // the world, so the cut is the same in every pass and doesn't crawl as the
 // view moves. Its outermost pixels have its color blended over them.
+//
+// Compiled after common.wgsl (see `crate::shaders`).
 
 struct Globals {
     // Size of the target in pixels.
@@ -80,29 +82,8 @@ fn vs_main(
     return out;
 }
 
-// Mirrors goblin_nightclub_core::layer::TILE: world units a tile.
-const TILE: f32 = 10.0;
-
 // Size of the bumps along a fringe's ragged edge, in pixels of the art.
 const FRINGE_GRAIN: f32 = 3.0;
-
-fn hash(p: vec2<f32>) -> f32 {
-    let q = fract(p * vec2(0.1031, 0.1030));
-    let r = q + dot(q, q.yx + 33.33);
-    return fract((r.x + r.y) * r.x);
-}
-
-// Smooth value noise in [0, 1], a lattice point every unit.
-fn value_noise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-    let a = hash(i);
-    let b = hash(i + vec2(1.0, 0.0));
-    let c = hash(i + vec2(0.0, 1.0));
-    let d = hash(i + vec2(1.0, 1.0));
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
 
 // Does a fringe from `edge`, reaching at most `reach`, cover world point
 // `p`? Out to a fraction of `reach` that varies along the edge: decided
@@ -239,17 +220,8 @@ fn fs_mask_near(in: VsOut) -> @location(0) vec4<f32> {
     return vec4(1.0);
 }
 
-// A light (see `goblin_nightclub_core::vision::Lit`): how bright at its
-// heart and at its rim, and how much of its color it casts (the rest
-// white). Mirrored in composite.wgsl, for the viewer's own.
-const LIGHT_HEART: f32 = 1.1;
-const LIGHT_RIM: f32 = 0.4;
-const LIGHT_WARMTH: f32 = 0.6;
-// Width (world units) of the band inside its radius where what it lights
-// fades from view (as `RADIUS_FADE` in composite.wgsl).
-const LIGHT_FADE: f32 = 12.0;
-
-// What a light, its center and radius in `edge` and its color in `color`,
+// What a light (see `LIGHT_HEART` in common.wgsl), its center and radius
+// in `edge` and its color in `color`,
 // casts at `world`: its tinted brightness (added up where lights meet),
 // and how much what it lights shows (the most of any).
 @fragment
@@ -259,7 +231,7 @@ fn fs_light(in: VsOut) -> @location(0) vec4<f32> {
     let t = clamp(d / r, 0.0, 1.0);
     let bright = mix(LIGHT_RIM, LIGHT_HEART, (1.0 - t) * (1.0 - t));
     let tint = mix(vec3(1.0), in.color.rgb, LIGHT_WARMTH);
-    let shown = 1.0 - smoothstep(r - LIGHT_FADE, r, d);
+    let shown = 1.0 - smoothstep(r - FADE, r, d);
     return vec4(tint * bright * shown, shown);
 }
 

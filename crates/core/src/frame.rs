@@ -3,10 +3,11 @@
 
 use std::sync::Arc;
 
-use crate::camera::{self, Rect};
+use crate::art::LayerMeshes;
+use crate::camera;
 use crate::draw::Canvas;
+use crate::geom::Rect;
 use crate::layer::TILE;
-use crate::level::LayerMeshes;
 use crate::mesh::Mesh;
 use crate::vision::Lit;
 
@@ -23,8 +24,6 @@ pub struct LayerFrame {
     pub visible: Canvas,
     /// Drawn over `tiles` where the viewer has seen before but can't now.
     pub remembered: Canvas,
-    /// Drawn where the viewer has never seen.
-    pub unknown: Canvas,
     /// Boundary of what's in line of sight around `origin`, by angle;
     /// drawn as a triangle fan. It goes as far as `lights` light: visible
     /// within the view radius, and beyond it where they light it.
@@ -51,8 +50,6 @@ pub struct LayerFrame {
 }
 
 pub struct Frame {
-    /// Layers in the level.
-    pub depth: usize,
     /// The viewer's layer.
     pub top: usize,
     /// The viewer's layer and each one below it that shows through, top

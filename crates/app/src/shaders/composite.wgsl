@@ -3,6 +3,8 @@
 //   now  = 1 where currently visible
 //   seen = 1 where ever visible
 // Masks are anti-aliased, so styles blend smoothly across their edges.
+//
+// Compiled after common.wgsl (see `crate::shaders`).
 
 // Distances are in world units; the view is in pixels, `zoom` to a world
 // unit, and `seen` in pixels of the art, `seen_zoom` to a world unit.
@@ -52,7 +54,7 @@ struct Params {
 // Each layer drawn goes in a slot: its depth below the viewer's, `s` (0
 // for the viewer's own).
 // Per slot `s`, in view space (already moved and scaled for parallax):
-// visible, remembered and unknown canvases at 3s, 3s + 1, 3s + 2; the
+// visible and remembered canvases at 2s and 2s + 1; the
 // `now` mask; and where it's void, showing the layer below.
 @group(0) @binding(1) var canvases: texture_2d_array<f32>;
 @group(0) @binding(2) var mask_now: texture_2d_array<f32>;
@@ -61,7 +63,7 @@ struct Params {
 // array, if anything on it has been seen.
 @group(0) @binding(3) var mask_seen: texture_2d_array<f32>;
 @group(0) @binding(4) var voids: texture_2d_array<f32>;
-// Where each slot's pages in view are: per slot `s`, at 8s, the page
+// Where each slot's pages in view are: per slot `s`, at `TABLE_HEAD * s`, the page
 // column and row (as i32) of the top-left of a window of pages, its
 // columns and rows, and where its entries start in this same array; each
 // entry, row by row, the page's layer in `mask_seen`, or NO_PAGE.
@@ -71,26 +73,15 @@ struct Params {
 // they light shows (a), wherever it's in line of sight.
 @group(0) @binding(6) var light_map: texture_2d<f32>;
 
-// A page nothing on which has been seen.
-const NO_PAGE: u32 = 0xffffffffu;
-
-// Width (world units) of the band inside the radius where the visible style
-// fades into the remembered one.
-const RADIUS_FADE: f32 = 12.0;
-
 // Away from the open sky, the viewer carries a light: brightest close by,
-// dimmer toward the edge of sight, its color partly cast (as a light's in
-// shapes.wgsl, whose brightness this mirrors). However many lights meet,
-// nothing's lit brighter than `LIGHT_MOST`.
+// dimmer toward the edge of sight, its color partly cast (as a light's:
+// see `LIGHT_HEART` in common.wgsl). However many lights meet, nothing's
+// lit brighter than `LIGHT_MOST`.
 const OWN_LIGHT: vec3<f32> = vec3(1.0, 0.82, 0.6);
-const LIGHT_HEART: f32 = 1.1;
-const LIGHT_RIM: f32 = 0.4;
-const LIGHT_WARMTH: f32 = 0.6;
 const LIGHT_MOST: f32 = 1.3;
 
 // Anywhere never seen, and beyond the level's edge: a dark gray fog in the
-// mist's billows, drifting with it, under whatever the unknown canvas
-// holds. Its average gray, and how much it varies either way (a fraction
+// mist's billows, drifting with it. Its average gray, and how much it varies either way (a fraction
 // of that) after its billows' contrast is stretched (see `mist_density`):
 // at most about 0.13, below the remembered style's dithered grays
 // (REMEMBERED_MIN and up), so what's known stands out against it.
@@ -128,24 +119,6 @@ const MIST_SCALE: f32 = 60.0;
 const MIST_DRIFT: vec2<f32> = vec2(2.5, 1.0);
 // Opacity steps, for the banded look of 16-bit translucency.
 const MIST_STEPS: f32 = 6.0;
-
-fn hash(p: vec2<f32>) -> f32 {
-    let q = fract(p * vec2(0.1031, 0.1030));
-    let r = q + dot(q, q.yx + 33.33);
-    return fract((r.x + r.y) * r.x);
-}
-
-// Smooth value noise in [0, 1], a lattice point every unit.
-fn value_noise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-    let a = hash(i);
-    let b = hash(i + vec2(1.0, 0.0));
-    let c = hash(i + vec2(0.0, 1.0));
-    let d = hash(i + vec2(1.0, 1.0));
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
 
 // Opacity of a mist sheet at world point `world` (on the sheet), out of 1 at the sheet's average opacity, varying by `variation`
 // either way after stretching the billows by `contrast`. In whole pixels
@@ -202,11 +175,11 @@ fn radius_at(a: u32, d: u32) -> f32 {
     return r;
 }
 
-// Full color `c` of slot `s` at view pixel `px`, `dist` from the viewer
-// with view `radius` (0 for unlimited), lit: outdoors by daylight, dimming
-// slightly toward the edge of sight; anywhere else by the viewer's own
-// light, warm and dimming more, and on the viewer's layer by lights too.
-fn style_visible(c: vec3<f32>, s: u32, px: vec2<i32>, dist: f32, radius: f32) -> vec3<f32> {
+// Full color `c`, `dist` from the viewer with view `radius` (0 for
+// unlimited), lit: outdoors by daylight, dimming slightly toward the edge of
+// sight; anywhere else by the viewer's own light, warm and dimming more, and
+// by `lights` (what lights cast there, on the viewer's layer).
+fn style_visible(c: vec3<f32>, lights: vec3<f32>, dist: f32, radius: f32) -> vec3<f32> {
     if radius <= 0.0 {
         return c;
     }
@@ -215,11 +188,8 @@ fn style_visible(c: vec3<f32>, s: u32, px: vec2<i32>, dist: f32, radius: f32) ->
     }
     let t = clamp(dist / radius, 0.0, 1.0);
     let own = mix(LIGHT_RIM, LIGHT_HEART, (1.0 - t) * (1.0 - t))
-        * (1.0 - smoothstep(radius - RADIUS_FADE, radius, dist));
-    var light = mix(vec3(1.0), OWN_LIGHT, LIGHT_WARMTH) * own;
-    if s == 0u {
-        light += textureLoad(light_map, px, 0).rgb;
-    }
+        * (1.0 - smoothstep(radius - FADE, radius, dist));
+    let light = mix(vec3(1.0), OWN_LIGHT, LIGHT_WARMTH) * own + lights;
     return c * min(light, vec3(LIGHT_MOST));
 }
 
@@ -239,11 +209,9 @@ fn style_remembered(c: vec3<f32>, p: vec2<u32>) -> vec3<f32> {
     return vec3(level);
 }
 
-// The fog at world point `world`, under `c` (premultiplied).
-fn style_unknown(c: vec4<f32>, world: vec2<f32>) -> vec3<f32> {
-    let density = mist_density(world, UNKNOWN_VARIATION, UNKNOWN_CONTRAST);
-    let fog = vec3(UNKNOWN_GRAY * density);
-    return c.rgb + fog * (1.0 - c.a);
+// The fog at world point `world`.
+fn style_unknown(world: vec2<f32>) -> vec3<f32> {
+    return vec3(UNKNOWN_GRAY * mist_density(world, UNKNOWN_VARIATION, UNKNOWN_CONTRAST));
 }
 
 // Slot `s`'s `seen` at world point `world`: 0 on a page nothing on which
@@ -251,7 +219,7 @@ fn style_unknown(c: vec4<f32>, world: vec2<f32>) -> vec3<f32> {
 fn seen_at(s: u32, world: vec2<f32>) -> f32 {
     let at = world * params.seen_zoom;
     let page = vec2<i32>(floor(at / params.page_px));
-    let window = 8u * s;
+    let window = TABLE_HEAD * s;
     let corner = vec2(bitcast<i32>(pages[window]), bitcast<i32>(pages[window + 1u]));
     let size = vec2(pages[window + 2u], pages[window + 3u]);
     let rel = page - corner;
@@ -266,44 +234,59 @@ fn seen_at(s: u32, world: vec2<f32>) -> f32 {
     return textureLoad(mask_seen, inside, layer, 0).r;
 }
 
-// How much slot `s` at view pixel `px` and world point `world` is visible
-// now, and has been seen, with view `radius` and `through` as for `shade`.
-// In line of sight, it's visible within the radius, and beyond it where
-// lights show it.
-fn knowledge(s: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec2<f32> {
+// What's known of a layer at a pixel: how much it's visible now, how much
+// it's been seen (or the hole showing it has), and how much it's been seen
+// itself.
+struct Known {
+    now: f32,
+    seen: f32,
+    own: f32,
+};
+
+// What's known of slot `s` at world point `world`, with view `radius` (0
+// for unlimited), `shown` (how much lights show it, past the radius) and
+// `through` as for `shade`. In line of sight, it's visible within the
+// radius, and beyond it where lights show it.
+fn knowledge(s: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, shown: f32, through: f32) -> Known {
     var now = textureLoad(mask_now, px, s, 0).r;
     if radius > 0.0 {
         let dist = distance(world, params.origin);
-        var shown = 1.0 - smoothstep(radius - RADIUS_FADE, radius, dist);
-        if s == 0u {
-            shown = max(shown, textureLoad(light_map, px, 0).a);
-        }
-        now *= shown;
+        now *= max(1.0 - smoothstep(radius - FADE, radius, dist), shown);
     }
-    return vec2(now, max(seen_at(s, world), through));
+    let own = seen_at(s, world);
+    return Known(now, max(own, through), own);
 }
 
-// Slot `s` at view pixel `px` and world point `world`, styled by its
-// masks, with view `radius` (0 for unlimited). `through` is how much the
-// hole this pixel looks down has been seen: a lower layer is remembered
-// where it has been seen itself, or where the hole showing it has (the
-// hole's sides, which parallax brings into view beside it, are seen with
-// the hole, but lie under the layers above, so never in its own `seen`).
-// The canvases hold premultiplied color (drawn over transparent black), so
-// the result is too; water is the translucent case.
-fn shade(s: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, through: f32) -> vec3<f32> {
-    let dist = distance(world, params.origin);
-    let known = knowledge(s, px, world, radius, through);
-    let now = known.x;
-    let seen = known.y;
-    let visible = style_visible(textureLoad(canvases, px, 3u * s, 0).rgb, s, px, dist, radius);
-    // Pixel of the art, wrapped to the dither pattern (it can be negative
-    // beyond the level's edge on lower layers).
-    let dots = vec2<i32>(floor(world * params.seen_zoom));
-    let cell = vec2<u32>(((dots % 4) + 4) % 4);
-    let remembered = style_remembered(textureLoad(canvases, px, 3u * s + 1u, 0).rgb, cell);
-    let unknown = style_unknown(textureLoad(canvases, px, 3u * s + 2u, 0), world);
-    return mix(mix(unknown, remembered, seen), visible, now);
+// Slot `s` at view pixel `px` and world point `world`, styled by what's
+// `known` of it, with view `radius` (0 for unlimited) and `lights` as for
+// `style_visible`. A lower layer is remembered where it has been seen
+// itself, or where the hole showing it has (`through` in `knowledge`: the
+// hole's sides, which parallax brings into view beside it, are seen with the
+// hole, but lie under the layers above, so never in its own `seen`). The
+// canvases hold premultiplied color (drawn over transparent black), so the
+// result is too; water is the translucent case. Only the styles that show
+// are worked out.
+fn shade(s: u32, px: vec2<i32>, world: vec2<f32>, radius: f32, known: Known, lights: vec3<f32>) -> vec3<f32> {
+    var color = vec3(0.0);
+    if known.now > 0.0 {
+        let dist = distance(world, params.origin);
+        color = style_visible(textureLoad(canvases, px, 2u * s, 0).rgb, lights, dist, radius);
+        if known.now >= 1.0 {
+            return color;
+        }
+    }
+    var past = vec3(0.0);
+    if known.seen > 0.0 {
+        // Pixel of the art, wrapped to the dither pattern (it can be
+        // negative beyond the level's edge on lower layers).
+        let dots = vec2<i32>(floor(world * params.seen_zoom));
+        let cell = vec2<u32>(((dots % 4) + 4) % 4);
+        past = style_remembered(textureLoad(canvases, px, 2u * s + 1u, 0).rgb, cell);
+    }
+    if known.seen < 1.0 {
+        past = mix(style_unknown(world), past, known.seen);
+    }
+    return mix(past, color, known.now);
 }
 
 @fragment
@@ -322,8 +305,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var remaining = 1.0;
     // What a hole through every layer drawn shows at its bottom: bedrock,
     // black where the hole is known, else the unknown style (as the last
-    // layer passed through has it).
-    var bedrock = vec3(0.0);
+    // layer passed through has it, where it is on that layer).
+    var unknown = 0.0;
+    var bottom = vec2(0.0);
     for (var d = 0u; d <= params.top; d++) {
         let a = params.top - d;
         if ((params.present >> d) & 1u) == 0u {
@@ -333,12 +317,18 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let mask = textureLoad(voids, px, d, 0).r;
         let below = select(0.0, through, d > 0u);
         let radius = radius_at(a, d);
+        // What lights cast, on the viewer's layer.
+        var lights = vec4(0.0);
+        if d == 0u {
+            lights = textureLoad(light_map, px, 0);
+        }
+        let known = knowledge(d, px, world, radius, lights.a, below);
         // The viewer's layer, fading in or out, counts only so much; the
         // layer beneath shows through the rest of it, solid or not.
         let weight = select(1.0, params.fade, d == 0u);
         let next = ((params.present >> (d + 1u)) & 1u) != 0u;
         if mask <= 0.25 {
-            color += shade(d, px, world, radius, below) * remaining * weight;
+            color += shade(d, px, world, radius, known, lights.rgb) * remaining * weight;
             if weight >= 1.0 || !next {
                 return vec4(color, 1.0);
             }
@@ -348,18 +338,17 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             scale *= params.scale;
             continue;
         }
-        let known = knowledge(d, px, world, radius, below);
-        let unknown = (1.0 - known.x) * (1.0 - known.y);
-        bedrock = style_unknown(textureLoad(canvases, px, 3u * d + 2u, 0), world) * unknown;
+        unknown = (1.0 - known.now) * (1.0 - known.seen);
+        bottom = world;
         if mask < 0.75 {
             // Water: its styled (premultiplied) color over what's below.
             // Where it's never been seen, the unknown style is opaque, so
             // nothing beneath shows through that part.
-            let alpha = textureLoad(canvases, px, 3u * d, 0).a;
-            color += shade(d, px, world, radius, below) * remaining * weight;
+            let alpha = textureLoad(canvases, px, 2u * d, 0).a;
+            color += shade(d, px, world, radius, known, lights.rgb) * remaining * weight;
             remaining *= 1.0 - weight * (1.0 - (1.0 - alpha) * (1.0 - unknown));
         }
-        through = min(through, seen_at(d, world));
+        through = min(through, known.own);
         // The mist down this hole, onto the next layer: there only where
         // the hole is known, in the remembered style's gray where it isn't
         // in view.
@@ -373,11 +362,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             let variation = select(MIST_DARK_VARIATION, MIST_LIGHT_VARIATION, light);
             let contrast = select(MIST_DARK_CONTRAST, MIST_LIGHT_CONTRAST, light);
             let density = mist_density(at, variation, contrast);
-            let alpha = clamp(opacity * density, 0.0, 1.0) * max(known.x, known.y) * weight;
-            color += mix(gray, tint, known.x) * alpha * remaining;
+            let alpha = clamp(opacity * density, 0.0, 1.0) * max(known.now, known.seen) * weight;
+            color += mix(gray, tint, known.now) * alpha * remaining;
             remaining *= 1.0 - alpha;
         }
         scale *= params.scale;
     }
-    return vec4(color + bedrock * remaining, 1.0);
+    if unknown > 0.0 && remaining > 0.0 {
+        color += style_unknown(bottom) * unknown * remaining;
+    }
+    return vec4(color, 1.0);
 }

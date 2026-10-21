@@ -8,7 +8,7 @@ impl Rng {
     }
 
     /// 24 random bits.
-    pub fn next_u24(&mut self) -> u32 {
+    fn next_u24(&mut self) -> u32 {
         self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         self.0 >> 8
     }

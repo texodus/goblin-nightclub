@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use goblin_nightclub_core::chunk::{CHUNK, Chunk, ChunkKey};
 use goblin_nightclub_core::packed::Packed;
@@ -84,8 +84,6 @@ pub struct WorkerSource {
     regions: Rc<RefCell<Regions>>,
     /// Asks JS for a region: `request(rx, ry)`.
     request: js_sys::Function,
-    /// What went wrong asking, once.
-    trouble: Mutex<Option<String>>,
 }
 
 impl WorkerSource {
@@ -98,7 +96,6 @@ impl WorkerSource {
             tileset: tileset().clone(),
             regions: regions.clone(),
             request,
-            trouble: Default::default(),
         };
         (source, regions)
     }
@@ -124,7 +121,7 @@ impl WorkerSource {
         if regions.asked.insert(at) {
             let (rx, ry) = (JsValue::from(at[0] as u32), JsValue::from(at[1] as u32));
             if let Err(e) = self.request.call2(&JsValue::NULL, &rx, &ry) {
-                self.trouble.lock().unwrap().get_or_insert(format!("{e:?}"));
+                web_sys::console::error_2(&"asking for a region failed:".into(), &e);
             }
         }
         None

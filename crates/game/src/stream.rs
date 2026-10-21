@@ -1,5 +1,6 @@
 //! Playing a level too big to keep whole, a window at a time (see
-//! [`goblin_nightclub_core::world`]). What's kept between windows, in the
+//! [`goblin_nightclub_core::world`]): making the next window as the player
+//! moves on, and swapping it in. What's kept between windows, in the
 //! level's own coordinates: the tiles explored and the outline edges seen
 //! on each layer, and the NPCs outside the window, asleep where they were
 //! (only those in the window move).
@@ -12,9 +13,12 @@ use goblin_nightclub_core::chunk::{CHUNK, ChunkKey};
 use goblin_nightclub_core::entity::{Entity, EntityId};
 use goblin_nightclub_core::layer::{Edge, TILE};
 use goblin_nightclub_core::level::Level;
+use goblin_nightclub_core::pieces::Pieces;
 use goblin_nightclub_core::rng::Rng;
 use goblin_nightclub_core::vision::Vision;
-use goblin_nightclub_core::world::{Build, ChunkSource, Pieces, Roofs, Window};
+use goblin_nightclub_core::world::{Build, ChunkSource, Roofs, Window};
+
+use super::*;
 
 /// Words of bits for a chunk's tiles.
 const WORDS: usize = CHUNK * CHUNK / 64;
@@ -216,5 +220,101 @@ impl Stream {
             }
         }
         npcs
+    }
+}
+
+impl Game {
+    /// What's drawn of the next window, as it's made: to have ready for
+    /// when it's swapped in.
+    pub fn upcoming(&self) -> impl Iterator<Item = &Mesh> {
+        let next = self.stream.iter().flat_map(|s| &s.next);
+        next.flat_map(|b| b.meshes())
+    }
+
+    /// For a level played a window at a time: once the player has moved
+    /// on from the middle of the window, make the next one around them, a
+    /// piece each update, and swap it in when it's made.
+    pub(super) fn advance_stream(&mut self) {
+        let Some(stream) = &mut self.stream else {
+            return;
+        };
+        let tile = stream.absolute(tile_of(center(self.player, PLAYER_SIZE)));
+        let top = stream.window.base + self.top;
+        let build = match &mut stream.next {
+            Some(build) => build,
+            None => {
+                let want = Window::around(stream.size(), tile, top);
+                if want == stream.window {
+                    return;
+                }
+                stream.next.insert(
+                    Build::new(stream.source.clone(), want, top).with_pieces(stream.pieces.clone()),
+                )
+            }
+        };
+        if !build.step() {
+            return;
+        }
+        let build = stream.next.take().unwrap();
+        // Unless the player's left it already (and the next is due).
+        let chunk = tile.map(|t| t.div_euclid(CHUNK as i32));
+        if build.window().local((top, chunk[0], chunk[1])).is_some() {
+            self.swap(build);
+        }
+    }
+
+    /// Move the game onto the window `build` makes: everything moves with
+    /// the level under it, and what's kept between windows is kept.
+    pub(super) fn swap(&mut self, build: Build) {
+        let stream = self.stream.as_mut().unwrap();
+        let (old, new) = (stream.window, build.window());
+        stream.keep(&self.level, &self.visions);
+        stream.sleep(std::mem::take(&mut self.npcs));
+        let (level, roofs) = build.finish();
+        stream.roofs = roofs;
+        let [ox, oy] = old.tile_origin();
+        let [nx, ny] = new.tile_origin();
+        let tiles = [ox - nx, oy - ny];
+        let by = tiles.map(|t| t as f32 * TILE);
+        let shift = |p: [f32; 2]| [p[0] + by[0], p[1] + by[1]];
+        self.player = shift(self.player);
+        self.camera.pos = shift(self.camera.pos);
+        self.top = old.base + self.top - new.base;
+        if let Some(route) = &mut self.route {
+            for t in &mut route.tiles {
+                *t = [t[0] + tiles[0], t[1] + tiles[1]];
+            }
+            for w in &mut route.waypoints {
+                *w = shift(*w);
+            }
+        }
+        // Each layer's memories go with it, if it's still in the window.
+        let size = [new.cols as f32 * TILE, new.rows as f32 * TILE];
+        let mut memories: Vec<Memory> = (0..new.depth).map(|_| Memory::default()).collect();
+        for (k, mut memory) in std::mem::take(&mut self.memories).into_iter().enumerate() {
+            let at = (old.base + k)
+                .checked_sub(new.base)
+                .filter(|&k| k < new.depth);
+            if let Some(k) = at {
+                memory.shift(by, [[0.0; 2], size]);
+                memories[k] = memory;
+            }
+        }
+        self.memories = memories;
+        stream.window = new;
+        self.visions = stream.visions(&level, VIEW_RADIUS);
+        let avoid = center(self.player, PLAYER_SIZE);
+        self.npcs = stream.wake(&level, NPC_PER_CHUNK, avoid, NPC_SPAWN_DIST);
+        let old = std::mem::replace(&mut self.level, level);
+        self.litter.extend(old.take_apart());
+        self.observed = None;
+        self.observe();
+    }
+
+    /// The ground level, as a layer of the game's level: 0 if it's below
+    /// the window, its depth if it's above.
+    pub(super) fn local_ground(&self) -> usize {
+        let base = self.stream.as_ref().map_or(0, |s| s.window.base);
+        self.ground.saturating_sub(base).min(self.level.depth())
     }
 }

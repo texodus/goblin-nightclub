@@ -15,4 +15,3 @@ serde_json.workspace = true
 
 [dev-dependencies]
 goblin-nightclub-core = { workspace = true, features = ["test-util"] }
-png.workspace = true

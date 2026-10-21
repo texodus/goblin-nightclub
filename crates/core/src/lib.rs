@@ -8,12 +8,14 @@
 //! The `test-util` feature exposes test helpers (levels from ASCII art,
 //! random tile soups, invariant checks) for other crates' tests.
 
+pub mod art;
 pub mod camera;
 pub mod chunk;
 pub mod draw;
 pub mod entity;
 pub mod frame;
 pub mod fringe;
+pub mod geom;
 pub mod input;
 pub mod layer;
 pub mod level;
@@ -23,6 +25,7 @@ pub mod mesh;
 pub mod packed;
 pub mod palette;
 pub mod path;
+pub mod pieces;
 pub mod prop;
 pub mod rng;
 pub mod tileset;
@@ -34,10 +37,3 @@ pub mod world;
 /// resolution) is a whole number of times this, more or less.
 pub const WIDTH: u32 = 320;
 pub const HEIGHT: u32 = 200;
-
-/// The length of `v`. Not `f32::hypot`, which guards against overflow no
-/// level comes near, and which compiles to a slow software routine in
-/// wasm: sight calls this a great deal every frame.
-pub fn length(v: [f32; 2]) -> f32 {
-    (v[0] * v[0] + v[1] * v[1]).sqrt()
-}

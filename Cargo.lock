@@ -212,9 +212,20 @@ name = "goblin-nightclub-generate"
 version = "0.1.0"
 dependencies = [
  "goblin-nightclub-core",
- "png",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "goblin-nightclub-tests"
+version = "0.1.0"
+dependencies = [
+ "goblin-nightclub-core",
+ "goblin-nightclub-generate",
+ "goblin_nightclub",
+ "png",
+ "serde_json",
+ "wgpu",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 //! WebGPU renderer. Each frame, for each layer of the level in view, drawn
 //! through that layer's transform (the camera, plus parallax: each layer
 //! below the viewer's a little smaller about the view's center):
-//! 1. its visible, remembered and unknown canvases;
+//! 1. its visible and remembered canvases;
 //! 2. where it's void (the layer below shows through), in a mask;
 //! 3. its visibility polygon into `now`, cleared every frame; and in world
 //!    space into `seen`, never cleared, so it accumulates everything seen
@@ -39,13 +39,14 @@ use std::rc::Rc;
 use wgpu::util::DeviceExt;
 
 use crate::pages::{Op, Page, Pages};
-use goblin_nightclub_core::camera::Rect;
+use crate::shaders::{self, CompositeParams, NO_PAGE, TABLE_HEAD, Transform};
+use goblin_nightclub_core::art::MeshPiece;
 use goblin_nightclub_core::chunk::CHUNK;
 use goblin_nightclub_core::draw::Vertex;
 use goblin_nightclub_core::frame::{Frame, LayerFrame};
+use goblin_nightclub_core::geom::{Rect, bounds};
 use goblin_nightclub_core::layer::TILE;
 use goblin_nightclub_core::level::MAX_VISIBLE;
-use goblin_nightclub_core::level::MeshPiece;
 use goblin_nightclub_core::mesh::Mesh;
 use goblin_nightclub_core::tileset::Sheet;
 
@@ -63,67 +64,6 @@ const MASK_SAMPLES: u32 = 4;
 /// (if the device allows).
 const PAGES_FIRST: u32 = 16;
 const PAGES_MAX: u32 = 256;
-
-/// Marks a page in the page table nothing on which has been seen; mirrors
-/// `NO_PAGE` in composite.wgsl.
-const NO_PAGE: u32 = u32::MAX;
-
-/// Words per slot at the head of the page table (see `pages` in
-/// composite.wgsl).
-const TABLE_HEAD: usize = 8;
-
-/// Mirrors `Globals` in shapes.wgsl: how world positions land on a target.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Transform {
-    screen: [f32; 2],
-    camera: [f32; 2],
-    center: [f32; 2],
-    scale: f32,
-    zoom: f32,
-    cell: f32,
-    /// How much smaller each layer is drawn than the one above it: so how
-    /// much larger anything up from its layer (see `Vertex::z`) is.
-    parallax: f32,
-    /// Where world point (0, 0) is in the whole level.
-    offset: [f32; 2],
-}
-
-/// Mirrors `Params` in composite.wgsl.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct CompositeParams {
-    origin: [f32; 2],
-    /// 0 for unlimited.
-    radius: f32,
-    time: f32,
-    top: u32,
-    /// Bit per layer drawn this frame.
-    present: u32,
-    scale: f32,
-    radius_step: f32,
-    camera: [f32; 2],
-    radius_min: f32,
-    zoom: f32,
-    seen_zoom: f32,
-    /// 1 when the viewer is outdoors (light mist over lower layers, not
-    /// dark).
-    outdoors: f32,
-    /// The ground level: the mist over layers below it is dark even
-    /// outdoors.
-    ground: u32,
-    /// Layers below `ground` are seen this fraction as far.
-    radius_underground: f32,
-    /// Edge of a page of `seen`, in its pixels.
-    page_px: f32,
-    _pad: f32,
-    /// Where world point (0, 0) is in the whole level.
-    offset: [f32; 2],
-    /// See [`Frame::fade`] and [`Frame::sink`].
-    fade: f32,
-    sink: f32,
-    _pad2: [f32; 2],
-}
 
 /// A vertex buffer that grows (to the next power of two) as needed.
 struct GrowBuffer {
@@ -280,19 +220,18 @@ impl Msaa {
         Self { view }
     }
 
-    /// Color attachment drawing into `resolved`. With `clear` the mask is
-    /// reset first; otherwise new triangles accumulate onto what's there.
+    /// Color attachment drawing into `resolved`, cleared first.
     fn attachment<'a>(
         &'a self,
         resolved: &'a wgpu::TextureView,
-        clear: bool,
     ) -> wgpu::RenderPassColorAttachment<'a> {
         let (view, resolve_target) = match &self.view {
             Some(msaa) => (msaa, Some(resolved)),
             None => (resolved, None),
         };
-        // The MSAA samples only need to outlive the pass when accumulating.
-        let store = if clear && self.view.is_some() {
+        // The samples needn't outlive the pass: they're resolved, and the
+        // next pass clears them.
+        let store = if self.view.is_some() {
             wgpu::StoreOp::Discard
         } else {
             wgpu::StoreOp::Store
@@ -302,11 +241,7 @@ impl Msaa {
             depth_slice: None,
             resolve_target,
             ops: wgpu::Operations {
-                load: if clear {
-                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
-                } else {
-                    wgpu::LoadOp::Load
-                },
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                 store,
             },
         }
@@ -394,17 +329,30 @@ fn seen_key(drawn: &[&[Vertex]], shaft: Option<&Mesh>, page_px: u32) -> u64 {
     h.finish()
 }
 
-/// A plain single-sample attachment, cleared first.
-fn cleared(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
+/// A plain single-sample attachment, first `load`ed.
+fn target(
+    view: &wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+) -> wgpu::RenderPassColorAttachment<'_> {
     wgpu::RenderPassColorAttachment {
         view,
         depth_slice: None,
         resolve_target: None,
         ops: wgpu::Operations {
-            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            load,
             store: wgpu::StoreOp::Store,
         },
     }
+}
+
+/// The same, cleared first.
+fn cleared(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
+    target(view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT))
+}
+
+/// The same, drawn over what's there.
+fn kept(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
+    target(view, wgpu::LoadOp::Load)
 }
 
 /// A uniform buffer holding a `Transform`, and its bind group (which also
@@ -499,6 +447,52 @@ struct Leaving {
     mapped: Rc<Cell<Option<bool>>>,
 }
 
+/// What a frame draws of one layer, worked out before any of it is.
+struct LayerPlan<'f> {
+    layer: &'f LayerFrame,
+    /// How far below the viewer's it is: which textures it's drawn into.
+    slot: usize,
+    /// Its first piece's in [`Renderer::shifts`].
+    first: u32,
+    /// Its canvases, in the canvas vertices.
+    canvases: [Range<u32>; 2],
+    /// What's visible, what lights light, the props seen and whatever
+    /// stands on it, in the mask vertices.
+    visible: Range<u32>,
+    lights: Range<u32>,
+    props_seen: Range<u32>,
+    standing: Range<u32>,
+    /// The pages of `seen` what's visible goes into this frame.
+    pages: Vec<PageDraw>,
+}
+
+impl<'f> LayerPlan<'f> {
+    /// Layer `layer` in slot `slot`, its pieces' shifts from `first`; its
+    /// vertices and pages yet to be worked out.
+    fn new(layer: &'f LayerFrame, slot: usize, first: u32) -> Self {
+        Self {
+            layer,
+            slot,
+            first,
+            canvases: [0..0, 0..0],
+            visible: 0..0,
+            lights: 0..0,
+            props_seen: 0..0,
+            standing: 0..0,
+            pages: Vec::new(),
+        }
+    }
+}
+
+/// What a frame draws, worked out (its vertices and page table uploaded)
+/// before any of it is drawn.
+struct FramePlan<'f> {
+    layers: Vec<LayerPlan<'f>>,
+    /// The overlay and the interface, in the canvas vertices.
+    overlay: Range<u32>,
+    ui: Range<u32>,
+}
+
 /// One page of a layer's `seen` mask to draw what's visible into.
 struct PageDraw {
     slot: u32,
@@ -521,8 +515,7 @@ type Draw<'a> = (&'a wgpu::Buffer, Range<u32>, u32);
 /// What's sized to the screen, a slot each.
 struct Screen {
     size: [u32; 2],
-    /// Per slot `s`: visible, remembered, unknown at `3s`, `3s + 1`,
-    /// `3s + 2`.
+    /// Per slot `s`: visible and remembered at `2s` and `2s + 1`.
     canvases: ArrayTexture,
     now: ArrayTexture,
     voids: ArrayTexture,
@@ -718,7 +711,13 @@ impl Renderer {
 
         // Canvases and masks all draw triangles from the same vertices;
         // masks ignore the color, and mostly the sheet.
-        let shapes = device.create_shader_module(wgpu::include_wgsl!("shaders/shapes.wgsl"));
+        let module = |label, source: String| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            })
+        };
+        let shapes = module("shapes", shaders::shapes());
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -857,8 +856,7 @@ impl Renderer {
                 texture_entry(6, wgpu::TextureViewDimension::D2),
             ],
         });
-        let composite_shader =
-            device.create_shader_module(wgpu::include_wgsl!("shaders/composite.wgsl"));
+        let composite_shader = module("composite", shaders::composite());
         let composite_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("composite"),
@@ -992,7 +990,7 @@ impl Renderer {
         let format = self.config.format;
         self.screen = Some(Screen {
             size,
-            canvases: ArrayTexture::new(device, "canvases", size, 3 * slots, format),
+            canvases: ArrayTexture::new(device, "canvases", size, 2 * slots, format),
             now: ArrayTexture::new(device, "mask now", size, slots, MASK_FORMAT),
             voids: ArrayTexture::new(device, "voids", size, slots, MASK_FORMAT),
             now_msaa: (0..MAX_VISIBLE)
@@ -1258,42 +1256,51 @@ impl Renderer {
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
         };
-        // The camera on a whole pixel, so the tile art stays crisp. `seen`
-        // is at the art's own size, whatever the view's zoom, so zooming
-        // keeps what's been seen; its pages are a chunk of the level each.
-        let zoom = frame.zoom;
-        let cell = frame.cell as f32;
-        let seen_zoom = cell / TILE;
-        let page_world = CHUNK as f32 * TILE;
+        let plan = self.plan(frame);
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.apply_page_ops(&mut encoder);
+        self.ensure_composite();
+        self.write_uniforms(frame, &plan);
+        let screen = output.texture.create_view(&Default::default());
+        self.encode(&mut encoder, frame, &plan, &screen);
+        self.queue.submit([encoder.finish()]);
+        self.queue.present(output);
+    }
+
+    /// Work out what `frame` draws, before any of it is: the textures it
+    /// needs, its meshes on the GPU (and where each piece goes), its
+    /// vertices uploaded, which pages of `seen` each layer shows (the page
+    /// table, uploaded) and which it draws what's visible into.
+    fn plan<'f>(&mut self, frame: &'f Frame) -> FramePlan<'f> {
+        // `seen` is at the art's own size, whatever the view's zoom, so
+        // zooming keeps what's been seen; its pages are a chunk of the level
+        // each.
         let page_px = CHUNK as u32 * frame.cell;
+        let page_world = CHUNK as f32 * TILE;
         self.ensure_seen(page_px);
         self.ensure_screen();
         self.collect_leaving();
-        let camera = frame.camera.map(|c| (c * zoom).round() / zoom);
-        // The level may be drawn a window at a time: its layers and pages,
-        // and patterns pinned to the world, go by where they are in the
-        // whole level.
-        let offset = frame.offset.map(|t| t as f32 * TILE);
+        // The level may be drawn a window at a time: its layers and pages
+        // go by where they are in the whole level.
         let page_offset = frame.offset.map(|t| t.div_euclid(CHUNK as i32));
         let page = |index: usize, px: i32, py: i32| -> Page {
             (frame.base + index, px + page_offset[0], py + page_offset[1])
         };
-        // Top first, a slot each: how far below the viewer's it is.
-        let layers: Vec<_> = frame
+
+        // Top first, a slot each: how far below the viewer's it is. Each
+        // layer's meshes on the GPU, and where each of its pieces goes: its
+        // first in `shifts`.
+        let mut shifts = vec![[0.0f32; 2]];
+        let mut layers = Vec::new();
+        for l in frame
             .layers
             .iter()
             .filter(|l| frame.top - l.index < MAX_VISIBLE)
-            .collect();
-        let slot = |index: usize| frame.top - index;
-        // Each layer's meshes on the GPU, and where each of its pieces
-        // goes: its first in `shifts` at `firsts`.
-        let mut shifts = vec![[0.0f32; 2]];
-        let mut firsts = Vec::new();
-        for l in &layers {
+        {
             for mesh in l.meshes.all().chain(l.shaft.as_deref()) {
                 self.keep(mesh);
             }
-            firsts.push(shifts.len() as u32);
+            layers.push(LayerPlan::new(l, frame.top - l.index, shifts.len() as u32));
             shifts.extend((0..l.meshes.pieces.len()).map(|i| l.meshes.corner(i)));
         }
         self.shifts
@@ -1309,65 +1316,48 @@ impl Renderer {
             into.extend_from_slice(vertices);
             start..into.len() as u32
         };
-        struct Ranges {
-            canvases: [Range<u32>; 3],
-            visible: Range<u32>,
-            lights: Range<u32>,
-            props_seen: Range<u32>,
-            standing: Range<u32>,
-        }
-        // How far each sees by itself, for the triangles of what's visible
-        // (see `fs_mask_near`).
+        // How far the viewer sees by itself, for the triangles of what's
+        // visible (see `fs_mask_near`).
         let radius = if frame.radius.is_finite() {
             frame.radius
         } else {
             f32::MAX
         };
-        let ranges: Vec<Ranges> = layers
-            .iter()
-            .map(|l| {
-                let canvases = [&l.visible, &l.remembered, &l.unknown]
-                    .map(|c| push(&mut canvas_vertices, &c.vertices));
-                // Visible area as a triangle list: the polygon fanning out
-                // from the origin, plus each (convex) lit shape fanned from
-                // its first point; each vertex with how far the viewer sees
-                // by itself.
-                let start = mask_vertices.len() as u32;
-                let near = [frame.origin[0], frame.origin[1], radius, 0.0];
-                mask_vertices.extend(fan(frame.origin, &l.polygon, &l.lit_shapes).map(|pos| {
+        for lp in &mut layers {
+            let l = lp.layer;
+            lp.canvases =
+                [&l.visible, &l.remembered].map(|c| push(&mut canvas_vertices, &c.vertices));
+            // Visible area as a triangle list: the polygon fanning out from
+            // the origin, plus each (convex) lit shape fanned from its first
+            // point; each vertex with how far the viewer sees by itself.
+            let start = mask_vertices.len() as u32;
+            let near = [frame.origin[0], frame.origin[1], radius, 0.0];
+            mask_vertices.extend(
+                fan(frame.origin, &l.polygon, &l.lit_shapes).map(|pos| Vertex {
+                    pos,
+                    edge: near,
+                    ..Default::default()
+                }),
+            );
+            lp.visible = start..mask_vertices.len() as u32;
+            // Likewise what each light lights, with its center, radius and
+            // color.
+            let start = mask_vertices.len() as u32;
+            for lit in &l.lights {
+                let edge = [lit.center[0], lit.center[1], lit.radius, 0.0];
+                mask_vertices.extend(fan(lit.center, lit.polygon(), lit.band()).map(|pos| {
                     Vertex {
                         pos,
-                        edge: near,
+                        color: lit.color,
+                        edge,
                         ..Default::default()
                     }
                 }));
-                let visible = start..mask_vertices.len() as u32;
-                // Likewise what each light lights, with its center, radius
-                // and color.
-                let start = mask_vertices.len() as u32;
-                for lit in &l.lights {
-                    let edge = [lit.center[0], lit.center[1], lit.radius, 0.0];
-                    mask_vertices.extend(fan(lit.center, lit.polygon(), lit.band()).map(|pos| {
-                        Vertex {
-                            pos,
-                            color: lit.color,
-                            edge,
-                            ..Default::default()
-                        }
-                    }));
-                }
-                let lights = start..mask_vertices.len() as u32;
-                let props_seen = push(&mut mask_vertices, &l.props_seen.vertices);
-                let standing = push(&mut mask_vertices, &l.standing.vertices);
-                Ranges {
-                    canvases,
-                    visible,
-                    lights,
-                    props_seen,
-                    standing,
-                }
-            })
-            .collect();
+            }
+            lp.lights = start..mask_vertices.len() as u32;
+            lp.props_seen = push(&mut mask_vertices, &l.props_seen.vertices);
+            lp.standing = push(&mut mask_vertices, &l.standing.vertices);
+        }
         let overlay = push(&mut canvas_vertices, &frame.overlay.vertices);
         let ui = push(&mut canvas_vertices, &frame.ui.vertices);
 
@@ -1376,7 +1366,7 @@ impl Renderer {
         let shows = |l: &LayerFrame, rect: Rect| {
             l.shaft
                 .as_ref()
-                .is_none_or(|shaft| !shaft.ranges(rect).is_empty())
+                .is_none_or(|shaft| shaft.ranges(rect).next().is_some())
         };
         let page_rect = |px: i32, py: i32| -> Rect {
             let at = [px as f32 * page_world, py as f32 * page_world];
@@ -1390,9 +1380,10 @@ impl Renderer {
         // first time below is missing until the next, but that's where it's
         // visible now, which shows whatever's been seen.
         let mut table = vec![0u32; TABLE_HEAD * MAX_VISIBLE];
-        for l in &layers {
+        for lp in &layers {
+            let l = lp.layer;
             let [xs, ys] = pages_over(frame.layer_view(l.index), frame.world, page_world);
-            let head = TABLE_HEAD * slot(l.index);
+            let head = TABLE_HEAD * lp.slot;
             let size = [xs.len() as u32, ys.len() as u32];
             let start = table.len() as u32;
             table[head..head + 5].copy_from_slice(&[
@@ -1414,52 +1405,44 @@ impl Renderer {
         // What's visible goes into the pages it covers, unless it's what
         // they were last drawn from. A page there's no room for now is
         // drawn next frame.
-        let draws: Vec<Vec<PageDraw>> = layers
-            .iter()
-            .zip(&ranges)
-            .map(|(l, r)| {
-                let of = |r: &Range<u32>| &mask_vertices[r.start as usize..r.end as usize];
-                let visible = of(&r.visible);
-                if !frame.remember || visible.is_empty() {
-                    return Vec::new();
-                }
-                let key = seen_key(&[visible, of(&r.lights)], l.shaft.as_deref(), page_px);
-                let layer = frame.base + l.index;
-                if seen.drawn.get(&layer) == Some(&key) {
-                    return Vec::new();
-                }
-                let fold = |f: fn(f32, f32) -> f32, start: f32| {
-                    [0, 1].map(|axis| visible.iter().map(|v| v.pos[axis]).fold(start, f))
-                };
-                let bounds = [
-                    fold(f32::min, f32::INFINITY),
-                    fold(f32::max, f32::NEG_INFINITY),
-                ];
-                let [xs, ys] = pages_over(bounds, frame.world, page_world);
-                let mut complete = true;
-                let mut draws = Vec::new();
-                for py in ys {
-                    for px in xs.clone() {
-                        let rect = page_rect(px, py);
-                        if !shows(l, rect) {
-                            continue;
-                        }
-                        match seen.pages.write(page(l.index, px, py)) {
-                            Some(slot) => draws.push(PageDraw { slot, rect }),
-                            None => complete = false,
-                        }
+        for lp in &mut layers {
+            let l = lp.layer;
+            let of = |r: &Range<u32>| &mask_vertices[r.start as usize..r.end as usize];
+            let visible = of(&lp.visible);
+            if !frame.remember || visible.is_empty() {
+                continue;
+            }
+            let key = seen_key(&[visible, of(&lp.lights)], l.shaft.as_deref(), page_px);
+            let layer = frame.base + l.index;
+            if seen.drawn.get(&layer) == Some(&key) {
+                continue;
+            }
+            let points: Vec<[f32; 2]> = visible.iter().map(|v| v.pos).collect();
+            let [xs, ys] = pages_over(bounds(&points), frame.world, page_world);
+            let mut complete = true;
+            for py in ys {
+                for px in xs.clone() {
+                    let rect = page_rect(px, py);
+                    if !shows(l, rect) {
+                        continue;
+                    }
+                    match seen.pages.write(page(l.index, px, py)) {
+                        Some(slot) => lp.pages.push(PageDraw { slot, rect }),
+                        None => complete = false,
                     }
                 }
-                if complete {
-                    seen.drawn.insert(layer, key);
-                } else {
-                    seen.drawn.remove(&layer);
-                }
-                draws
-            })
-            .collect();
-        seen.drawn
-            .retain(|layer, _| layers.iter().any(|l| frame.base + l.index == *layer));
+            }
+            if complete {
+                seen.drawn.insert(layer, key);
+            } else {
+                seen.drawn.remove(&layer);
+            }
+        }
+        seen.drawn.retain(|layer, _| {
+            layers
+                .iter()
+                .any(|lp| frame.base + lp.layer.index == *layer)
+        });
         if self
             .page_table
             .write(&self.device, &self.queue, bytemuck::cast_slice(&table))
@@ -1480,27 +1463,39 @@ impl Renderer {
         self.mask_scratch = mask_vertices;
         self.meshes
             .retain(|_, kept| std::mem::replace(&mut kept.used, false));
+        FramePlan {
+            layers,
+            overlay,
+            ui,
+        }
+    }
 
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.apply_page_ops(&mut encoder);
-        self.ensure_composite();
-
-        // Transforms: each slot onto the view, smaller the deeper it is;
-        // each page drawn onto its page; the interface as is.
+    /// The transforms (each slot onto the view, smaller the deeper it is;
+    /// each page drawn onto its page; the interface as is) and the
+    /// composite's parameters, for `frame` as `plan` draws it.
+    fn write_uniforms(&mut self, frame: &Frame, plan: &FramePlan) {
+        // The camera on a whole pixel, so the tile art stays crisp.
+        let zoom = frame.zoom;
+        let cell = frame.cell as f32;
+        let seen_zoom = cell / TILE;
+        let page_px = CHUNK as u32 * frame.cell;
+        let camera = frame.camera.map(|c| (c * zoom).round() / zoom);
+        // Patterns pinned to the world go by where it is in the whole level.
+        let offset = frame.offset.map(|t| t as f32 * TILE);
         let center = [frame.view[0] / 2.0, frame.view[1] / 2.0];
         let parallax = frame.parallax();
-        for l in &layers {
+        for lp in &plan.layers {
             let t = Transform {
                 screen: frame.view,
                 camera,
                 center,
-                scale: frame.scale(l.index),
+                scale: frame.scale(lp.layer.index),
                 zoom,
                 cell,
-                parallax: frame.parallax(),
+                parallax,
                 offset,
             };
-            let buffer = &self.layer_transforms[slot(l.index)].buffer;
+            let buffer = &self.layer_transforms[lp.slot].buffer;
             self.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&t));
         }
         let flat = |screen, camera, zoom| Transform {
@@ -1513,8 +1508,8 @@ impl Renderer {
             parallax: 1.0,
             offset,
         };
-        let pages_drawn = draws.iter().map(Vec::len).sum();
-        while self.page_transforms.len() < pages_drawn {
+        let pages = plan.layers.iter().flat_map(|lp| &lp.pages);
+        while self.page_transforms.len() < pages.clone().count() {
             let uniform = Uniform::new(
                 &self.device,
                 &self.transform_layout,
@@ -1523,7 +1518,7 @@ impl Renderer {
             );
             self.page_transforms.push(uniform);
         }
-        for (d, uniform) in draws.iter().flatten().zip(&self.page_transforms) {
+        for (d, uniform) in pages.zip(&self.page_transforms) {
             let t = flat([page_px as f32; 2], d.rect[0], seen_zoom);
             self.queue
                 .write_buffer(&uniform.buffer, 0, bytemuck::bytes_of(&t));
@@ -1534,9 +1529,10 @@ impl Renderer {
             bytemuck::bytes_of(&flat(frame.view, [0.0; 2], frame.ui_scale)),
         );
 
-        let present = layers
+        let present = plan
+            .layers
             .iter()
-            .fold(0u32, |bits, l| bits | 1 << slot(l.index));
+            .fold(0u32, |bits, lp| bits | 1 << lp.slot);
         let params = CompositeParams {
             origin: frame.origin,
             radius: if frame.radius.is_finite() {
@@ -1565,308 +1561,302 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.composite_params, 0, bytemuck::bytes_of(&params));
+    }
 
-        let screen = output.texture.create_view(&Default::default());
-        let seen = self.seen.as_ref().unwrap();
-        let screen_textures = self.screen.as_ref().unwrap();
-
-        // One pass with `pipeline` through `transform`, drawing each range
-        // of a vertex buffer in turn, moved by its shift.
-        let shift_buffer = &self.shifts.buffer;
-        let pass = |encoder: &mut wgpu::CommandEncoder,
-                    attachment: wgpu::RenderPassColorAttachment,
-                    pipeline: &wgpu::RenderPipeline,
-                    transform: &wgpu::BindGroup,
-                    extra: Option<&wgpu::BindGroup>,
-                    draws: &[Draw]| {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("pass"),
-                color_attachments: &[Some(attachment)],
-                ..Default::default()
-            });
-            let mut ready = false;
-            for (buffer, range, shift) in draws.iter().filter(|(_, r, _)| !r.is_empty()) {
-                if !ready {
-                    pass.set_pipeline(pipeline);
-                    pass.set_bind_group(0, transform, &[]);
-                    if let Some(group) = extra {
-                        pass.set_bind_group(1, group, &[]);
-                    }
-                    pass.set_vertex_buffer(1, shift_buffer.slice(..));
-                    ready = true;
-                }
-                pass.set_vertex_buffer(0, buffer.slice(..));
-                pass.draw(range.clone(), *shift..*shift + 1);
-            }
-        };
-        let keep = |view| wgpu::RenderPassColorAttachment {
-            view,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Load,
-                store: wgpu::StoreOp::Store,
-            },
-        };
-        // Mesh `m`'s chunks that reach into `view`, moved by shift
-        // `shift` (`view` is where they are before that): as few draws as
-        // there are runs of them side by side in its buffer.
-        let mesh = |m: &Mesh, view: Rect, shift: u32| -> Vec<Draw> {
-            let Some(Kept {
-                buffer: Some(buffer),
-                ..
-            }) = self.meshes.get(&m.id())
-            else {
-                return Vec::new();
-            };
-            let mut ranges: Vec<Range<u32>> = Vec::new();
-            for r in m.ranges(view) {
-                match ranges.last_mut() {
-                    Some(last) if last.end == r.start => last.end = r.end,
-                    _ => ranges.push(r),
-                }
-            }
-            ranges.into_iter().map(|r| (buffer, r, shift)).collect()
-        };
-        // Of each piece of layer `l` (its first shift `first`), mesh `of`,
-        // where it reaches into `view`.
-        let pieces = |l: &LayerFrame, first: u32, of: fn(&MeshPiece) -> &Mesh, view: Rect| {
-            let mut draws = Vec::new();
-            for (i, piece) in l.meshes.pieces.iter().enumerate() {
-                let c = l.meshes.corner(i);
-                let local = view.map(|p| [p[0] - c[0], p[1] - c[1]]);
-                draws.extend(mesh(of(piece), local, first + i as u32));
-            }
-            draws
-        };
-
-        let mut page_transforms = self.page_transforms.iter();
-        for (((l, r), page_draws), &first) in layers.iter().zip(&ranges).zip(&draws).zip(&firsts) {
-            let (a, s) = (l.index, slot(l.index));
-            let view = frame.layer_view(a);
-            let transform = &self.layer_transforms[s].bind_group;
-            let (canvas, masks) = (&self.canvas_vertices.buffer, &self.mask_vertices.buffer);
-            // The tiles, then fringes and trims over them: the pieces', then
-            // those along their edges.
-            let m = &l.meshes;
-            let mut tiles = pieces(l, first, |p| &p.tiles, view);
-            let edging = [
-                pieces(l, first, |p| &p.fringes, view),
-                mesh(&m.fringes, view, 0),
-                pieces(l, first, |p| &p.trims, view),
-                mesh(&m.trims, view, 0),
-            ]
-            .concat();
-            tiles.extend(edging.iter().cloned());
-            // Props over all of it, and whoever's about too.
-            let props = pieces(l, first, |p| &p.props, view);
-            for (i, range) in r.canvases.iter().enumerate() {
-                let attachment = wgpu::RenderPassColorAttachment {
-                    view: &screen_textures.canvases.layers[3 * s + i],
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                };
-                // The tiles under the visible and remembered canvases, and
-                // the props over them.
-                let (under, over) = if i < 2 {
-                    (tiles.as_slice(), props.as_slice())
-                } else {
-                    (&[][..], &[][..])
-                };
-                let mut draws = under.to_vec();
-                draws.push((canvas, range.clone(), 0));
-                draws.extend(over.iter().cloned());
-                pass(
-                    &mut encoder,
-                    attachment,
-                    &self.shape_pipeline,
-                    transform,
-                    None,
-                    &draws,
-                );
-            }
-            let voids = &screen_textures.voids.layers[s];
-            pass(
-                &mut encoder,
-                cleared(voids),
-                &self.fill_pipeline,
-                transform,
-                None,
-                &pieces(l, first, |p| &p.voids, view),
-            );
-            // Liquid is void that tints what shows through: mark it half.
-            pass(
-                &mut encoder,
-                keep(voids),
-                &self.water_pipeline,
-                transform,
-                None,
-                &pieces(l, first, |p| &p.liquid, view),
-            );
-            // Fringes, trims and props cover the void and water they reach
-            // over.
-            pass(
-                &mut encoder,
-                keep(voids),
-                &self.unmask_pipeline,
-                transform,
-                None,
-                &[edging, props].concat(),
-            );
-            // Then clear it again under whatever stands on the layer.
-            pass(
-                &mut encoder,
-                keep(voids),
-                &self.unmask_pipeline,
-                transform,
-                None,
-                &[(masks, r.standing.clone(), 0)],
-            );
-            // What's visible now: the polygon (and lit solid), and the props
-            // seen where their art is opaque.
-            let now = screen_textures.now_msaa[s].attachment(&screen_textures.now.layers[s], true);
-            {
-                let mut now = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("now"),
-                    color_attachments: &[Some(now)],
-                    ..Default::default()
-                });
-                now.set_bind_group(0, transform, &[]);
-                now.set_vertex_buffer(0, masks.slice(..));
-                now.set_vertex_buffer(1, shift_buffer.slice(..));
-                let draws = [
-                    (&self.mask_pipeline, r.visible.clone()),
-                    (&self.mask_cutout_pipeline, r.props_seen.clone()),
-                ];
-                for (pipeline, range) in draws.into_iter().filter(|(_, r)| !r.is_empty()) {
-                    now.set_pipeline(pipeline);
-                    now.draw(range, 0..1);
-                }
-            }
-            // On the viewer's layer, what lights cast.
-            if s == 0 {
-                let light = screen_textures
-                    .light_msaa
-                    .attachment(&screen_textures.light, true);
-                pass(
-                    &mut encoder,
-                    light,
-                    &self.light_pipeline,
-                    transform,
-                    None,
-                    &[(masks, r.lights.clone(), 0)],
-                );
-            }
-            // What's visible, into each page of `seen` it covers.
-            for d in page_draws {
-                let onto = &page_transforms.next().unwrap().bind_group;
-                let page = keep(&seen.atlas.layers[d.slot as usize]);
-                let visible = [(masks, r.visible.clone(), 0)];
-                match &l.shaft {
-                    // Below the viewer: remembered as seen only where it
-                    // shows through.
-                    Some(shaft) => {
-                        pass(
-                            &mut encoder,
-                            cleared(&seen.shaft),
-                            &self.fill_pipeline,
-                            onto,
-                            None,
-                            &mesh(shaft, d.rect, 0),
-                        );
-                        let group = Some(&seen.shaft_bind_group);
-                        let pipeline = &self.seen_shaft_pipeline;
-                        pass(&mut encoder, page, pipeline, onto, group, &visible);
-                    }
-                    // The viewer's layer: what's in sight within the radius,
-                    // and what lights show wherever it's in sight.
-                    None => {
-                        pass(
-                            &mut encoder,
-                            page,
-                            &self.seen_near_pipeline,
-                            onto,
-                            None,
-                            &visible,
-                        );
-                        if !r.lights.is_empty() {
-                            pass(
-                                &mut encoder,
-                                cleared(&seen.shaft),
-                                &self.fill_pipeline,
-                                onto,
-                                None,
-                                &visible,
-                            );
-                            pass(
-                                &mut encoder,
-                                keep(&seen.atlas.layers[d.slot as usize]),
-                                &self.seen_shaft_pipeline,
-                                onto,
-                                Some(&seen.shaft_bind_group),
-                                &[(masks, r.lights.clone(), 0)],
-                            );
-                        }
-                        if !r.props_seen.is_empty() {
-                            pass(
-                                &mut encoder,
-                                keep(&seen.atlas.layers[d.slot as usize]),
-                                &self.seen_cutout_pipeline,
-                                onto,
-                                None,
-                                &[(masks, r.props_seen.clone(), 0)],
-                            );
-                        }
-                    }
-                }
-            }
+    /// Every pass of `frame` as `plan` has it, onto `screen`: each layer's,
+    /// then the composite, then the overlay and the interface over it.
+    fn encode(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &Frame,
+        plan: &FramePlan,
+        screen: &wgpu::TextureView,
+    ) {
+        let mut onto = self.page_transforms.iter();
+        let mut draws = Vec::new();
+        for lp in &plan.layers {
+            self.encode_layer(encoder, frame, lp, &mut onto, &mut draws);
         }
-
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &screen,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                color_attachments: &[Some(target(
+                    screen,
+                    wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                ))],
                 ..Default::default()
             });
             pass.set_pipeline(&self.composite_pipeline);
             pass.set_bind_group(0, self.composite_bind_group.as_ref().unwrap(), &[]);
             pass.draw(0..3, 0..1);
         }
-
         // Overlay on the viewer's layer, then the interface, over it all.
         let canvas = &self.canvas_vertices.buffer;
+        let shapes = &self.shape_pipeline;
         let top = &self.layer_transforms[0].bind_group;
-        pass(
-            &mut encoder,
-            keep(&screen),
-            &self.shape_pipeline,
-            top,
+        let overlay = [(canvas, plan.overlay.clone(), 0)];
+        self.pass(encoder, kept(screen), top, None, &[(shapes, &overlay)]);
+        let ui = [(canvas, plan.ui.clone(), 0)];
+        self.pass(
+            encoder,
+            kept(screen),
+            &self.ui_transform.bind_group,
             None,
-            &[(canvas, overlay, 0)],
+            &[(shapes, &ui)],
         );
-        let ui_group = &self.ui_transform.bind_group;
-        pass(
-            &mut encoder,
-            keep(&screen),
-            &self.shape_pipeline,
-            ui_group,
-            None,
-            &[(canvas, ui, 0)],
-        );
+    }
 
-        self.queue.submit([encoder.finish()]);
-        self.queue.present(output);
+    /// The passes of one layer: its canvases with the tiles under them and
+    /// the props over them; where it's void; what's visible now, and what
+    /// lights cast; and what's visible into each page of `seen` it covers
+    /// (through the next of `onto`). `draws` is scratch space.
+    fn encode_layer<'a>(
+        &'a self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &Frame,
+        lp: &LayerPlan,
+        onto: &mut std::slice::Iter<'a, Uniform>,
+        draws: &mut Vec<Draw<'a>>,
+    ) {
+        let (l, s) = (lp.layer, lp.slot);
+        let view = frame.layer_view(l.index);
+        let transform = &self.layer_transforms[s].bind_group;
+        let (canvas, masks) = (&self.canvas_vertices.buffer, &self.mask_vertices.buffer);
+        let screen = self.screen.as_ref().unwrap();
+        let seen = self.seen.as_ref().unwrap();
+        let first = lp.first;
+        // The draws of the layer's meshes, side by side in `draws`: the
+        // tiles, then fringes and trims over them (the pieces', then those
+        // along their edges), then the props over everything, then where
+        // it's void and liquid.
+        draws.clear();
+        self.piece_draws(l, first, |p| &p.tiles, view, draws);
+        let edging = draws.len();
+        self.piece_draws(l, first, |p| &p.fringes, view, draws);
+        self.mesh_draws(&l.meshes.fringes, view, 0, draws);
+        self.piece_draws(l, first, |p| &p.trims, view, draws);
+        self.mesh_draws(&l.meshes.trims, view, 0, draws);
+        let props = draws.len();
+        self.piece_draws(l, first, |p| &p.props, view, draws);
+        let voids = draws.len();
+        self.piece_draws(l, first, |p| &p.voids, view, draws);
+        let liquid = draws.len();
+        self.piece_draws(l, first, |p| &p.liquid, view, draws);
+        let draws = &draws[..];
+        let (under, over) = (&draws[..props], &draws[props..voids]);
+
+        let shapes = &self.shape_pipeline;
+        for (i, range) in lp.canvases.iter().enumerate() {
+            let attachment = cleared(&screen.canvases.layers[2 * s + i]);
+            let own = [(canvas, range.clone(), 0)];
+            self.pass(
+                encoder,
+                attachment,
+                transform,
+                None,
+                &[(shapes, under), (shapes, &own), (shapes, over)],
+            );
+        }
+        let void = &screen.voids.layers[s];
+        self.pass(
+            encoder,
+            cleared(void),
+            transform,
+            None,
+            &[(&self.fill_pipeline, &draws[voids..liquid])],
+        );
+        // Liquid is void that tints what shows through: mark it half.
+        // Fringes, trims and props cover the void and water they reach over;
+        // and it's cleared again under whatever stands on the layer.
+        let standing = [(masks, lp.standing.clone(), 0)];
+        self.pass(
+            encoder,
+            kept(void),
+            transform,
+            None,
+            &[
+                (&self.water_pipeline, &draws[liquid..]),
+                (&self.unmask_pipeline, &draws[edging..voids]),
+                (&self.unmask_pipeline, &standing),
+            ],
+        );
+        // What's visible now: the polygon (and lit solid), and the props
+        // seen where their art is opaque.
+        let visible = [(masks, lp.visible.clone(), 0)];
+        let props_seen = [(masks, lp.props_seen.clone(), 0)];
+        let now = screen.now_msaa[s].attachment(&screen.now.layers[s]);
+        self.pass(
+            encoder,
+            now,
+            transform,
+            None,
+            &[
+                (&self.mask_pipeline, &visible),
+                (&self.mask_cutout_pipeline, &props_seen),
+            ],
+        );
+        // On the viewer's layer, what lights cast.
+        let lights = [(masks, lp.lights.clone(), 0)];
+        if s == 0 {
+            let light = screen.light_msaa.attachment(&screen.light);
+            self.pass(
+                encoder,
+                light,
+                transform,
+                None,
+                &[(&self.light_pipeline, &lights)],
+            );
+        }
+        // What's visible, into each page of `seen` it covers.
+        for d in &lp.pages {
+            let onto = &onto.next().unwrap().bind_group;
+            let page = &seen.atlas.layers[d.slot as usize];
+            match &l.shaft {
+                // Below the viewer: remembered as seen only where it shows
+                // through.
+                Some(shaft) => {
+                    let mut stencil = Vec::new();
+                    self.mesh_draws(shaft, d.rect, 0, &mut stencil);
+                    self.through(encoder, page, onto, &stencil, &visible);
+                }
+                // The viewer's layer: what's in sight within the radius, what
+                // lights show wherever it's in sight, and the props seen.
+                None => {
+                    self.pass(
+                        encoder,
+                        kept(page),
+                        onto,
+                        None,
+                        &[(&self.seen_near_pipeline, &visible)],
+                    );
+                    if !lp.lights.is_empty() {
+                        self.through(encoder, page, onto, &visible, &lights);
+                    }
+                    self.pass(
+                        encoder,
+                        kept(page),
+                        onto,
+                        None,
+                        &[(&self.seen_cutout_pipeline, &props_seen)],
+                    );
+                }
+            }
+        }
+    }
+
+    /// Draw `draws` into page `page` of `seen` (through `onto`) only where
+    /// `stencil` covers it, drawn first into the page-sized scratch texture.
+    fn through(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        page: &wgpu::TextureView,
+        onto: &wgpu::BindGroup,
+        stencil: &[Draw],
+        draws: &[Draw],
+    ) {
+        let seen = self.seen.as_ref().unwrap();
+        self.pass(
+            encoder,
+            cleared(&seen.shaft),
+            onto,
+            None,
+            &[(&self.fill_pipeline, stencil)],
+        );
+        let group = Some(&seen.shaft_bind_group);
+        self.pass(
+            encoder,
+            kept(page),
+            onto,
+            group,
+            &[(&self.seen_shaft_pipeline, draws)],
+        );
+    }
+
+    /// One pass into `attachment` through `transform` (and `extra`, as bind
+    /// group 1), drawing each group of draws with its pipeline: each range
+    /// of a vertex buffer moved by its shift. A pass that would only keep
+    /// what's there is left out.
+    fn pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        attachment: wgpu::RenderPassColorAttachment,
+        transform: &wgpu::BindGroup,
+        extra: Option<&wgpu::BindGroup>,
+        groups: &[(&wgpu::RenderPipeline, &[Draw])],
+    ) {
+        let drawn = |d: &&Draw| !d.1.is_empty();
+        let keeps = matches!(attachment.ops.load, wgpu::LoadOp::Load);
+        if keeps
+            && !groups
+                .iter()
+                .any(|(_, draws)| draws.iter().any(|d| drawn(&d)))
+        {
+            return;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("pass"),
+            color_attachments: &[Some(attachment)],
+            ..Default::default()
+        });
+        pass.set_bind_group(0, transform, &[]);
+        if let Some(group) = extra {
+            pass.set_bind_group(1, group, &[]);
+        }
+        pass.set_vertex_buffer(1, self.shifts.buffer.slice(..));
+        for (pipeline, draws) in groups {
+            let mut ready = false;
+            for (buffer, range, shift) in draws.iter().filter(drawn) {
+                if !ready {
+                    pass.set_pipeline(pipeline);
+                    ready = true;
+                }
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(range.clone(), *shift..*shift + 1);
+            }
+        }
+    }
+
+    /// Onto `out`, mesh `m`'s chunks that reach into `view`, moved by shift
+    /// `shift` (`view` is where they are before that): as few draws as there
+    /// are runs of them side by side in its buffer.
+    fn mesh_draws<'a>(&'a self, m: &Mesh, view: Rect, shift: u32, out: &mut Vec<Draw<'a>>) {
+        let Some(Kept {
+            buffer: Some(buffer),
+            ..
+        }) = self.meshes.get(&m.id())
+        else {
+            return;
+        };
+        let mut run: Option<Range<u32>> = None;
+        for r in m.ranges(view) {
+            match &mut run {
+                Some(last) if last.end == r.start => last.end = r.end,
+                _ => {
+                    if let Some(done) = run.replace(r) {
+                        out.push((buffer, done, shift));
+                    }
+                }
+            }
+        }
+        if let Some(done) = run {
+            out.push((buffer, done, shift));
+        }
+    }
+
+    /// Onto `out`, of each piece of layer `l` (its first shift `first`),
+    /// mesh `of`, where it reaches into `view`.
+    fn piece_draws<'a>(
+        &'a self,
+        l: &LayerFrame,
+        first: u32,
+        of: fn(&MeshPiece) -> &Mesh,
+        view: Rect,
+        out: &mut Vec<Draw<'a>>,
+    ) {
+        for (i, piece) in l.meshes.pieces.iter().enumerate() {
+            let c = l.meshes.corner(i);
+            let local = view.map(|p| [p[0] - c[0], p[1] - c[1]]);
+            self.mesh_draws(of(piece), local, first + i as u32, out);
+        }
     }
 }

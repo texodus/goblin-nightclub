@@ -128,9 +128,9 @@ impl Canvas {
         }
     }
 
-    /// Sheet cell `cell` as a tile-sized square (see
-    /// [`Tileset::sprite_size`]) centered on `center`, snapped to whole
-    /// sheet pixels so it lines up with the tiles' pixels.
+    /// Sheet cell `cell` as a tile-sized square centered on `center`,
+    /// snapped to whole sheet pixels so it lines up with the tiles'
+    /// pixels.
     pub fn sprite(&mut self, center: [f32; 2], cell: Cell, color: Color) {
         self.sprite_from([0.0; 2], center, cell, color);
     }
@@ -185,6 +185,7 @@ impl Canvas {
         }
         self.poly(points, fill);
 
+        use crate::geom::{inset_corner, inward_normal};
         let normal = |i: usize| inward_normal(points[i], points[(i + 1) % n]);
         let inset: Vec<[f32; 2]> = (0..n)
             .map(|i| inset_corner(points[i], normal((i + n - 1) % n), normal(i), 1.0))
@@ -197,26 +198,6 @@ impl Canvas {
     }
 }
 
-/// Unit normal of `a`-`b` pointing to its right, which is the inside of an
-/// outline running clockwise on screen (y down).
-pub fn inward_normal(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
-    let e = [b[0] - a[0], b[1] - a[1]];
-    let len = crate::length(e);
-    [-e[1] / len, e[0] / len]
-}
-
-/// Corner `p` of an outline moved `width` inward, between edges with
-/// inward normals `before` and `after`, along the bisector, so strips that
-/// wide along the two edges meet exactly (at concave and sharp corners
-/// too).
-pub fn inset_corner(p: [f32; 2], before: [f32; 2], after: [f32; 2], width: f32) -> [f32; 2] {
-    let k = width / (1.0 + before[0] * after[0] + before[1] * after[1]);
-    [
-        p[0] + (before[0] + after[0]) * k,
-        p[1] + (before[1] + after[1]) * k,
-    ]
-}
-
 /// Whether a face with inward normal `n` faces up or left (and so is lit):
 /// its outward normal, `-n`, points that way. Faces exactly up-right or
 /// down-left count as lit if they face up.
@@ -226,121 +207,5 @@ pub fn faces_light(n: [f32; 2]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const RED: Color = [1.0, 0.0, 0.0, 1.0];
-    const GREEN: Color = [0.0, 1.0, 0.0, 1.0];
-    const BLUE: Color = [0.0, 0.0, 1.0, 1.0];
-
-    const ZOOM: f32 = 1.6;
-    const CELL: u32 = 16;
-
-    fn canvas() -> Canvas {
-        Canvas::new(&crate::tileset::testing::tileset())
-    }
-
-    /// Color of the last triangle covering `p`, like the GPU would draw it.
-    fn color_at(layer: &Canvas, p: [f32; 2]) -> Option<Color> {
-        layer.vertices.chunks(3).rev().find_map(|t| {
-            let cross = |a: [f32; 2], b: [f32; 2]| {
-                (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
-            };
-            let s = [
-                cross(t[0].pos, t[1].pos),
-                cross(t[1].pos, t[2].pos),
-                cross(t[2].pos, t[0].pos),
-            ];
-            let inside = s.iter().all(|v| *v >= 0.0) || s.iter().all(|v| *v <= 0.0);
-            inside.then_some(t[0].color)
-        })
-    }
-
-    #[test]
-    fn bevels_light_top_left_and_shade_bottom_right() {
-        let mut layer = canvas();
-        // A 10x10 square with its bottom-right corner cut at 45 degrees.
-        let shape = [
-            [0.0, 0.0],
-            [10.0, 0.0],
-            [10.0, 5.0],
-            [5.0, 10.0],
-            [0.0, 10.0],
-        ];
-        layer.beveled(&shape, RED, GREEN, BLUE);
-        assert_eq!(color_at(&layer, [5.0, 0.5]), Some(GREEN), "top");
-        assert_eq!(color_at(&layer, [0.5, 5.0]), Some(GREEN), "left");
-        assert_eq!(color_at(&layer, [9.5, 2.0]), Some(BLUE), "right");
-        assert_eq!(color_at(&layer, [2.0, 9.5]), Some(BLUE), "bottom");
-        assert_eq!(
-            color_at(&layer, [7.3, 7.3]),
-            Some(BLUE),
-            "diagonal facing down-right"
-        );
-        assert_eq!(color_at(&layer, [5.0, 5.0]), Some(RED), "fill");
-        assert_eq!(color_at(&layer, [9.0, 9.0]), None, "cut off");
-    }
-
-    #[test]
-    fn sprites_center_on_whole_pixels_and_show_their_cell() {
-        let mut canvas = canvas();
-        canvas.sprite([20.0, 30.0], [1, 3], RED);
-        let size = [TILE, TILE];
-        let xs: Vec<f32> = canvas.vertices.iter().map(|v| v.pos[0]).collect();
-        let ys: Vec<f32> = canvas.vertices.iter().map(|v| v.pos[1]).collect();
-        let (x0, x1) = (
-            xs.iter().copied().fold(f32::MAX, f32::min),
-            xs.iter().copied().fold(f32::MIN, f32::max),
-        );
-        let (y0, y1) = (
-            ys.iter().copied().fold(f32::MAX, f32::min),
-            ys.iter().copied().fold(f32::MIN, f32::max),
-        );
-        assert!((x1 - x0 - size[0]).abs() < 1e-4 && (y1 - y0 - size[1]).abs() < 1e-4);
-        assert!(
-            ((x0 + x1) / 2.0 - 20.0).abs() <= 0.5 / ZOOM,
-            "centered, to a pixel"
-        );
-        assert!(((y0 + y1) / 2.0 - 30.0).abs() <= 0.5 / ZOOM);
-        for v in [x0, y0] {
-            assert!(
-                ((v * ZOOM) - (v * ZOOM).round()).abs() < 1e-3,
-                "{v} on a pixel"
-            );
-        }
-        // The square spans exactly the cell in the sheet.
-        for v in &canvas.vertices {
-            let [u, w] = v.uv;
-            let c = CELL as f32;
-            assert!(
-                (c..=2.0 * c).contains(&u) && (3.0 * c..=4.0 * c).contains(&w),
-                "{u} {w}"
-            );
-            assert_eq!(v.color, RED);
-        }
-        // Plain shapes show the white cell.
-        let mut plain = Canvas::new(&crate::tileset::testing::tileset());
-        plain.rect([0.0, 0.0], [5.0, 5.0], RED);
-        assert!(
-            plain
-                .vertices
-                .iter()
-                .all(|v| v.uv[0] < CELL as f32 && v.uv[1] < CELL as f32)
-        );
-    }
-
-    #[test]
-    fn bevel_strip_is_one_pixel_wide_on_diagonals() {
-        let mut layer = canvas();
-        // A "/" face facing up-left: lit.
-        let shape = [[10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
-        layer.beveled(&shape, RED, GREEN, BLUE);
-        let r = std::f32::consts::FRAC_1_SQRT_2;
-        // Along the face's inward normal from its midpoint (5,5).
-        assert_eq!(
-            color_at(&layer, [5.0 + 0.9 * r, 5.0 + 0.9 * r]),
-            Some(GREEN)
-        );
-        assert_eq!(color_at(&layer, [5.0 + 1.1 * r, 5.0 + 1.1 * r]), Some(RED));
-    }
-}
+#[path = "tests/draw_tests.rs"]
+mod tests;

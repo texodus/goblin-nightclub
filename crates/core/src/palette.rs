@@ -1,8 +1,5 @@
 //! The 16-color EGA palette as linear-ish RGBA floats (sRGB values / 255).
 
-// Not every color is in use at any given time.
-#![allow(dead_code)]
-
 pub type Color = [f32; 4];
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
@@ -29,15 +26,18 @@ pub const WHITE: Color = rgb(0xFF, 0xFF, 0xFF);
 /// Not one of the sixteen: nothing, blended over anything, changes it.
 pub const TRANSPARENT: Color = [0.0; 4];
 
+/// A channel, 0 to 1, as a byte.
+fn byte(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 /// `c` as `#rrggbb` (its alpha dropped), as tile sheets name colors.
 pub fn hex(c: Color) -> String {
-    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02x}{:02x}{:02x}", byte(c[0]), byte(c[1]), byte(c[2]))
 }
 
 /// `#rrggbbaa`, or `#rrggbb` when opaque.
 pub fn hex_alpha(c: Color) -> String {
-    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     if byte(c[3]) == 255 {
         hex(c)
     } else {
@@ -67,22 +67,3 @@ pub fn parse_hex(s: &str) -> Option<Color> {
     c[3] = a as f32 / 255.0;
     Some(c)
 }
-
-pub const ALL: [Color; 16] = [
-    BLACK,
-    BLUE,
-    GREEN,
-    CYAN,
-    RED,
-    MAGENTA,
-    BROWN,
-    LIGHT_GRAY,
-    DARK_GRAY,
-    LIGHT_BLUE,
-    LIGHT_GREEN,
-    LIGHT_CYAN,
-    LIGHT_RED,
-    LIGHT_MAGENTA,
-    YELLOW,
-    WHITE,
-];

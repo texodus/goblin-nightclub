@@ -2,6 +2,7 @@
 
 use std::f32::consts::TAU;
 
+use crate::geom::distance;
 use crate::layer::{Layer, TILE};
 use crate::rng::Rng;
 
@@ -90,9 +91,7 @@ impl Entity {
             ];
             let npc = Self::npc(first_id + out.len() as EntityId, pos);
             let c = npc.center();
-            if !level.collides(pos, NPC_SIZE)
-                && crate::length([c[0] - avoid[0], c[1] - avoid[1]]) >= min_dist
-            {
+            if !level.collides(pos, NPC_SIZE) && distance(avoid, c) >= min_dist {
                 out.push(npc);
             }
         }
@@ -115,7 +114,7 @@ impl Entity {
             self.heading[1] * NPC_SPEED * dt,
         ];
         let next = level.move_box(self.pos, self.size, delta);
-        let moved = crate::length([next[0] - self.pos[0], next[1] - self.pos[1]]);
+        let moved = distance(self.pos, next);
         if moved < 0.5 * NPC_SPEED * dt {
             self.turn(rng);
         }
@@ -142,30 +141,4 @@ pub fn sample_points(pos: [f32; 2], size: [f32; 2]) -> [[f32; 2]; 5] {
         [x0, y1],
         [x1, y1],
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn npcs_spawn_clear_and_never_enter_walls() {
-        for seed in 0..20 {
-            let spawn = [165.0, 105.0];
-            let level = Layer::soup(seed, 32, 20);
-            let mut rng = Rng::new(seed ^ 0x9E37_79B9);
-            let mut npcs = Entity::spawn_npcs(&level, &mut rng, 4, 0, spawn, 40.0);
-            assert_eq!(npcs.len(), 4);
-            for npc in &npcs {
-                let c = npc.center();
-                assert!((c[0] - spawn[0]).hypot(c[1] - spawn[1]) >= 40.0);
-            }
-            for _ in 0..2000 {
-                for npc in &mut npcs {
-                    npc.wander(&level, &mut rng, 1.0 / 60.0);
-                    assert!(!level.collides(npc.pos, npc.size), "seed {seed}");
-                }
-            }
-        }
-    }
 }

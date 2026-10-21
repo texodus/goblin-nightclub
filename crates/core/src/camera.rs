@@ -1,28 +1,31 @@
 //! The view onto a level: where it is, how big, and how far zoomed in.
 //! Shared by the game and the editor.
 
+use crate::geom::Rect;
 use crate::input::Input;
 use crate::layer::TILE;
 
 /// Each wheel notch zooms by this factor.
 pub const ZOOM_STEP: f32 = 1.01;
-/// The most zoomed in, relative to the default. Zooming out stops where a
-/// pixel of the art is a pixel of the screen.
+/// The most zoomed in, relative to the default.
 pub const ZOOM_MAX: f32 = 3.0;
+/// The most zoomed out: where a pixel of the screen spans this many pixels
+/// of the art, at any size of view.
+pub const ZOOM_OUT: f32 = 16.0;
 
 /// Panning speed, in screen pixels a second.
 pub const PAN_SPEED: f32 = 600.0;
 
 /// Scale of each layer relative to the one above it, at the default
 /// zoom. See [`parallax`] for other zooms.
-pub const PARALLAX: f32 = 0.925;
+const PARALLAX: f32 = 0.925;
 
 /// How much the parallax is normalized against zooming out, 0 to 1. At 1
 /// its strength shrinks in step with the zoom, so a layer's shift at the
 /// edge of the view stays what it is at the default zoom. At 0 the
 /// strength is [`PARALLAX`] at every zoom, so the shift at the edge grows
 /// as the view widens. Zooming in never changes it.
-pub const PARALLAX_NORMALIZATION: f32 = 1.0;
+const PARALLAX_NORMALIZATION: f32 = 1.0;
 
 /// The scale of each layer relative to the one above it at `zoom` screen
 /// pixels a world unit, where `default_zoom` is the zoom the art is drawn
@@ -33,12 +36,6 @@ pub fn parallax(zoom: f32, default_zoom: f32) -> f32 {
     let strength = 1.0 - PARALLAX_NORMALIZATION.clamp(0.0, 1.0) * (1.0 - normalized);
     1.0 - (1.0 - PARALLAX) * strength
 }
-
-/// An axis-aligned rectangle in world units: top-left, bottom-right.
-pub type Rect = [[f32; 2]; 2];
-
-/// A rectangle covering any level.
-pub const EVERYWHERE: Rect = [[f32::NEG_INFINITY; 2], [f32::INFINITY; 2]];
 
 /// The part of a layer in a view `view` screen pixels in size, its
 /// top-left at world point `camera`, at `zoom` screen pixels a world unit,
@@ -101,8 +98,8 @@ impl Camera {
     /// world point under `p` (view pixels) where it is.
     pub fn zoom_by(&mut self, steps: i32, p: [f32; 2]) {
         let anchor = self.to_world(p);
-        let min = 1.0 / (self.ui_scale() * 16.0);
-        self.zoom_factor = (self.zoom_factor * ZOOM_STEP.powi(steps)).clamp(min, ZOOM_MAX);
+        self.zoom_factor =
+            (self.zoom_factor * ZOOM_STEP.powi(steps)).clamp(self.least_zoom(), ZOOM_MAX);
         let zoom = self.zoom();
         self.pos = [anchor[0] - p[0] / zoom, anchor[1] - p[1] / zoom];
     }
@@ -112,8 +109,13 @@ impl Camera {
     pub fn resize(&mut self, view: [f32; 2]) {
         let center = self.to_world([self.view[0] / 2.0, self.view[1] / 2.0]);
         self.view = view;
-        self.zoom_factor = self.zoom_factor.clamp(1.0 / self.ui_scale(), ZOOM_MAX);
+        self.zoom_factor = self.zoom_factor.clamp(self.least_zoom(), ZOOM_MAX);
         self.center_on(center);
+    }
+
+    /// The least `zoom_factor`: see [`ZOOM_OUT`].
+    fn least_zoom(&self) -> f32 {
+        1.0 / (self.ui_scale() * ZOOM_OUT)
     }
 
     /// The world point at view pixel `p`.

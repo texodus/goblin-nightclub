@@ -1,0 +1,23 @@
+use super::*;
+
+fn level(layers: &[&[&str]]) -> Level {
+    Level::new(
+        layers.iter().map(|rows| Layer::from_ascii(rows)).collect(),
+        crate::tileset::testing::tileset(),
+    )
+}
+
+#[test]
+fn only_views_near_the_viewer_are_kept() {
+    let l = level(&[&["."], &["~"], &["~"], &["~"], &["~"]]);
+    let near = l.view(4, 0);
+    assert!(Arc::ptr_eq(&near, &l.view(4, 0)), "kept");
+    l.view(3, 0);
+    assert!(
+        Arc::ptr_eq(&near, &l.view(4, 0)),
+        "one layer away: still kept"
+    );
+    l.view(1, 0);
+    assert!(!Arc::ptr_eq(&near, &l.view(4, 0)), "made again");
+    assert!(l.views.lock().unwrap().keys().all(|&(top, _)| top >= 3));
+}

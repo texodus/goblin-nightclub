@@ -14,7 +14,8 @@
 use goblin_nightclub_core::layer::{Part, Tile};
 use goblin_nightclub_core::prop::{Prop, PropId};
 
-use super::{CAVE_FLOOR, PLAINS, SPAWN_CLEARANCE, fbm, lattice, tileset};
+use super::{CAVE_FLOOR, PLAINS, SPAWN_CLEARANCE, tileset};
+use crate::noise::{fbm, lattice};
 
 /// Trees on at most this share of the plains' grass, where groves are
 /// thickest.
