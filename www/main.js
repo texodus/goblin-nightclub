@@ -1,3 +1,20 @@
+//                                    ▗◡≝▔▔` ▔≝=◺▂             ∕        ▐▋  ▝▉
+//                                  ╣▒◿▒≘≉◬_    _▒▆▒▀         ◞         ▐▋  ▐▌
+//                                  ╔`     ▝◺◿▒▟▘╔╹ ▚◛                  ▐▌  ▐▏
+//       G O B L I N               ▕▎_"▃▅≣P ▐▓▛▗▉▂_▂__◚◛_         __▂▂▂▂▟▙◓▀▀▀▀≝
+//        N I G H T C L U B         ║`║║_▂▐╝ ▟◙██▛╬▔`_▂◙▒▖       ▕∏▃▃▃▃▂▐▌║▂▂▂▔▔
+//                                  ▙⋡▜╥∺╝ ▗▟███▛Ƒ  ▐▛▔▔▜█▌      ▐╣ ▝▜███▋ ∭▔▔▔▔
+//                                   ▁⋡▚▃▄▀▉Ƣ█▀▉╺▗▐∏▊   ╠█▎      ▐╣   ▁∭█▉ ▊ ∭▐█
+//                          ▁▃◛◭◒≠◚▔▔╸ ╔▒∏▕▓▌ ▟▎ ▐▒██▖    ▜▎     ╠▎≕∏__  ◙∏▍ ╣█▌
+//                     _◿▎`▂_ ▟▒║╣▂▂▂▂▞╜▔▜ ╬◙▏∏▎ ▐███◘⊠◚"` ▜     ╣ ▂▅▅▅_ ▐█▎▕▒█Ǩ
+//              _▂_ _▂▂▒∭▒▒◛≝▔           ▕▶╣◚▔▔▔╠∏∏║▌ ┉━━≝▒▃▘   ▕▌▟█████▙ ∭ ▐▐▌▓
+//    ▁▁▁▁_╓◛▋▝◠▬Ǟ◡▃╠◚≝≊■■■▆▆▤▀◚⊜⊛╥▄▃▃▂_║╳▞▗╝▟▛◚███████████▌    ▕▒████◚◚█▌▋ ∭▟▎╱
+//   ▐▔▔"⋨∭◅▃╏◠≉╬▒▇▆▅┫ ▕▄▃∏◠━━◡▃▂║▃▃▃▄▙▄∭▟▟▙▓≝▬▬╩◘██████████    ▐∏██◘▜▁╔▕▒▎ ▒█▎╣
+//   ▕╣◚◘▉▐▄▃▂▁▟▒╝◙▉◙Ů▒▒◚▜▛◙◘▒▒▌▍ ▔▔"▀▬ǡ∗▃∑◚▀▀◘◘▓████▀╣▟╢▒◙◙▙▖  ▐ ╬     ∭▐▏▐█▉▏▜
+//    ĴĄ  ╲╲ ▔╠▛◘◘▓▍▅╣┇▐▒∭Ǭ▛╨◀∗▃▒▀Ň◘█▒⋯┳▂▃_▐█████████████████▌∑◚╣__%◺_⊋∛ ∭ ▐▐▉▌▝
+//  ▔  ┗▌   ▔◚▜▍▝▀▀▜█▌▐▐▐██▙▄▃▂_ ▗╢▒▛◚▬∗▃▂◚▀╩╩╩◘◘◙╩◘Ů▔▔▔▔▔▔▔▔▔▝▜▒▒▒▒▒◘◘▣▤▌ ∭█▌▕▎
+//  Copyright 2026, [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+
 import init, { App } from "./pkg/goblin_nightclub.js";
 
 const $ = (selector) => document.querySelector(selector);
@@ -161,9 +178,16 @@ async function main() {
     let [cols, rows] = asked ? [Number(asked[1]), Number(asked[2])] : [];
     const params = query.get("params") ?? undefined;
     workers ??= Array.from(
-      { length: Math.max(1, Math.min(4, (navigator.hardwareConcurrency ?? 2) - 1)) },
+      {
+        length: Math.max(
+          1,
+          Math.min(4, (navigator.hardwareConcurrency ?? 2) - 1),
+        ),
+      },
       () => {
-        const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+        const worker = new Worker(new URL("./worker.js", import.meta.url), {
+          type: "module",
+        });
         worker.onmessage = ({ data }) => {
           if (data.game !== world) return;
           if (data.error) return warn(`Couldn't make a region: ${data.error}`);
@@ -180,11 +204,23 @@ async function main() {
     let next = 0;
     const request = (rx, ry) => {
       workers[next++ % workers.length].postMessage({
-        game, seed: worldSeed, params, cols, rows, rx, ry,
+        game,
+        seed: worldSeed,
+        params,
+        cols,
+        rows,
+        rx,
+        ry,
       });
     };
     try {
-      [cols, rows] = app.new_generated_game(worldSeed, params, cols, rows, request);
+      [cols, rows] = app.new_generated_game(
+        worldSeed,
+        params,
+        cols,
+        rows,
+        request,
+      );
     } catch (err) {
       warn(`Couldn't make that world: ${err.message ?? err}`);
       return false;
@@ -380,11 +416,19 @@ async function main() {
         download("level.json", app.editor_save());
         break;
       case "save-pack":
-        download("level.pack", app.editor_save_packed(), "application/octet-stream");
+        download(
+          "level.pack",
+          app.editor_save_packed(),
+          "application/octet-stream",
+        );
         break;
       case "save-diff":
         try {
-          download("level-diff.pack", app.editor_save_diff(), "application/octet-stream");
+          download(
+            "level-diff.pack",
+            app.editor_save_diff(),
+            "application/octet-stream",
+          );
         } catch (err) {
           warn(`Couldn't save a diff: ${err.message ?? err}`);
         }
