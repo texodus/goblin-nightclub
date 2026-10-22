@@ -1,0 +1,100 @@
+<!doctype html>
+<!--
+                                      ▗◡≝▔▔` ▔≝=◺▂             ∕        ▐▋  ▝▉
+                                    ╣▒◿▒≘≉◬_    _▒▆▒▀         ◞         ▐▋  ▐▌
+                                    ╔`     ▝◺◿▒▟▘╔╹ ▚◛                  ▐▌  ▐▏
+         G O B L I N               ▕▎_"▃▅≣P ▐▓▛▗▉▂_▂__◚◛_         __▂▂▂▂▟▙◓▀▀▀▀≝
+          N I G H T C L U B         ║`║║_▂▐╝ ▟◙██▛╬▔`_▂◙▒▖       ▕∏▃▃▃▃▂▐▌║▂▂▂▔▔
+                                    ▙⋡▜╥∺╝ ▗▟███▛Ƒ  ▐▛▔▔▜█▌      ▐╣ ▝▜███▋ ∭▔▔▔▔
+                                     ▁⋡▚▃▄▀▉Ƣ█▀▉╺▗▐∏▊   ╠█▎      ▐╣   ▁∭█▉ ▊ ∭▐█
+                            ▁▃◛◭◒≠◚▔▔╸ ╔▒∏▕▓▌ ▟▎ ▐▒██▖    ▜▎     ╠▎≕∏__  ◙∏▍ ╣█▌
+                       _◿▎`▂_ ▟▒║╣▂▂▂▂▞╜▔▜ ╬◙▏∏▎ ▐███◘⊠◚"` ▜     ╣ ▂▅▅▅_ ▐█▎▕▒█Ǩ
+                _▂_ _▂▂▒∭▒▒◛≝▔           ▕▶╣◚▔▔▔╠∏∏║▌ ┉━━≝▒▃▘   ▕▌▟█████▙ ∭ ▐▐▌▓
+      ▁▁▁▁_╓◛▋▝◠▬Ǟ◡▃╠◚≝≊■■■▆▆▤▀◚⊜⊛╥▄▃▃▂_║╳▞▗╝▟▛◚███████████▌    ▕▒████◚◚█▌▋ ∭▟▎╱
+     ▐▔▔"⋨∭◅▃╏◠≉╬▒▇▆▅┫ ▕▄▃∏◠━━◡▃▂║▃▃▃▄▙▄∭▟▟▙▓≝▬▬╩◘██████████    ▐∏██◘▜▁╔▕▒▎ ▒█▎╣
+     ▕╣◚◘▉▐▄▃▂▁▟▒╝◙▉◙Ů▒▒◚▜▛◙◘▒▒▌▍ ▔▔"▀▬ǡ∗▃∑◚▀▀◘◘▓████▀╣▟╢▒◙◙▙▖  ▐ ╬     ∭▐▏▐█▉▏▜
+      ĴĄ  ╲╲ ▔╠▛◘◘▓▍▅╣┇▐▒∭Ǭ▛╨◀∗▃▒▀Ň◘█▒⋯┳▂▃_▐█████████████████▌∑◚╣__%◺_⊋∛ ∭ ▐▐▉▌▝
+    ▔  ┗▌   ▔◚▜▍▝▀▀▜█▌▐▐▐██▙▄▃▂_ ▗╢▒▛◚▬∗▃▂◚▀╩╩╩◘◘◙╩◘Ů▔▔▔▔▔▔▔▔▔▝▜▒▒▒▒▒◘◘▣▤▌ ∭█▌▕▎
+    Copyright 2026, [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Goblin Nightclub</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <canvas id="game" tabindex="0"></canvas>
+
+    <div id="menu" class="panel" hidden>
+      <h1>Goblin Nightclub</h1>
+      <button data-action="new">New</button>
+      <button data-action="editor">Editor</button>
+      <button data-action="load">Load</button>
+      <p class="hint" id="menu-hint">Esc returns here</p>
+    </div>
+
+    <div id="editor" hidden>
+      <div id="topbar" class="bar">
+        <button data-action="menu" title="Back to the menu (Esc)">Menu</button>
+        <span class="sep"></span>
+        <button data-action="new-level" title="Start a blank level">New</button>
+        <button data-action="open" title="Open a level file, or a packed level and any diffs over it">Open</button>
+        <button data-action="save" title="Save the level to a file">Save</button>
+        <button data-action="save-pack" title="Save the level packed in chunks, to play a piece at a time">Save packed</button>
+        <button data-action="save-diff" title="Save just what's changed since opening it from a packed level">Save diff</button>
+        <span class="sep"></span>
+        <button data-action="undo" title="Undo (Ctrl+Z)">Undo</button>
+        <button data-action="redo" title="Redo (Ctrl+Shift+Z)">Redo</button>
+        <span class="sep"></span>
+        <span class="label">Layer</span>
+        <span id="layers"></span>
+        <button data-action="add-layer-above" title="Add a layer above this one">+▲</button>
+        <button data-action="add-layer-below" title="Add a layer below this one">+▼</button>
+        <button data-action="remove-layer" title="Remove this layer">−</button>
+        <span class="sep"></span>
+        <button data-action="play" title="Try the level out">Play</button>
+        <span id="status"></span>
+      </div>
+      <div id="toolbox" class="bar">
+        <button data-tool="pencil" title="Pencil: click or drag (B)">✎</button>
+        <button data-tool="rect" title="Rectangle: drag a region (R)">▭</button>
+        <button data-tool="fill" title="Fill: like tiles joined to the one clicked (F)">◍</button>
+        <button data-tool="pick" title="Picker: take the brushes from a tile (I)">⌖</button>
+        <button data-tool="spawn" title="Spawn: where the player starts">⚑</button>
+        <hr />
+        <button data-shape="whole" title="Whole tile">■</button>
+        <button data-shape="NW" title="Primary in the top-left half">◤</button>
+        <button data-shape="NE" title="Primary in the top-right half">◥</button>
+        <button data-shape="SW" title="Primary in the bottom-left half">◣</button>
+        <button data-shape="SE" title="Primary in the bottom-right half">◢</button>
+      </div>
+      <div id="palette" class="bar">
+        <div id="current" title="Primary (left button) over secondary (right button)">
+          <div id="secondary" class="swatch"></div>
+          <div id="primary" class="swatch"></div>
+        </div>
+        <div id="swatches"></div>
+      </div>
+    </div>
+
+    <dialog id="new-level" class="panel">
+      <form method="dialog">
+        <h2>New level</h2>
+        <label>Columns <input name="cols" type="number" min="4" max="128" value="64" /></label>
+        <label>Rows <input name="rows" type="number" min="4" max="128" value="40" /></label>
+        <label>Layers <input name="layers" type="number" min="1" max="8" value="3" /></label>
+        <div class="buttons">
+          <button value="cancel">Cancel</button>
+          <button value="ok">Create</button>
+        </div>
+      </form>
+    </dialog>
+
+    <input id="file" type="file" accept=".json,.pack,application/json,application/octet-stream" multiple hidden />
+    <p id="error" hidden></p>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

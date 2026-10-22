@@ -1,0 +1,306 @@
+/*
+                                      ▗◡≝▔▔` ▔≝=◺▂             ∕        ▐▋  ▝▉
+                                    ╣▒◿▒≘≉◬_    _▒▆▒▀         ◞         ▐▋  ▐▌
+                                    ╔`     ▝◺◿▒▟▘╔╹ ▚◛                  ▐▌  ▐▏
+         G O B L I N               ▕▎_"▃▅≣P ▐▓▛▗▉▂_▂__◚◛_         __▂▂▂▂▟▙◓▀▀▀▀≝
+          N I G H T C L U B         ║`║║_▂▐╝ ▟◙██▛╬▔`_▂◙▒▖       ▕∏▃▃▃▃▂▐▌║▂▂▂▔▔
+                                    ▙⋡▜╥∺╝ ▗▟███▛Ƒ  ▐▛▔▔▜█▌      ▐╣ ▝▜███▋ ∭▔▔▔▔
+                                     ▁⋡▚▃▄▀▉Ƣ█▀▉╺▗▐∏▊   ╠█▎      ▐╣   ▁∭█▉ ▊ ∭▐█
+                            ▁▃◛◭◒≠◚▔▔╸ ╔▒∏▕▓▌ ▟▎ ▐▒██▖    ▜▎     ╠▎≕∏__  ◙∏▍ ╣█▌
+                       _◿▎`▂_ ▟▒║╣▂▂▂▂▞╜▔▜ ╬◙▏∏▎ ▐███◘⊠◚"` ▜     ╣ ▂▅▅▅_ ▐█▎▕▒█Ǩ
+                _▂_ _▂▂▒∭▒▒◛≝▔           ▕▶╣◚▔▔▔╠∏∏║▌ ┉━━≝▒▃▘   ▕▌▟█████▙ ∭ ▐▐▌▓
+      ▁▁▁▁_╓◛▋▝◠▬Ǟ◡▃╠◚≝≊■■■▆▆▤▀◚⊜⊛╥▄▃▃▂_║╳▞▗╝▟▛◚███████████▌    ▕▒████◚◚█▌▋ ∭▟▎╱
+     ▐▔▔"⋨∭◅▃╏◠≉╬▒▇▆▅┫ ▕▄▃∏◠━━◡▃▂║▃▃▃▄▙▄∭▟▟▙▓≝▬▬╩◘██████████    ▐∏██◘▜▁╔▕▒▎ ▒█▎╣
+     ▕╣◚◘▉▐▄▃▂▁▟▒╝◙▉◙Ů▒▒◚▜▛◙◘▒▒▌▍ ▔▔"▀▬ǡ∗▃∑◚▀▀◘◘▓████▀╣▟╢▒◙◙▙▖  ▐ ╬     ∭▐▏▐█▉▏▜
+      ĴĄ  ╲╲ ▔╠▛◘◘▓▍▅╣┇▐▒∭Ǭ▛╨◀∗▃▒▀Ň◘█▒⋯┳▂▃_▐█████████████████▌∑◚╣__%◺_⊋∛ ∭ ▐▐▉▌▝
+    ▔  ┗▌   ▔◚▜▍▝▀▀▜█▌▐▐▐██▙▄▃▂_ ▗╢▒▛◚▬∗▃▂◚▀╩╩╩◘◘◙╩◘Ů▔▔▔▔▔▔▔▔▔▝▜▒▒▒▒▒◘◘▣▤▌ ∭█▌▕▎
+    Copyright 2026, [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+*/
+
+/* EGA colors. */
+:root {
+    --black: #000;
+    --blue: #0000aa;
+    --light-blue: #5555ff;
+    --gray: #aaaaaa;
+    --dark-gray: #555555;
+    --white: #ffffff;
+    --yellow: #ffff55;
+    --cyan: #55ffff;
+    --red: #ff5555;
+}
+
+html,
+body {
+    margin: 0;
+    height: 100%;
+    background: var(--black);
+    color: var(--gray);
+    font-family: ui-monospace, monospace;
+}
+
+body {
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+}
+
+/* The canvas fills the window, rendered at its own resolution (see
+   main.js); if that's capped, it's scaled up by a whole number, with hard
+   pixel edges. */
+#game {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    image-rendering: pixelated;
+    outline: none;
+}
+
+[hidden] {
+    display: none !important;
+}
+
+/* Raised, beveled buttons, light above and left, dark below and right. */
+button {
+    font: inherit;
+    color: var(--white);
+    background: var(--blue);
+    border: 2px solid;
+    border-color: var(--light-blue) var(--black) var(--black) var(--light-blue);
+    padding: 2px 8px;
+    cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+    background: var(--light-blue);
+}
+
+button:active:not(:disabled),
+button.on {
+    border-color: var(--black) var(--light-blue) var(--light-blue) var(--black);
+    background: var(--black);
+    color: var(--yellow);
+}
+
+button:disabled {
+    color: var(--dark-gray);
+    cursor: default;
+}
+
+.panel {
+    background: var(--blue);
+    color: var(--white);
+    border: 3px double var(--gray);
+}
+
+/* The start menu, over the middle of the screen. */
+#menu {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 24px 40px;
+    min-width: 200px;
+    text-align: center;
+}
+
+#menu h1 {
+    margin: 0 0 8px;
+    color: var(--yellow);
+    letter-spacing: 0.3em;
+    font-size: 24px;
+}
+
+#menu button {
+    font-size: 18px;
+    padding: 6px;
+}
+
+.hint {
+    margin: 4px 0 0;
+    color: var(--gray);
+    font-size: 12px;
+}
+
+/* The editor: a bar along the top, tools down the left, the palette along
+   the bottom, all over the canvas. */
+.bar {
+    position: fixed;
+    background: var(--blue);
+    border: 2px solid var(--gray);
+    display: flex;
+    gap: 4px;
+    padding: 4px;
+    align-items: center;
+}
+
+#topbar {
+    top: 0;
+    left: 0;
+    right: 0;
+    border-width: 0 0 2px;
+    flex-wrap: wrap;
+}
+
+#toolbox {
+    top: 50%;
+    left: 4px;
+    transform: translateY(-50%);
+    flex-direction: column;
+}
+
+#toolbox button {
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    font-size: 20px;
+}
+
+#toolbox hr {
+    width: 100%;
+    border: 0;
+    border-top: 2px solid var(--gray);
+    margin: 2px 0;
+}
+
+#palette {
+    bottom: 0;
+    left: 0;
+    right: 0;
+    border-width: 2px 0 0;
+    gap: 12px;
+}
+
+#swatches {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.swatch {
+    width: 32px;
+    height: 32px;
+    border: 2px solid var(--black);
+    background-color: var(--black);
+    background-repeat: no-repeat;
+    image-rendering: pixelated;
+    box-sizing: content-box;
+    cursor: pointer;
+    position: relative;
+}
+
+/* Void: nothing, crossed out. */
+.swatch.void {
+    background-image: linear-gradient(45deg, transparent 46%, var(--dark-gray) 46% 54%, transparent 54%),
+        linear-gradient(-45deg, transparent 46%, var(--dark-gray) 46% 54%, transparent 54%) !important;
+}
+
+.swatch.primary {
+    border-color: var(--yellow);
+}
+
+.swatch.secondary {
+    border-color: var(--cyan);
+}
+
+.swatch.primary.secondary {
+    border-color: var(--yellow) var(--cyan) var(--cyan) var(--yellow);
+}
+
+/* Paint's two overlapping color boxes. */
+#current {
+    position: relative;
+    width: 56px;
+    height: 48px;
+    flex: none;
+}
+
+#current .swatch {
+    position: absolute;
+    cursor: default;
+}
+
+#primary {
+    top: 0;
+    left: 0;
+    border-color: var(--yellow);
+}
+
+#secondary {
+    bottom: 0;
+    right: 0;
+    border-color: var(--cyan);
+}
+
+#layers {
+    display: flex;
+    gap: 2px;
+}
+
+#layers button {
+    min-width: 28px;
+}
+
+.sep {
+    width: 2px;
+    align-self: stretch;
+    background: var(--gray);
+    margin: 0 4px;
+}
+
+.label,
+#status {
+    color: var(--gray);
+}
+
+#status {
+    margin-left: auto;
+    padding-right: 8px;
+}
+
+#new-level {
+    padding: 16px 24px;
+}
+
+#new-level::backdrop {
+    background: rgb(0 0 0 / 60%);
+}
+
+#new-level h2 {
+    margin: 0 0 12px;
+    color: var(--yellow);
+    font-size: 18px;
+}
+
+#new-level label {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin: 6px 0;
+}
+
+#new-level input {
+    font: inherit;
+    width: 64px;
+    background: var(--black);
+    color: var(--white);
+    border: 2px solid var(--gray);
+}
+
+#new-level .buttons {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+#error {
+    position: fixed;
+    inset: auto 16px 64px;
+    color: var(--red);
+    background: var(--black);
+    white-space: pre-wrap;
+}
